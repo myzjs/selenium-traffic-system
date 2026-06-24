@@ -35,7 +35,7 @@ def run_ip_provider():
     logger.info("阶段1：通过中转服务器获取IPDeep代理")
     logger.info("=" * 60)
 
-    max_retries = 3
+    max_retries = 5
     for attempt in range(max_retries):
         try:
             import ip_provider
@@ -61,7 +61,7 @@ def run_ip_provider():
             else:
                 logger.warning(f"获取代理失败 (尝试 {attempt+1}/{max_retries}): {result.get('error', '未知错误')}")
                 if attempt < max_retries - 1:
-                    time.sleep(3)
+                    time.sleep(5)
         except Exception as e:
             logger.warning(f"IP获取异常 (尝试 {attempt+1}/{max_retries}): {type(e).__name__}: {e}")
             if attempt < max_retries - 1:

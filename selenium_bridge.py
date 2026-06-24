@@ -761,6 +761,19 @@ class Page:
             return ""
 
     @property
+    def request(self) -> Request:
+        """返回当前页面的请求信息"""
+        return Request(
+            url=self.url,
+            headers={
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+            }
+        )
+
+    @property
     def viewport_size(self) -> Dict:
         try:
             size = self.driver.get_window_size()
@@ -856,6 +869,16 @@ class Page:
                 if nav_entries and isinstance(nav_entries, dict):
                     status = int(nav_entries.get("responseStatus", 200) or 200)
                     ok = 200 <= status < 400
+            except Exception:
+                pass
+
+            # 导航后注入 localStorage 随机化
+            try:
+                self.driver.execute_script(
+                    "localStorage.setItem('_v_'+Date.now(),'1');"
+                    "localStorage.setItem('_s_'+Math.random().toString(36).substr(2),'1');"
+                    "localStorage.setItem('_p_'+Math.random().toString(36).substr(2,8),'en');"
+                )
             except Exception:
                 pass
 
