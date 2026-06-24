@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""
-Selenium流量系统 - 完整流程测试脚本
+#!/usr/bin/env python3
+"""Selenium流量系统 - 完整流程集成测试脚本
+需要真实浏览器和代理才能运行。
+标记: @pytest.mark.integration
 """
 import json
 import logging
@@ -9,6 +11,8 @@ import random
 import sys
 import time
 from datetime import datetime
+
+import pytest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,9 +32,9 @@ REPORT_DIR = os.path.join(os.path.dirname(__file__), "test_reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
 
-def test_ip_provider():
+def run_ip_provider():
     logger.info("=" * 60)
-    logger.info("测试阶段1：通过中转服务器获取IPDeep代理")
+    logger.info("阶段1：通过中转服务器获取IPDeep代理")
     logger.info("=" * 60)
     
     try:
@@ -266,7 +270,9 @@ def test_browsing_rules(page, config):
         return {"success": False, "error": str(e)}
 
 
+@pytest.mark.integration
 def main():
+    """集成测试主入口"""
     logger.info("开始完整流程测试")
     logger.info("=" * 60)
     
