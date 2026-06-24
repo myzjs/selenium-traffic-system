@@ -30,38 +30,44 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 
 
 def run_ip_provider():
-    """阶段1：通过中转服务器获取IPDeep代理"""
+    """阶段1：通过中转服务器获取IPDeep代理（带重试）"""
     logger.info("=" * 60)
     logger.info("阶段1：通过中转服务器获取IPDeep代理")
     logger.info("=" * 60)
 
-    try:
-        import ip_provider
-        provider = ip_provider.init_from_config(CONFIG)
-        logger.info(f"VPS配置: {CONFIG.get('vps_host')}:{CONFIG.get('vps_new_port')}")
-        logger.info(f"代理池数量: {len(CONFIG.get('proxy_pool', []))}")
-        logger.info("开始获取代理IP...")
-        result = provider.get_ip()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            import ip_provider
+            provider = ip_provider.init_from_config(CONFIG)
+            logger.info(f"VPS配置: {CONFIG.get('vps_host')}:{CONFIG.get('vps_new_port')}")
+            logger.info(f"代理池数量: {len(CONFIG.get('proxy_pool', []))}")
+            logger.info(f"开始获取代理IP... (尝试 {attempt+1}/{max_retries})")
+            result = provider.get_ip()
 
-        if result.get("success"):
-            ip_info = result.get("ip_info", {})
-            logger.info(f"出口IP: {ip_info.get('ip', '未知')}")
-            logger.info(f"代理: {result.get('proxy_host')}:{result.get('proxy_port')}")
-            logger.info(f"国家: {ip_info.get('country', '未知')}")
-            logger.info(f"城市: {ip_info.get('city', '未知')}")
-            if ip_info.get("ip"):
-                if ip_provider.check_ip_used_recently(ip_info["ip"]):
-                    logger.warning("该IP在去重间隔内已使用")
-                else:
-                    logger.info("IP未在近期使用，可正常使用")
-                    ip_provider.record_ip_use(ip_info["ip"])
-            return {"success": True, "proxy_host": result.get("proxy_host"), "proxy_port": result.get("proxy_port"), "ip_info": ip_info, "result": result}
-        else:
-            logger.error(f"获取代理失败: {result.get('error', '未知错误')}")
-            return {"success": False, "error": result.get("error", "未知错误")}
-    except Exception as e:
-        logger.error(f"IP获取测试异常: {type(e).__name__}: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
+            if result.get("success"):
+                ip_info = result.get("ip_info", {})
+                logger.info(f"出口IP: {ip_info.get('ip', '未知')}")
+                logger.info(f"代理: {result.get('proxy_host')}:{result.get('proxy_port')}")
+                logger.info(f"国家: {ip_info.get('country', '未知')}")
+                logger.info(f"城市: {ip_info.get('city', '未知')}")
+                if ip_info.get("ip"):
+                    if ip_provider.check_ip_used_recently(ip_info["ip"]):
+                        logger.warning("该IP在去重间隔内已使用")
+                    else:
+                        logger.info("IP未在近期使用，可正常使用")
+                        ip_provider.record_ip_use(ip_info["ip"])
+                return {"success": True, "proxy_host": result.get("proxy_host"), "proxy_port": result.get("proxy_port"), "ip_info": ip_info, "result": result}
+            else:
+                logger.warning(f"获取代理失败 (尝试 {attempt+1}/{max_retries}): {result.get('error', '未知错误')}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+        except Exception as e:
+            logger.warning(f"IP获取异常 (尝试 {attempt+1}/{max_retries}): {type(e).__name__}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(3)
+
+    return {"success": False, "error": f"重试{max_retries}次后仍失败"}
 
 
 def run_risk_detection(page, proxy_info):
@@ -243,7 +249,12 @@ def main():
             logger.info("\n启动浏览器...")
             launch_args = [
                 "--no-sandbox", "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled", "--disable-webrtc",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-webrtc",
+                "--disable-web-security",
+                "--disable-features=WebRtcHideLocalIpsWithMdns",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--enforce-webrtc-ip-permission-check=false",
             ]
             proxy_host = ip_result.get("proxy_host")
             proxy_port = ip_result.get("proxy_port")

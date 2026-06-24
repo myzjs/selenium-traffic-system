@@ -1707,14 +1707,34 @@ class Chromium:
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                // WebRTC 禁用 - 覆盖 RTCPeerConnection
+                window.RTCPeerConnection = undefined;
+                window.webkitRTCPeerConnection = undefined;
+                // Cookie/LocalStorage 随机化
+                try {
+                    if (localStorage.length < 3) {
+                        localStorage.setItem('_visitor_' + Date.now(), 'true');
+                        localStorage.setItem('_session_' + Math.random().toString(36).substr(2), '1');
+                        localStorage.setItem('_pref_' + Math.random().toString(36).substr(2, 8), 'en');
+                    }
+                } catch(e) {}
                 """
             })
         except Exception:
             pass
 
-        # 移除webdriver标识
+        # 移除webdriver标识 + 设置请求头
         try:
             driver.execute_cdp_cmd("Network.enable", {})
+            # 设置标准请求头（修复缺失 Accept-Language / Sec-Ch-Ua）
+            driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+                "headers": {
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                }
+            })
         except Exception:
             pass
 
