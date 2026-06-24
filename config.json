@@ -1,6 +1,6 @@
 {
-    "ip_proxy_api": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=992bODNmNzI2MDI5NDE1MTMzNDc4OTkw",
-    "ip_proxy_user": "\u52a0\u62ff\u5927",
+    "ip_proxy_api": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=fd21ODc3ZjI2MjI5ODA4MTYyNTM3NTQz",
+    "ip_proxy_user": "加拿大",
     "ip_proxy_pwd": "",
     "vps_host": "104.129.54.64",
     "vps_port": 8888,
@@ -109,31 +109,31 @@
         "search_engines": [
             {
                 "id": "baidu",
-                "name": "\u767e\u5ea6",
+                "name": "百度",
                 "url": "https://www.baidu.com/s?wd=",
                 "language": "zh"
             },
             {
                 "id": "sogou",
-                "name": "\u641c\u72d7",
+                "name": "搜狗",
                 "url": "https://www.sogou.com/web?query=",
                 "language": "zh"
             },
             {
                 "id": "so360",
-                "name": "360\u641c\u7d22",
+                "name": "360搜索",
                 "url": "https://www.so.com/s?q=",
                 "language": "zh"
             },
             {
                 "id": "google",
-                "name": "\u8c37\u6b4c",
+                "name": "谷歌",
                 "url": "https://www.google.com/search?q=",
                 "language": "en"
             },
             {
                 "id": "bing",
-                "name": "\u5fc5\u5e94",
+                "name": "必应",
                 "url": "https://www.bing.com/search?q=",
                 "language": "en"
             },
@@ -187,12 +187,12 @@
             }
         ],
         "region_engine_map": {
-            "\u4e2d\u56fd": [
+            "中国": [
                 "baidu",
                 "sogou",
                 "so360"
             ],
-            "\u7f8e\u56fd": [
+            "美国": [
                 "google",
                 "bing",
                 "facebook",
@@ -207,11 +207,11 @@
         },
         "keyword_pools": {
             "zh": [
-                "\u5e7f\u544a\u8054\u76df",
-                "SEO\u4f18\u5316",
-                "\u7f51\u7ad9\u63a8\u5e7f",
-                "\u7f51\u7edc\u8425\u9500",
-                "\u6570\u5b57\u8425\u9500"
+                "广告联盟",
+                "SEO优化",
+                "网站推广",
+                "网络营销",
+                "数字营销"
             ],
             "en": [
                 "affiliate marketing",
@@ -287,7 +287,7 @@
         "layer_3": {
             "keywords": [
                 "next",
-                "\u4e0b\u4e00\u7ae0",
+                "下一章",
                 "back",
                 "Previous Chapter",
                 "Next Chapter",
@@ -313,7 +313,7 @@
         "layer_4": {
             "keywords": [
                 "next",
-                "\u4e0b\u4e00\u7ae0",
+                "下一章",
                 "back",
                 "Previous Chapter",
                 "Next Chapter",
@@ -341,7 +341,7 @@
         "layer_5": {
             "keywords": [
                 "next",
-                "\u4e0b\u4e00\u7ae0",
+                "下一章",
                 "back",
                 "Previous Chapter",
                 "Next Chapter",
@@ -369,7 +369,7 @@
         "layer_6": {
             "keywords": [
                 "next",
-                "\u4e0b\u4e00\u7ae0",
+                "下一章",
                 "back",
                 "Previous Chapter",
                 "Next Chapter",
@@ -403,18 +403,18 @@
             "max": 5
         },
         "back_links": [
-            "\u8fd4\u56de",
+            "返回",
             "back",
-            "\u76ee\u5f55",
+            "目录",
             "back to contents",
             "home",
-            "\u9996\u9875",
+            "首页",
             "home",
             "Free Digital Book",
             "All Books"
         ],
         "back_home_links": [
-            "\u9996\u9875",
+            "首页",
             "home",
             "Free Digital Book",
             "All Books",
@@ -426,19 +426,19 @@
         {
             "enabled": true,
             "country_code": "US",
-            "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=ca42NWY2ZDI2MDM1OTU1NTY3Mjk2NTkw",
-            "proxy_user": "d2841616000-res-country-us-session-3790387000-sessiontime-5",
+            "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=fd21ODc3ZjI2MjI5ODA4MTYyNTM3NTQz",
+            "proxy_user": "d8187332000-res-country-us-session-2809839000-sessiontime-5",
             "proxy_pwd": "zhan7263"
         },
         {
-            "enabled": true,
+            "enabled": false,
             "country_code": "GB",
             "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=59bfOGMxNjI2MDM1OTA5MDM5MDk1ODg2",
             "proxy_user": "d2841616000-res-country-gb-session-3436939000-sessiontime-5",
             "proxy_pwd": "zhan7263"
         },
         {
-            "enabled": true,
+            "enabled": false,
             "country_code": "DE",
             "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=18dbMjRiZTI2MDM1OTE0ODQ1NDU0NDE0",
             "proxy_user": "d2841616000-res-country-de-session-3479425000-sessiontime-5",
@@ -480,7 +480,7 @@
             "proxy_pwd": "zhan7263"
         },
         {
-            "enabled": true,
+            "enabled": false,
             "country_code": "AU",
             "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=1c72ZmFlNzI2MDM1OTUwNzg5ODUzMjYy",
             "proxy_user": "d2841616000-res-country-au-session-3750354000-sessiontime-5",
