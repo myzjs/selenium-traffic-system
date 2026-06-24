@@ -272,11 +272,9 @@ plugin rp-pppoe.so
             if 'inet ' in line and 'brd' in line:
                 parts = line.strip().split()
                 for part in parts:
-                    if part.startswith('192.') or part.startswith('10.') or \
-                       part.startswith('172.') or ':' not in part:
-                        ip = part.split('/')[0]
-                        if ip and not ip.startswith('127.'):
-                            return ip
+                    ip = part.split('/')[0]
+                    if ip and not ip.startswith('127.') and '.' in ip and not ip.startswith('inet'):
+                        return ip
         return None
     
     def disconnect_adsl(self) -> bool:
