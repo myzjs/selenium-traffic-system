@@ -1,0 +1,6 @@
+flask>=2.0.0
+requests>=2.25.0
+PySocks>=1.7.1
+selenium>=4.15.0
+pytz>=2023.3
+fake_useragent>=1.4.0
