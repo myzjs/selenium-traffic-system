@@ -3087,6 +3087,7 @@ HTML_TEMPLATE = r"""
             color: white; 
             font-size: 12px; 
             box-sizing: border-box;
+            text-align: center;
             font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, Ubuntu, sans-serif;
         }
         textarea { 
@@ -3098,6 +3099,7 @@ HTML_TEMPLATE = r"""
             color: white; 
             font-size: 12px; 
             box-sizing: border-box;
+            text-align: center;
             font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, Ubuntu, sans-serif;
         }
         select {
@@ -4938,8 +4940,9 @@ HTML_TEMPLATE = r"""
             const lines = logBox.querySelectorAll('p');
             const overflow = lines.length - maxLines;
             if (overflow > 0) {
+                // 最新日志在顶部，超出上限时从底部（最旧）开始删除
                 for (let i = 0; i < overflow; i++) {
-                    lines[i].remove();
+                    lines[lines.length - 1 - i].remove();
                 }
             }
         }
@@ -4961,7 +4964,7 @@ HTML_TEMPLATE = r"""
                         logBox.innerHTML = html;
                         capLogDom(logBox, 500);
                         originalLogHTML = logBox.innerHTML;
-                        logBox.scrollTop = logBox.scrollHeight;
+                        logBox.scrollTop = 0;
                     } else {
                         const currentScrollTop = logBox.scrollTop;
                         logBox.innerHTML = html;
@@ -11549,7 +11552,7 @@ def get_current_ip_context():
 @app.route('/')
 def index():
     ensure_config_defaults()
-    return render_template_string(HTML_TEMPLATE, config=config, logs=log.messages[-500:], 
+    return render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
                                   stats=stats, runningtask=task_running,
@@ -12439,7 +12442,8 @@ def get_logs():
         limit = 500
     limit = max(50, min(limit, 500))
     messages = messages[-limit:]
-    return ''.join([f"<p>{msg}</p>" for msg in messages])
+    # 从下往上展示：最新日志置顶（倒序输出）
+    return ''.join([f"<p>{msg}</p>" for msg in reversed(messages)])
 
 @app.route('/api/status')
 def api_status():
