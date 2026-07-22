@@ -4839,7 +4839,6 @@ HTML_TEMPLATE = r"""
                         });
                         console.log('✅ 已加载代理池配置:', proxyPool.length, '个代理');
                     }
-}
                     
                     // 4. 加载ADSL配置
                     if (data.config.adsl_username) {
@@ -12828,5 +12827,5 @@ if __name__ == "__main__":
     import os
     # 优先读取环境变量，无参数默认5001
     port = int(os.getenv("RUN_PORT",5001))
-    host = os.getenv("RUN_HOST","127.0.0.1")
+    host = os.getenv("RUN_HOST","0.0.0.0")
     app.run(host=host,port=port)
