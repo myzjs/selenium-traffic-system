@@ -11552,7 +11552,7 @@ def index():
     ensure_config_defaults()
     return render_template_string(HTML_TEMPLATE, config=config, logs=log.messages[-500:], 
                                   statstotal=stats['total'], statssuccess=stats['success'], 
-                                  statsfail=stats['fail'], statsvideo_view_count=stats['video_view_count'],
+                                  statsfail=stats['fail'],
                                   stats=stats, runningtask=task_running,
                                   planned_total=planned_total_tasks)
 
@@ -12449,8 +12449,8 @@ def api_status():
         "total": stats["total"],
         "success": stats["success"],
         "fail": stats["fail"],
-        "video_view_count": stats["video_view_count"],
-        "total_video_watch_time": stats["total_video_watch_time"],
+        "video_view_count": stats.get("video_view_count", 0),
+        "total_video_watch_time": stats.get("total_video_watch_time", 0),
         "adsl": adsl_status
     })
 
