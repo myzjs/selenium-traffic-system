@@ -18,11 +18,11 @@ import os
 from io import BytesIO
 
 # 配置
-USER = "admin"
-PASS = "admin123"
+USER = os.environ.get("VPS_USER", "admin")
+PASS = os.environ.get("VPS_PASS", "gq1pH5O6Qgk1A7LiV9")
 TIMEOUT = 60
-PORT = 6666
-SOCKS5_PORT = 1666
+PORT = int(os.environ.get("VPS_NEW_PORT", 6666))
+SOCKS5_PORT = int(os.environ.get("VPS_SOCKS5_PORT", 1666))
 REQUIRE_PROXY_AUTH = True  # 6666 HTTP控制面/兼容HTTP代理保留认证
 REQUIRE_SOCKS5_AUTH = False  # 1666浏览器数据面不认证：Chrome/Playwright SOCKS5认证兼容性差
 
@@ -32,9 +32,12 @@ _last_update = 0
 PROXY_CACHE_TTL = 600  # 阶段2新服务：缓存10分钟，避免每个连接都刷新IPDeep
 _proxy_refresh_lock = threading.Lock()
 _DEFAULT_IPDEEP_API_URL = ""
+_DEFAULT_IPDEEP_API_USER = ""
+_DEFAULT_IPDEEP_API_PWD = ""
 
 # IP去重机制：记录IP和使用时间，12小时内不重复
 _used_ips = {}  # {ip: timestamp}
+_used_ips_lock = threading.Lock()  # 线程锁保护 _used_ips
 IP_REUSE_INTERVAL = 12 * 3600  # 12小时 = 43200秒
 
 # 配置日志
@@ -117,15 +120,17 @@ def check_auth(auth_header, request_type="unknown"):
         return False
 
 
-def get_or_refresh_ipdeep_proxy(api_url):
+def get_or_refresh_ipdeep_proxy(api_url, api_user=None, api_pwd=None):
     """从IPDeep API获取代理信息，并按目标站访问速度筛选节点。"""
     global _current_ipdeep_proxy, _last_update, _used_ips
 
     now = time.time()
 
-    expired_ips = [ip for ip, ts in _used_ips.items() if (now - ts) > IP_REUSE_INTERVAL]
-    for ip in expired_ips:
-        del _used_ips[ip]
+    # 线程安全清理过期IP
+    with _used_ips_lock:
+        expired_ips = [ip for ip, ts in _used_ips.items() if (now - ts) > IP_REUSE_INTERVAL]
+        for ip in expired_ips:
+            del _used_ips[ip]
 
     max_retries = 3
     speed_threshold = 8.0
@@ -140,7 +145,14 @@ def get_or_refresh_ipdeep_proxy(api_url):
                 "Accept": "*/*"
             }
 
-            resp = requests.get(api_url, headers=headers, timeout=15)
+            # 如果提供了认证凭据，使用 Basic Auth
+            auth = None
+            if api_user and api_pwd:
+                from requests.auth import HTTPBasicAuth
+                auth = HTTPBasicAuth(api_user, api_pwd)
+                logger.info(f"使用 IPDeep API 认证: user={api_user}")
+
+            resp = requests.get(api_url, headers=headers, auth=auth, timeout=15)
             resp.raise_for_status()
 
             response_text = resp.text.strip()
@@ -155,16 +167,19 @@ def get_or_refresh_ipdeep_proxy(api_url):
 
             logger.info(f"解析代理成功: {proxy_host}:{proxy_port}")
 
+            # 使用 HTTP 代理连接 IPDeep（支持 Basic 认证）
             proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
             ip_info = get_ip_details_proxy(proxy_url)
             exit_ip = ip_info.get("ip", "未知")
 
-            if exit_ip in _used_ips:
-                ip_age = now - _used_ips[exit_ip]
-                if ip_age < IP_REUSE_INTERVAL:
-                    logger.warning(f"IP {exit_ip} 在 {int(ip_age/3600)} 小时内用过，继续获取新IP...")
-                    time.sleep(1)
-                    continue
+            # 线程安全检查IP是否已使用
+            with _used_ips_lock:
+                if exit_ip in _used_ips:
+                    ip_age = now - _used_ips[exit_ip]
+                    if ip_age < IP_REUSE_INTERVAL:
+                        logger.warning(f"IP {exit_ip} 在 {int(ip_age/3600)} 小时内用过，继续获取新IP...")
+                        time.sleep(1)
+                        continue
 
             target_fast, target_detail, target_elapsed, target_reachable = validate_target_site_proxy(
                 proxy_url,
@@ -186,7 +201,8 @@ def get_or_refresh_ipdeep_proxy(api_url):
             if target_fast:
                 logger.info(f"✓ 目标站快节点通过: {target_detail}")
                 proxy_data = candidate
-                _used_ips[exit_ip] = now
+                with _used_ips_lock:
+                    _used_ips[exit_ip] = now
                 logger.info(f"✓ 新IP确认: {exit_ip} (已记录，12小时内不重复)")
                 break
 
@@ -205,7 +221,8 @@ def get_or_refresh_ipdeep_proxy(api_url):
 
     if proxy_data is None and best_slow_candidate is not None:
         best_elapsed, proxy_data, best_exit_ip = best_slow_candidate
-        _used_ips[best_exit_ip] = now
+        with _used_ips_lock:
+            _used_ips[best_exit_ip] = now
         logger.warning(
             f"连续 {max_retries} 次未找到 <= {speed_threshold:.0f}s 的快节点，"
             f"使用本轮最快可用节点: ip={best_exit_ip}, time={best_elapsed:.2f}s"
@@ -229,7 +246,7 @@ def get_ip_details_proxy(proxy_url):
     ip_apis = [
         {
             "name": "ip-api.com",
-            "url": "http://ip-api.com/json?fields=status,country,countryCode,regionName,city,timezone,isp,query",
+            "url": "https://ip-api.com/json?fields=status,country,countryCode,regionName,city,timezone,isp,query",
             "parser": lambda data: {
                 "success": data.get("status") == "success",
                 "ip": data.get("query"),
@@ -244,7 +261,7 @@ def get_ip_details_proxy(proxy_url):
         },
         {
             "name": "ipinfo.io",
-            "url": "http://ipinfo.io/json",
+            "url": "https://ipinfo.io/json",
             "parser": lambda data: {
                 "success": True,
                 "ip": data.get("ip"),
@@ -389,7 +406,7 @@ def read_http_request(client_socket):
                         content_length = int(line.split(':', 1)[1].strip())
                         logger.debug(f"[read_http_request] 找到 Content-Length: {content_length}")
                         break
-                    except:
+                    except (ValueError, IndexError):
                         pass
             
             # 如果有内容，继续读取
@@ -533,8 +550,12 @@ def handle_api_request(client_socket, request):
             api_url = urllib.parse.unquote(api_url_encoded)
             logger.info(f"IPDeep API: {api_url}")
             
-            # 获取代理信息
-            proxy_data = get_or_refresh_ipdeep_proxy(api_url)
+            # 获取代理信息，传递认证凭据
+            proxy_data = get_or_refresh_ipdeep_proxy(
+                api_url, 
+                _DEFAULT_IPDEEP_API_USER or os.environ.get("IP_PROXY_USER", ""),
+                _DEFAULT_IPDEEP_API_PWD or os.environ.get("IP_PROXY_PWD", "")
+            )
             
             if not proxy_data.get("success"):
                 response = (
@@ -766,7 +787,15 @@ def handle_https_connect(client_socket, request):
         
         if not (resp_text.startswith('HTTP/1.1 200') or resp_text.startswith('HTTP/1.0 200')):
             logger.error(f"IPDeep代理连接失败: {resp_text[:100]}")
-            proxy_sock.close()
+            try:
+                proxy_sock.close()
+            except Exception:
+                pass
+            # 通知客户端隧道建立失败，发送 502
+            try:
+                client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except Exception:
+                pass
             return
         
         logger.info("✓ HTTPS隧道建立成功，开始转发数据...")
@@ -793,11 +822,11 @@ def handle_https_connect(client_socket, request):
                 logger.info(f"{direction} 关闭连接，总计转发 {total_bytes} 字节")
                 try:
                     src.close()
-                except:
+                except OSError:
                     pass
                 try:
                     dst.close()
-                except:
+                except OSError:
                     pass
         
         # 启动转发线程
@@ -818,16 +847,28 @@ def handle_https_connect(client_socket, request):
                 b"\r\n"
             )
             client_socket.sendall(response)
-        except:
+        except OSError:
             pass
 
 
-def _load_default_api_url():
-    """从常见路径读取 ip_proxy_api，供1666 SOCKS5在未调用/api/get_proxy时自动预加载。"""
-    global _DEFAULT_IPDEEP_API_URL
+def _load_default_api_credentials():
+    """从常见路径读取 ip_proxy_api 及认证凭据，供1666 SOCKS5在未调用/api/get_proxy时自动预加载。"""
+    global _DEFAULT_IPDEEP_API_URL, _DEFAULT_IPDEEP_API_USER, _DEFAULT_IPDEEP_API_PWD
     if _DEFAULT_IPDEEP_API_URL:
-        return _DEFAULT_IPDEEP_API_URL
-    for cfg_path in ("/root/config.json", os.path.join(os.getcwd(), "config.json")):
+        return _DEFAULT_IPDEEP_API_URL, _DEFAULT_IPDEEP_API_USER, _DEFAULT_IPDEEP_API_PWD
+    # 优先级：脚本所在目录 > 当前工作目录 > /root/config.json
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg_paths = [
+        os.path.join(_script_dir, "config.json"),
+        os.path.join(os.getcwd(), "config.json"),
+        "/root/config.json",
+    ]
+    # 去重（保留顺序）
+    seen = set()
+    for cfg_path in cfg_paths:
+        if cfg_path in seen:
+            continue
+        seen.add(cfg_path)
         try:
             if not os.path.exists(cfg_path):
                 continue
@@ -836,11 +877,14 @@ def _load_default_api_url():
             api_url = str(data.get("ip_proxy_api") or "").strip()
             if api_url:
                 _DEFAULT_IPDEEP_API_URL = api_url
+                _DEFAULT_IPDEEP_API_USER = str(data.get("ip_proxy_user") or "").strip()
+                _DEFAULT_IPDEEP_API_PWD = str(data.get("ip_proxy_pwd") or "").strip()
                 logger.info(f"默认 IPDeep API URL 已加载: {api_url[:80]}...")
-                return _DEFAULT_IPDEEP_API_URL
+                logger.info(f"默认 IPDeep API 用户已加载: {_DEFAULT_IPDEEP_API_USER}")
+                return _DEFAULT_IPDEEP_API_URL, _DEFAULT_IPDEEP_API_USER, _DEFAULT_IPDEEP_API_PWD
         except Exception as e:
             logger.warning(f"读取默认配置失败 {cfg_path}: {e}")
-    return ""
+    return "", "", ""
 
 
 def _ensure_ipdeep_proxy(api_url=None, reason="连接请求", force_refresh=False):
@@ -850,16 +894,27 @@ def _ensure_ipdeep_proxy(api_url=None, reason="连接请求", force_refresh=Fals
     if not force_refresh and _current_ipdeep_proxy is not None and (now - _last_update) <= PROXY_CACHE_TTL:
         return True
     if not api_url:
-        api_url = _load_default_api_url()
-    if not api_url:
-        logger.warning(f"[{reason}] 当前没有可用IPDeep代理，且未提供api_url，无法自动刷新")
-        return _current_ipdeep_proxy is not None
+        api_url, api_user, api_pwd = _load_default_api_credentials()
+        if not api_url:
+            logger.warning(f"[{reason}] 当前没有可用IPDeep代理，且未提供api_url，无法自动刷新")
+            return _current_ipdeep_proxy is not None
+        # 使用从配置加载的认证凭据
+        api_user = api_user or os.environ.get("IP_PROXY_USER", "")
+        api_pwd = api_pwd or os.environ.get("IP_PROXY_PWD", "")
+    else:
+        # 如果传入了 api_url，也尝试从配置或环境变量获取认证
+        api_user, api_pwd = _DEFAULT_IPDEEP_API_USER, _DEFAULT_IPDEEP_API_PWD
+        if not api_user:
+            api_user = os.environ.get("IP_PROXY_USER", "")
+        if not api_pwd:
+            api_pwd = os.environ.get("IP_PROXY_PWD", "")
+    
     with _proxy_refresh_lock:
         now = time.time()
         if not force_refresh and _current_ipdeep_proxy is not None and (now - _last_update) <= PROXY_CACHE_TTL:
             return True
         logger.info(f"[{reason}] 刷新IPDeep代理...")
-        proxy_data = get_or_refresh_ipdeep_proxy(api_url)
+        proxy_data = get_or_refresh_ipdeep_proxy(api_url, api_user, api_pwd)
         if proxy_data and proxy_data.get("success"):
             _current_ipdeep_proxy = proxy_data
             _last_update = time.time()
@@ -1071,7 +1126,7 @@ def handle_client(client_socket, client_address):
     finally:
         try:
             client_socket.close()
-        except:
+        except OSError:
             pass
 
 

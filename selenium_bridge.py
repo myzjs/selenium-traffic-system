@@ -9,8 +9,11 @@ import os
 import re
 import random
 import threading
+import logging
 import urllib.parse
 from typing import Optional, Any, Callable, List, Dict, Union
+
+logger = logging.getLogger("selenium_bridge")
 
 from selenium import webdriver
 from selenium.webdriver import ChromeOptions, ActionChains
@@ -142,26 +145,16 @@ def _js_quote(s: str) -> str:
 
 
 def _find_chromedriver() -> str:
-    """自动查找ChromeDriver路径"""
-    # 1. 检查环境变量
-    env_path = os.environ.get("CHROMEDRIVER_PATH")
-    if env_path and os.path.isfile(env_path):
-        return env_path
-
-    # 2. 检查项目 bin 目录
-    bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
-    for root, dirs, files in os.walk(bin_dir):
-        for f in files:
-            if f == "chromedriver" or f == "chromedriver.exe":
-                return os.path.join(root, f)
-
-    # 3. 检查 PATH
-    import shutil
-    path_chromedriver = shutil.which("chromedriver")
-    if path_chromedriver:
-        return path_chromedriver
-
-    # 4. Selenium Manager 自动管理（返回 None，让 Selenium 自动处理）
+    """自动查找ChromeDriver路径
+    
+    重要：强制使用 Selenium Manager 自动管理版本
+    系统中的 chromedriver (v108) 与 Chrome (v149) 版本不兼容
+    返回 None 让 Selenium 自动下载匹配版本的 chromedriver
+    """
+    # 清除旧的环境变量，确保使用Selenium Manager
+    import os
+    if 'CHROMEDRIVER_PATH' in os.environ:
+        del os.environ['CHROMEDRIVER_PATH']
     return None
 
 
@@ -416,7 +409,7 @@ class Frame:
 
     def _get_page(self):
         """获取关联的Page对象"""
-        return Page._current_page or Page(self.driver)
+        return Page._get_current_page() or Page(self.driver)
 
     @property
     def url(self) -> str:
@@ -734,10 +727,29 @@ class Route:
 
 
 # ========== Page 兼容类 ==========
+import threading as _threading
+
 class Page:
     """模拟 Playwright Page 对象，核心适配层"""
 
-    _current_page = None  # 类变量，用于frame引用
+    _thread_local = _threading.local()  # 线程局部变量，避免多页面并发时互相覆盖
+
+    @classmethod
+    def _get_current_page(cls):
+        return getattr(cls._thread_local, 'page', None)
+
+    @classmethod
+    def _set_current_page(cls, page):
+        cls._thread_local.page = page
+
+    # 保持旧接口兼容
+    @property
+    def _current_page(self):
+        return self._get_current_page()
+
+    @_current_page.setter
+    def _current_page(self, value):
+        self._set_current_page(value)
 
     def __init__(self, driver, context=None):
         self.driver = driver
@@ -751,7 +763,7 @@ class Page:
         self._request_id_map = {}
         self.mouse = Mouse(driver)
         self.keyboard = Keyboard(driver)
-        Page._current_page = self
+        Page._set_current_page(self)
 
     @property
     def url(self) -> str:
@@ -762,15 +774,21 @@ class Page:
 
     @property
     def request(self) -> Request:
-        """返回当前页面的请求信息"""
+        """返回当前页面的请求信息（从浏览器上下文动态读取实际headers）"""
+        headers = {}
+        if self._context and hasattr(self._context, '_options'):
+            headers = dict(self._context._options.get("extra_http_headers") or {})
+        # 补全 User-Agent
+        if "User-Agent" not in headers and "user-agent" not in headers:
+            try:
+                ua = self.driver.execute_script("return navigator.userAgent")
+                if ua:
+                    headers["User-Agent"] = ua
+            except Exception:
+                pass
         return Request(
             url=self.url,
-            headers={
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-            }
+            headers=headers
         )
 
     @property
@@ -1297,8 +1315,8 @@ class BrowserContext:
                     cdp_kwargs["userAgentMetadata"] = meta
             if cdp_kwargs:
                 self.driver.execute_cdp_cmd("Network.setUserAgentOverride", cdp_kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"CDP Network.setUserAgentOverride 失败: {e}")
 
         # 设置时区
         timezone = opts.get("timezone_id", "")
@@ -1307,8 +1325,8 @@ class BrowserContext:
                 self.driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {
                     "timezoneId": timezone
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CDP Emulation.setTimezoneOverride 失败: {e}")
 
         # 设置语言locale
         locale = opts.get("locale", "")
@@ -1317,8 +1335,8 @@ class BrowserContext:
                 self.driver.execute_cdp_cmd("Emulation.setLocaleOverride", {
                     "locale": locale
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CDP Emulation.setLocaleOverride 失败: {e}")
 
         # 设置视口
         viewport = opts.get("viewport", {})
@@ -1332,8 +1350,8 @@ class BrowserContext:
                     "deviceScaleFactor": opts.get("device_scale_factor", 1),
                     "mobile": opts.get("is_mobile", False)
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CDP Emulation.setDeviceMetricsOverride 失败: {e}")
 
         # 设置额外HTTP头
         if extra_headers:
@@ -1341,8 +1359,8 @@ class BrowserContext:
                 self.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
                     "headers": extra_headers
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"CDP Network.setExtraHTTPHeaders 失败: {e}")
 
         # 设置权限（全部拒绝）
         try:
@@ -1350,8 +1368,8 @@ class BrowserContext:
                 "permission": {"name": "notifications"},
                 "setting": "denied"
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"CDP Browser.setPermission 失败: {e}")
 
         # 加载storage_state（cookies和localStorage）
         storage_state_path = opts.get("storage_state")
@@ -1693,28 +1711,22 @@ class Chromium:
         # 禁用自动化控制特征
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
 
-        # 查找ChromeDriver
-        chromedriver_path = _find_chromedriver()
-
+        # 终极修复：Selenium 4.45+ 会自动调用 Selenium Manager
+        # 已移除系统中的旧版 chromedriver v108，Selenium Manager 将自动下载 v149
         try:
-            if chromedriver_path:
-                service = Service(executable_path=chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            else:
-                # 让Selenium Manager自动管理
-                driver = webdriver.Chrome(options=chrome_options)
+            driver = webdriver.Chrome(options=chrome_options)
         except Exception as e:
-            # 重试：不指定binary_location
-            if chrome_binary:
-                chrome_options.binary_location = None
-                try:
-                    if chromedriver_path:
-                        service = Service(executable_path=chromedriver_path)
-                        driver = webdriver.Chrome(service=service, options=chrome_options)
-                    else:
+            error_msg = str(e)
+            # 如果是因为找不到驱动，尝试手动指定 Chrome 二进制路径后重试
+            if 'Unable to obtain driver' in error_msg or 'chromedriver' in error_msg.lower():
+                if chrome_binary:
+                    chrome_options.binary_location = chrome_binary
+                    try:
                         driver = webdriver.Chrome(options=chrome_options)
-                except Exception as e2:
-                    raise RuntimeError(f"Chrome启动失败: {e}; 无binary重试失败: {e2}")
+                    except Exception as e2:
+                        raise RuntimeError(f"Chrome启动失败: {e}; 指定binary后仍失败: {e2}")
+                else:
+                    raise
             else:
                 raise
 
@@ -1730,9 +1742,28 @@ class Chromium:
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
                 delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-                // WebRTC 禁用 - 覆盖 RTCPeerConnection
-                window.RTCPeerConnection = undefined;
-                window.webkitRTCPeerConnection = undefined;
+                // WebRTC IP泄露保护（保留API但阻止内网IP泄露）
+                (function() {
+                    const _origRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+                    if (!_origRTC) return;
+                    const _patchedRTC = function(config) {
+                        if (config && config.iceServers) { config.iceServers = []; }
+                        const pc = new _origRTC(config);
+                        pc.addEventListener('icecandidate', function(e) {
+                            if (e.candidate && e.candidate.candidate) {
+                                const c = e.candidate.candidate;
+                                if (/((10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.))/.test(c)) { return; }
+                            }
+                        });
+                        return pc;
+                    };
+                    _patchedRTC.prototype = _origRTC.prototype;
+                    Object.defineProperty(_patchedRTC, 'toString', {
+                        value: function() { return 'function RTCPeerConnection() { [native code] }'; }
+                    });
+                    window.RTCPeerConnection = _patchedRTC;
+                    if (window.webkitRTCPeerConnection) { window.webkitRTCPeerConnection = _patchedRTC; }
+                })();
                 // Cookie/LocalStorage 随机化
                 try {
                     if (localStorage.length < 3) {
@@ -1743,23 +1774,22 @@ class Chromium:
                 } catch(e) {}
                 """
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"CDP Page.addScriptToEvaluateOnNewDocument 失败: {e}")
 
-        # 移除webdriver标识 + 设置请求头
+        # 移除webdriver标识 + 设置默认请求头（后续 new_context 会用实际指纹覆盖）
         try:
             driver.execute_cdp_cmd("Network.enable", {})
-            # 设置标准请求头（修复缺失 Accept-Language / Sec-Ch-Ua）
+            # 设置通用默认请求头（new_context 创建时会通过 _apply_context_config 覆盖为实际值）
             driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
                 "headers": {
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-                    "Sec-Ch-Ua-Mobile": "?0",
-                    "Sec-Ch-Ua-Platform": '"Windows"',
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Upgrade-Insecure-Requests": "1",
                 }
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"CDP Network.setExtraHTTPHeaders 失败: {e}")
 
         # 注册到全局活跃列表，供 force_quit_all() 停止时强制关闭
         _register_driver(driver)

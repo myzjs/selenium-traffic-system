@@ -22,18 +22,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("seo_query")
 
-# 默认的SEO配置结构（用于校验和兜底）
+# 默认的SEO配置结构（用于校验和兖底）
 DEFAULT_SEO_CONFIG = {
     "search_engines": [
-        {"id": "baidu", "name": "百度", "url": "https://www.baidu.com/s?wd=", "language": "zh"},
-        {"id": "sogou", "name": "搜狗", "url": "https://www.sogou.com/web?query=", "language": "zh"},
-        {"id": "so360", "name": "360搜索", "url": "https://www.so.com/s?q=", "language": "zh"},
-        {"id": "google", "name": "谷歌", "url": "https://www.google.com/search?q=", "language": "en"},
-        {"id": "bing", "name": "必应", "url": "https://www.bing.com/search?q=", "language": "en"}
+        {"id": "google", "name": "谷歌", "url": "https://www.google.com/search?q=", "language": "en", "type": "search"},
+        {"id": "bing", "name": "必应", "url": "https://www.bing.com/search?q=", "language": "en", "type": "search"},
+        {"id": "baidu", "name": "百度", "url": "https://www.baidu.com/s?wd=", "language": "zh", "type": "search"},
+        {"id": "sogou", "name": "搜狗", "url": "https://www.sogou.com/web?query=", "language": "zh", "type": "search"},
+        {"id": "facebook", "name": "Facebook", "url": "https://www.facebook.com/", "language": "en", "type": "social"},
+        {"id": "twitter", "name": "Twitter/X", "url": "https://x.com/", "language": "en", "type": "social"},
+        {"id": "reddit", "name": "Reddit", "url": "https://www.reddit.com/", "language": "en", "type": "social"},
+        {"id": "instagram", "name": "Instagram", "url": "https://www.instagram.com/", "language": "en", "type": "social"},
+        {"id": "linkedin", "name": "LinkedIn", "url": "https://www.linkedin.com/", "language": "en", "type": "social"},
+        {"id": "tiktok", "name": "TikTok", "url": "https://www.tiktok.com/", "language": "en", "type": "social"}
     ],
     "region_engine_map": {
-        "中国": ["baidu", "sogou", "so360"],
-        "美国": ["google", "bing"]
+        "US": ["google", "bing", "facebook", "twitter", "reddit", "instagram"],
+        "GB": ["google", "bing", "facebook", "twitter", "reddit"],
+        "AU": ["google", "bing", "facebook", "reddit", "instagram"],
+        "DE": ["google", "bing", "facebook", "instagram"],
+        "FR": ["google", "bing", "facebook", "instagram"],
+        "JP": ["google", "bing", "twitter", "instagram", "tiktok"],
+        "CN": ["baidu", "sogou", "tiktok"]
     },
     "keyword_pools": {
         "zh": ["广告联盟", "SEO优化", "网站推广", "网络营销", "数字营销"],
@@ -425,14 +435,21 @@ class SEOConfigQuery:
         :return: Referer URL，生成失败则返回None
         """
         referer_mode = self.get_referer_mode()
-        engine_url = self.get_engine_url(engine_id)
+        engine = self.get_engine_by_id(engine_id)
+        engine_url = engine.get("url") if engine else None
+        engine_type = engine.get("type", "search") if engine else "search"
         
         if not engine_url:
             logger.error(f"无法生成Referer：引擎ID '{engine_id}' 的URL为空")
             return None
         
+        # 社媒平台：直接使用平台URL作为Referer（不拼接关键词）
+        if engine_type == "social":
+            logger.info(f"社媒平台Referer: {engine_url}")
+            return engine_url
+        
+        # 搜索引擎：动态拼接关键词
         if referer_mode == "dynamic":
-            # 动态模式：根据规则生成
             if not keyword:
                 keyword = self.get_random_keyword_for_engine(engine_id)
                 if not keyword:
@@ -447,9 +464,10 @@ class SEOConfigQuery:
             logger.info(f"动态生成Referer: {referer}")
             return referer
         else:
-            # 静态模式：当前版本暂不支持静态Referer池，使用动态模式替代
-            logger.warning(f"静态Referer模式暂未实现，使用动态模式替代")
-            return self.generate_referer(engine_id, keyword)
+            # 静态模式：使用搜索引擎主页
+            homepage = self.get_engine_homepage(engine_url)
+            logger.info(f"静态Referer: {homepage}")
+            return homepage or engine_url
     
     def get_engine_homepage(self, engine_url: str) -> Optional[str]:
         """

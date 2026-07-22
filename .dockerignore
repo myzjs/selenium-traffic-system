@@ -1,0 +1,29 @@
+# Docker 构建排除文件
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.git/
+.gitignore
+.env
+*.bak
+*.log
+report/
+test_reports/
+feedback/
+qa_sessions/
+logs/
+.uploads/
+# 测试文件（生产不需要）
+tests/
+pytest.ini
+test_*.py
+# 文档
+*.md
+# IDE
+.vscode/
+.idea/
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -118,7 +118,7 @@ def _http_get_json(url: str, timeout: float = 15.0) -> Optional[Dict]:
 def _query_ip_api(ip: str) -> Dict:
     """ip-api.com 免费版：45 次/分钟，无需 key"""
     data = _http_get_json(
-        f"http://ip-api.com/json/{ip}?fields=status,countryCode,country,timezone,query"
+        f"https://ip-api.com/json/{ip}?fields=status,countryCode,country,timezone,query"
     )
     if data and data.get("status") == "success":
         return {

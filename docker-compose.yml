@@ -1,0 +1,65 @@
+# ============================================================
+# selenium_traffic_system Docker Compose
+# 东京服务器一键部署
+# ============================================================
+version: "3.8"
+
+services:
+  traffic-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: selenium-traffic
+    restart: unless-stopped
+    ports:
+      - "${RUN_PORT:-5001}:5001"
+    environment:
+      # === 运行配置 ===
+      - RUN_HOST=0.0.0.0
+      - RUN_PORT=5001
+      # === IPDeep 代理凭据 ===
+      - IP_PROXY_API=${IP_PROXY_API}
+      - IP_PROXY_USER=${IP_PROXY_USER}
+      - IP_PROXY_PWD=${IP_PROXY_PWD}
+      # === Flask 认证 ===
+      - FLASK_AUTH_USER=${FLASK_AUTH_USER:-admin}
+      - FLASK_AUTH_PASS=${FLASK_AUTH_PASS}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
+      # === Chrome 配置 ===
+      - CHROME_BIN=/usr/bin/chromium
+      - CHROMEDRIVER_PATH=/usr/bin/chromedriver
+    volumes:
+      # 配置文件持久化
+      - ./config.json:/app/config.json
+      # QA 会话持久化（Cookie/localStorage）
+      - ./qa_sessions:/app/qa_sessions
+      # 报告输出
+      - ./report:/app/report
+      # 日志
+      - ./logs:/app/logs
+    # Chromium 需要共享内存（避免崩溃）
+    shm_size: "2gb"
+    # 安全选项（Chromium 沙箱需要）
+    security_opt:
+      - seccomp:unconfined
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 1G
+          cpus: "0.5"
+    # 日志配置（避免磁盘写满）
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - traffic-net
+
+networks:
+  traffic-net:
+    driver: bridge

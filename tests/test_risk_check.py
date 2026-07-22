@@ -26,6 +26,22 @@ def make_evaluate_side_effect(webdriver=False, referer="https://google.com", tz=
     def side_effect(*args):
         s = args[0] if args else ""
         # 基础信息
+        if "viewport_larger_than_screen" in s:
+            return {
+                "screen": [1920, 1080],
+                "viewport": [1900, 1000],
+                "viewport_larger_than_screen": False,
+                "viewport_ratio": 0.99
+            }
+        if "hardwareConcurrency" in s:
+            return {
+                "hardwareConcurrency": 8,
+                "deviceMemory": 8,
+                "hc_reasonable": True,
+                "hc_suspicious": False,
+                "dm_reasonable": True,
+                "dm_suspicious": False
+            }
         if "navigator.userAgent" in s:
             return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"
         if "navigator.platform" in s:

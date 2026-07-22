@@ -3,6 +3,8 @@ pytest 公共 fixtures 和配置
 """
 import json
 import os
+from unittest.mock import MagicMock
+
 import pytest
 
 # 项目根目录
@@ -20,22 +22,22 @@ def sample_config():
 
 
 @pytest.fixture
-def mock_page(mocker):
-    """创建一个模拟的 Playwright page 对象"""
-    page = mocker.MagicMock()
+def mock_page():
+    """创建一个模拟的 Playwright page 对象（无需 pytest-mock）"""
+    page = MagicMock()
     page.evaluate.return_value = None
     page.goto.return_value = None
     page.viewport_size = {"width": 1920, "height": 1080}
-    page.mouse = mocker.MagicMock()
-    page.request = mocker.MagicMock()
+    page.mouse = MagicMock()
+    page.request = MagicMock()
     page.request.headers = {}
     return page
 
 
 @pytest.fixture
 def mock_response():
-    """创建一个模拟的 requests.Response 对象"""
-    response = mocker.MagicMock()
+    """创建一个模拟的 requests.Response 对象（无需 pytest-mock）"""
+    response = MagicMock()
     response.status_code = 200
     response.json.return_value = {"success": True, "data": {}}
     response.text = '{"success": true}'

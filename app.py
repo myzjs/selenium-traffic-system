@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response, send_from_directory
 import requests
 from requests.auth import HTTPBasicAuth
 import urllib.parse
@@ -22,11 +22,34 @@ import selenium_bridge as _selenium_bridge
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
 def _bridge_should_stop():
-    return (not globals().get("task_running", True)) or (not globals().get("video_task_running", True))
+    return not globals().get("task_running", True)
 _selenium_bridge.set_stop_check(_bridge_should_stop)
 
 # 导入新创建的模块
 import sys, os
+
+# ========== 加载 .env 文件（若存在）==========
+def _load_dotenv(dotenv_path=None):
+    """简易 .env 加载器，避免引入 python-dotenv 依赖"""
+    if dotenv_path is None:
+        dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:  # 不覆盖已有环境变量
+                os.environ[key] = value
+
+_load_dotenv()
+
 print("Current directory:", os.getcwd())
 print("sys.path:", sys.path)
 from seo_query_module import get_seo_query
@@ -158,11 +181,73 @@ def generate_bimodal_hours(num_tasks):
         hours.append(h)
     return sorted(hours)
 
+def generate_burst_hours(num_tasks):
+    """突发流量模型：模拟真实用户的突发访问行为（如热点事件、社交分享）"""
+    hours = []
+    if num_tasks <= 0:
+        return []
+    # 随机选择 1-3 个突发时段
+    num_bursts = random.randint(1, min(3, max(1, num_tasks // 5)))
+    burst_centers = [random.uniform(6, 23) for _ in range(num_bursts)]
+    tasks_per_burst = num_tasks // num_bursts
+    remainder = num_tasks % num_bursts
+    
+    for i, center in enumerate(burst_centers):
+        count = tasks_per_burst + (1 if i < remainder else 0)
+        # 突发时段内使用较集中的分布（标准差 0.5-1.5 小时）
+        spread = random.uniform(0.5, 1.5)
+        for _ in range(count):
+            h = clamp_hour(random.normalvariate(center, spread))
+            hours.append(h)
+    
+    # 添加少量背景流量（10-20%）
+    background_count = max(1, int(num_tasks * random.uniform(0.1, 0.2)))
+    for _ in range(background_count):
+        h = clamp_hour(random.uniform(7, 23))
+        hours.append(h)
+    
+    return sorted(hours[:num_tasks])  # 确保不超过 num_tasks
+
+
+def get_weekend_holiday_multiplier(date_obj):
+    """根据日期返回流量倍率（模拟真实网站的周末/节假日流量波动）
+    
+    - 工作日: ~1.0（基准，周一略低、周五略高）
+    - 周六: 0.75~0.85（周末流量通常下降）
+    - 周日: 0.65~0.80（周日更低）
+    - 节假日: 0.50~0.70（重大节日流量大幅下降）
+    """
+    weekday = date_obj.weekday()  # 0=周一, 6=周日
+    month, day = date_obj.month, date_obj.day
+    
+    # 简单节假日检测（主要西方节日）
+    major_holidays = [
+        (1, 1),   # 元旦
+        (12, 25), # 圣诞节
+        (12, 24), # 平安夜
+        (7, 4),   # 美国独立日
+    ]
+    # 感恩节（11月第四个周四）
+    if month == 11 and weekday == 3 and 22 <= day <= 28:
+        return random.uniform(0.50, 0.70)
+    if (month, day) in major_holidays:
+        return random.uniform(0.50, 0.70)
+    
+    if weekday == 5:  # 周六
+        return random.uniform(0.75, 0.85)
+    elif weekday == 6:  # 周日
+        return random.uniform(0.65, 0.80)
+    else:  # 工作日微小波动
+        base = {0: 0.92, 1: 1.0, 2: 1.0, 3: 1.0, 4: 1.05}.get(weekday, 1.0)
+        return base * random.uniform(0.95, 1.05)
+
+
 MODEL_FUNCTIONS = {
     "normal": generate_normal_hours,
     "gamma": generate_gamma_hours,
     "poisson": generate_poisson_hours,
-    "bimodal": generate_bimodal_hours
+    "bimodal": generate_bimodal_hours,
+    "burst": generate_burst_hours
 }
 
 def get_site_age_category(site_creation_date_str):
@@ -180,7 +265,7 @@ def get_site_age_category(site_creation_date_str):
             return "mid"
         else:
             return "old"
-    except:
+    except Exception:
         return "old"
 
 # ========== 全球时段调度辅助函数（24小时全球分布）==========
@@ -373,7 +458,7 @@ def select_country_by_quota(candidates, country_quota_used, country_quota_target
 def validate_web_navigation_config(cfg, fail_hard=False):
     """校验 web_navigation 配置（网页浏览模式）。
     - 检查 loop_count / loop_interval 必须为 {min, max} 且 min <= max
-    - 检查 layer_1..layer_6 的 stay_ratio 不能全为 0
+    - 检查 layer_1..layer_5 的 stay_ratio 不能全为 0
     - 返回 (success: bool, errors: list[str])
     """
     errors = []
@@ -408,9 +493,9 @@ def validate_web_navigation_config(cfg, fail_hard=False):
         except Exception:
             errors.append("loop_interval 必须为数字")
 
-    # layer stay_ratio 检查
+    # layer stay_ratio 检查（只检查 layer_1 到 layer_5）
     ratio_sum = 0.0
-    for li2 in range(1, 7):
+    for li2 in range(1, 6):
         layer = wn.get(f"layer_{li2}", {}) if isinstance(wn.get(f"layer_{li2}", {}), dict) else {}
         r = layer.get("stay_ratio", 0)
         try:
@@ -418,7 +503,7 @@ def validate_web_navigation_config(cfg, fail_hard=False):
         except Exception:
             errors.append(f"layer_{li2}.stay_ratio 必须为数字")
     if ratio_sum <= 0 and not errors:
-        errors.append("layer_1..layer_6 的 stay_ratio 之和必须 > 0")
+        errors.append("layer_1..layer_5 的 stay_ratio 之和必须 > 0")
 
     if fail_hard and errors:
         raise ValueError("网页浏览模式配置错误: " + "; ".join(errors))
@@ -717,8 +802,19 @@ def generate_daily_tasks_legacy(cfg):
         local_datetime = utc_datetime.astimezone(local_tz)
         local_tp = (local_datetime - today_local_start).total_seconds()
         
-        # 任务间隔
-        task_gap = 0 if is_first else random.uniform(interval_cfg["min"], interval_cfg["max"])
+        # 任务间隔（增强随机性：非线性抖动 + 偶尔分心暂停）
+        if is_first:
+            task_gap = 0
+        else:
+            base_gap = random.uniform(interval_cfg["min"], interval_cfg["max"])
+            # 10% 概率出现"分心暂停"（模拟用户去倒水、看手机等）
+            if random.random() < 0.10:
+                base_gap += random.uniform(30, 120)
+            # 5% 概率出现"短暂快速操作"（模拟用户快速连续浏览）
+            elif random.random() < 0.05:
+                base_gap = max(3, base_gap * 0.3)
+            # 添加 ±15% 高斯微抖动
+            task_gap = max(2, base_gap * (1 + random.gauss(0, 0.15)))
         is_first = False
         
         # 顺延冲突处理：确保任务不会重叠（使用本地时间）
@@ -935,6 +1031,10 @@ def generate_daily_tasks(cfg):
             continue
 
         full_day_tasks = random.randint(day_min, day_max)
+        # 周末/节假日流量调整（模拟真实网站流量波动）
+        _day_date = day_local_start.date() if hasattr(day_local_start, 'date') else day_local_start
+        _wk_multiplier = get_weekend_holiday_multiplier(_day_date)
+        full_day_tasks = max(1, int(round(full_day_tasks * _wk_multiplier)))
         if day_idx == 0:
             remain_ratio = max(0.0, (day_end_sec - available_start) / 86400.0)
             planned_for_day = int(round(full_day_tasks * remain_ratio))
@@ -1248,23 +1348,52 @@ def save_qa_storage_state(context, site_url, country, state_path, meta_path):
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ========== Flask 安全配置 ==========
+import secrets
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+
+# ========== HTTP Basic Auth 中间件（已禁用）==========
+# from functools import wraps
+
+# AUTH_USER = os.environ.get("FLASK_AUTH_USER", "admin")
+# AUTH_PASS = os.environ.get("FLASK_AUTH_PASS", "")  # 默认无密码，生产环境必须设置
+
+# def _check_basic_auth():
+#     """检查 HTTP Basic Auth，返回是否认证通过"""
+#     if not AUTH_PASS:
+#         # 未配置密码时仅允许本地访问
+#         if request.remote_addr not in ("127.0.0.1", "::1"):
+#             return False
+#         return True
+#     auth = request.authorization
+#     if not auth:
+#         return False
+#     return auth.username == AUTH_USER and auth.password == AUTH_PASS
+
+# @app.before_request
+# def require_auth():
+#     """全局认证中间件，跳过健康检查接口"""
+#     if request.path in ("/health", "/ping"):
+#         return None
+#     if not _check_basic_auth():
+#         return Response(
+#             "Authentication required",
+#             status=401,
+#             headers={"WWW-Authenticate": 'Basic realm="Login Required"'}
+#         )
+#     return None
+
 # 全局变量
 config = {
     # 网络Tab参数
     "ip_proxy_api": "",
     "ip_proxy_user": "",
     "ip_proxy_pwd": "",
-    "vps_host": "127.0.0.1",
-    "vps_port": 8888,
-    "vps_new_port": 8888,
-    "vps_socks5_port": 1080,
     "skip_browser_ip_check": False,
     "webrtc_leak_check_enabled": True,
     "qa_session_enabled": True,
     "session_mode": "country_host_7d",
     "ua_repeat_max_rate": 0.2,
-    "vps_user": "admin",
-    "vps_pass": "admin123",
     
     # 任务Tab参数
     "target_urls": [
@@ -1282,16 +1411,7 @@ config = {
         "old": {"min": 500, "max": 1500}
     },
     "plan_days": 1,
-    "adsl_task_count": 1,
-    "vt_adsl_task_count": 1,
-    "adsl_profile": "pppoe",
     "ip_provider_type": "proxy_api",
-    "adsl_username": "",
-    "adsl_password": "",
-    "adsl_interface": "ppp0",
-    "adsl_min_redial_interval": 30,
-    "adsl_ip_blacklist_hours": 24,
-    "adsl_ip_redial_max_attempts": 10,
     "task_interval": {"min": 10, "max": 60},
     
     # 模型Tab参数（与config.json保持一致）
@@ -1313,16 +1433,6 @@ config = {
     "bezier_pause_prob": {"min": 0.05, "max": 0.2},
     "mouse_move_pause": {"min": 0.01, "max": 0.1},
     
-    # 社媒引流配置
-    "social_media": {
-        "platform_region": "auto",
-        "platforms": ["facebook", "twitter", "instagram"],
-        "frequency": {"min": 10, "max": 30},
-        "stay_time": {"min": 30, "max": 60},
-        "interaction_prob": {"min": 0.1, "max": 0.3},
-        "post_urls": []
-    },
-    
     # 其他参数
     "enabled": False,
     "ad_selector": ".ad-container, [class*='ad'], [id*='ad']",
@@ -1337,15 +1447,25 @@ config = {
     
     "seo": {
         "search_engines": [
-            {"id": "baidu", "name": "百度", "url": "https://www.baidu.com/s?wd=", "language": "zh"},
-            {"id": "sogou", "name": "搜狗", "url": "https://www.sogou.com/web?query=", "language": "zh"},
-            {"id": "so360", "name": "360搜索", "url": "https://www.so.com/s?q=", "language": "zh"},
-            {"id": "google", "name": "谷歌", "url": "https://www.google.com/search?q=", "language": "en"},
-            {"id": "bing", "name": "必应", "url": "https://www.bing.com/search?q=", "language": "en"}
+            {"id": "google", "name": "谷歌", "url": "https://www.google.com/search?q=", "language": "en", "type": "search"},
+            {"id": "bing", "name": "必应", "url": "https://www.bing.com/search?q=", "language": "en", "type": "search"},
+            {"id": "baidu", "name": "百度", "url": "https://www.baidu.com/s?wd=", "language": "zh", "type": "search"},
+            {"id": "sogou", "name": "搜狗", "url": "https://www.sogou.com/web?query=", "language": "zh", "type": "search"},
+            {"id": "facebook", "name": "Facebook", "url": "https://www.facebook.com/", "language": "en", "type": "social"},
+            {"id": "twitter", "name": "Twitter/X", "url": "https://x.com/", "language": "en", "type": "social"},
+            {"id": "reddit", "name": "Reddit", "url": "https://www.reddit.com/", "language": "en", "type": "social"},
+            {"id": "instagram", "name": "Instagram", "url": "https://www.instagram.com/", "language": "en", "type": "social"},
+            {"id": "linkedin", "name": "LinkedIn", "url": "https://www.linkedin.com/", "language": "en", "type": "social"},
+            {"id": "tiktok", "name": "TikTok", "url": "https://www.tiktok.com/", "language": "en", "type": "social"}
         ],
         "region_engine_map": {
-            "中国": ["baidu", "sogou", "so360"],
-            "美国": ["google", "bing"]
+            "US": ["google", "bing", "facebook", "twitter", "reddit", "instagram"],
+            "GB": ["google", "bing", "facebook", "twitter", "reddit"],
+            "AU": ["google", "bing", "facebook", "reddit", "instagram"],
+            "DE": ["google", "bing", "facebook", "instagram"],
+            "FR": ["google", "bing", "facebook", "instagram"],
+            "JP": ["google", "bing", "twitter", "instagram", "tiktok"],
+            "CN": ["baidu", "sogou", "tiktok"]
         },
         "keyword_pools": {
             "zh": ["广告联盟", "SEO优化", "网站推广", "网络营销", "数字营销"],
@@ -1420,28 +1540,17 @@ config = {
             "stay_ratio": 0.3,
             "min_stay": 10
         },
-        # 第5层 → 第6层（可选）
+        # 第5层
         "layer_5": {
             "keywords": [],
             "fallback_urls": [],
             "stay_ratio": 0.2,
             "min_stay": 10
         },
-        # 第6层（最后一层）
-        "layer_6": {
-            "keywords": [],
-            "fallback_urls": [],
-            "stay_ratio": 0.1,
-            "min_stay": 10
-        },
         # 循环次数配置
         "loop_count": {"min": 1, "max": 3},
         # 每轮浏览的间隔时长（秒）
         "loop_interval": {"min": 1, "max": 5},
-        # 返回链接关键字
-        "back_links": ["返回", "back", "目录"],
-        # 返回首页链接关键字
-        "back_home_links": ["首页", "home"]
     },
     
     # 代理池配置
@@ -1841,7 +1950,7 @@ class UAPoolManager:
                             ua = self.ua_generator.chrome
                             if ua and ua not in ua_pool:
                                 ua_pool.append(ua)
-                        except:
+                        except Exception:
                             pass
                 else:
                     # 英文环境
@@ -1850,7 +1959,7 @@ class UAPoolManager:
                             ua = self.ua_generator.random
                             if ua and ua not in ua_pool:
                                 ua_pool.append(ua)
-                        except:
+                        except Exception:
                             pass
             except Exception as e:
                 self._safe_log("debug", f"fake_useragent 生成失败: {e}")
@@ -2139,15 +2248,15 @@ def interruptible_sleep(seconds, check_interval=0.5):
 
 def video_interruptible_sleep(seconds, check_interval=0.5):
     """
-    视频任务专用的可中断 sleep：分片休眠，期间持续检查 video_task_running，
+    可中断 sleep：分片休眠，期间持续检查 task_running，
     支持「点击停止按钮后 1 秒内立即中断当前等待」。
     返回 True 表示完整睡完，False 表示被中断。
     """
     import time as _t
-    global video_task_running
+    global task_running
     remaining = max(0.0, float(seconds))
     while remaining > 0:
-        if not video_task_running:
+        if not task_running:
             return False
         # 每 5 秒更新一次真人模型心跳，避免超时
         if int(remaining) % 5 == 0:
@@ -2207,16 +2316,15 @@ def get_global_session_mode():
 
 def simulate_human_in_window(page, duration, stats, current_x, current_y, config, page_name="页面", deadline=None):
     """
-    在 duration 秒的时间窗内，穿插执行真人行为（鼠标移动/滚动/键盘/随机停顿）。
-    动作之间随机间隔 0.5-3 秒，超时即停；内部每步都会打日志（直播效果）。
-    任何动作异常都吞掉，不中断窗口。
-    deadline: 绝对时间戳（time.time() 的秒）。若提供且早于 duration 自然结束时间，则提前停。
+    在 duration 秒的时间窗内，穿插执行真人行为（鼠标移动/滚动/键盘/随机停顿/随机点击）。
+    所有动作参数均从 config 中读取（random.uniform(min, max)）。
+    deadline: 绝对时间戳。若提供且早于 duration 自然结束时间，则提前停。
     返回更新后的 (current_x, current_y)。
     """
     import time as _t
     import random as _rnd
 
-    # 补全 stats 默认字段（防止调用方漏初始化）
+    # 补全 stats 默认字段
     for _k in ("mouse_moves", "scrolls", "scroll_distance", "clicks",
                "waits", "key_presses", "total_stay"):
         stats.setdefault(_k, 0)
@@ -2225,33 +2333,46 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
     duration = max(0.0, float(duration))
     window_end = start + duration
     if deadline is not None and deadline < window_end:
-        log.info(
-            f"[{page_name}] 🛡️ 保险绳提前触发："
-            f"自然结束在 {duration:.0f}s，但 deadline 在 {(deadline-start):.0f}s，"
-            f"按保险绳裁剪。"
-        )
         window_end = float(deadline)
+
+    # ========== 从配置读取所有真人模型参数 ==========
+    scroll_cfg = config.get("scroll_pixels", {"min": 100, "max": 800})
+    scroll_wait_cfg = config.get("scroll_wait", {"min": 0.5, "max": 2.0})
+    scroll_count_cfg = config.get("scroll_count", {"min": 2, "max": 10})
+    mouse_steps_cfg = config.get("mouse_move_steps", {"min": 50, "max": 250})
+    mouse_wait_cfg = config.get("mouse_move_wait", {"min": 0.1, "max": 1.0})
+    mouse_pause_cfg = config.get("mouse_move_pause", {"min": 0.01, "max": 0.1})
+    bezier_pause_cfg = config.get("bezier_pause_prob", {"min": 0.05, "max": 0.2})
+    click_count_cfg = config.get("random_click_count", {"min": 0, "max": 3})
+    click_wait_cfg = config.get("random_click_wait", {"min": 0.5, "max": 2.0})
+    page_load_cfg = config.get("page_load_wait", {"min": 1.0, "max": 3.0})
+
+    # 页面加载后先等待（模拟真人反应）
+    _init_wait = _rnd.uniform(page_load_cfg.get("min", 1.0), page_load_cfg.get("max", 3.0))
+    _init_wait = min(_init_wait, max(0, window_end - _t.time()))
+    if _init_wait > 0:
+        _t.sleep(_init_wait)
+        stats["total_stay"] += _init_wait
+        stats["waits"] += 1
 
     log.info(
         f"[{page_name}] 🎭 真人模拟窗口启动: 时长 {duration:.1f}s，"
-        f"动作随机（滚动/鼠标/暂停/键盘），间隔 0.5-3s（每约 8-12 秒输出一次摘要，单步动作仅 DEBUG）"
+        f"动作随机（滚动/鼠标/点击/键盘），参数均从配置读取"
     )
 
-    # 动作权重：滚动最常见，鼠标其次，停顿其次，键盘偶发
+    # 动作权重：滚动和鼠标为主
     actions = (
-        ["scroll"] * 5 +
+        ["scroll"] * 4 +
         ["mouse"] * 4 +
-        ["pause"] * 3 +
+        ["click"] * 1 +
         ["key"] * 1
     )
 
-    scroll_cfg = config.get("scroll_pixels", {"min": 100, "max": 800})
-
     action_errors = 0
     loop_count = 0
-    # 周期摘要：每次累计到一定动作数时打一条 INFO 摘要（而不是每步都打）
-    summary_interval = 6  # 大约每 6 次动作打一条摘要
+    summary_interval = 6
     next_summary_at = summary_interval
+    bezier_prob = _rnd.uniform(bezier_pause_cfg.get("min", 0.05), bezier_pause_cfg.get("max", 0.2))
 
     while True:
         human_model_tick(page_name)
@@ -2260,11 +2381,9 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
         remaining = window_end - _t.time()
         if remaining <= 0:
             break
-        # 长会话疲劳模拟：随窗口已进行时长，动作间隔逐渐变长（人累了变慢），上限 1.8x
-        _elapsed_ratio = min(1.0, (_t.time() - start) / duration) if duration > 0 else 0.0
-        _fatigue = 1.0 + 0.8 * _elapsed_ratio
-        # 动作间隔（也算"真人感"）：0.5-3s × 疲劳系数，且不超出剩余窗口
-        gap = min(remaining, _rnd.uniform(0.5, 3.0) * _fatigue)
+        
+        # 动作间隔：0.5-2s
+        gap = min(remaining, _rnd.uniform(0.5, 2.0))
         _t.sleep(gap)
         stats["total_stay"] += gap
         if _t.time() >= window_end or not task_running:
@@ -2276,15 +2395,21 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
             if action == "scroll":
                 dy = _rnd.randint(int(scroll_cfg.get("min", 100)), int(scroll_cfg.get("max", 800)))
                 if _rnd.random() < 0.15:
-                    dy = -dy  # 偶发回滚
+                    dy = -dy
                 page.evaluate(f"window.scrollBy(0, {dy})")
                 stats["scrolls"] += 1
                 stats["scroll_distance"] += abs(dy)
-                log.debug(f"[{page_name}] 🖱️ 滚动 {dy:+d}px（累计 {stats['scroll_distance']}px, {stats['scrolls']} 次）")
+                # 滚动后等待（从配置读取）
+                _sw = min(window_end - _t.time(), _rnd.uniform(scroll_wait_cfg.get("min", 0.5), scroll_wait_cfg.get("max", 2.0)))
+                if _sw > 0:
+                    _t.sleep(_sw)
+                    stats["total_stay"] += _sw
             elif action == "mouse":
                 tx = _rnd.randint(100, 1100)
                 ty = _rnd.randint(100, 700)
-                steps = _rnd.randint(8, 18)
+                # 鼠标移动步数从配置读取
+                steps = _rnd.randint(int(mouse_steps_cfg.get("min", 50)) // 10, int(mouse_steps_cfg.get("max", 250)) // 10)
+                steps = max(3, steps)
                 for s in range(steps):
                     if _t.time() >= window_end:
                         break
@@ -2292,26 +2417,37 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                     mx = int(current_x + (tx - current_x) * tt + _rnd.randint(-2, 2))
                     my = int(current_y + (ty - current_y) * tt + _rnd.randint(-2, 2))
                     page.mouse.move(mx, my)
-                    _t.sleep(_rnd.uniform(0.01, 0.05))
+                    # 每步等待从配置读取
+                    _step_wait = _rnd.uniform(mouse_pause_cfg.get("min", 0.01), mouse_pause_cfg.get("max", 0.1))
+                    _t.sleep(_step_wait)
+                    # 贝塞尔暂停概率
+                    if _rnd.random() < bezier_prob:
+                        _t.sleep(_rnd.uniform(0.1, 0.4))
                 current_x, current_y = tx, ty
                 stats["mouse_moves"] += 1
-                log.debug(f"[{page_name}] 🎯 鼠标移动到 ({tx},{ty})（累计 {stats['mouse_moves']} 次）")
+                # 鼠标移动后等待
+                _mw = min(window_end - _t.time(), _rnd.uniform(mouse_wait_cfg.get("min", 0.1), mouse_wait_cfg.get("max", 1.0)))
+                if _mw > 0:
+                    _t.sleep(_mw)
+                    stats["total_stay"] += _mw
+            elif action == "click":
+                # 随机点击（从配置读取次数和等待）
+                cx = _rnd.randint(100, 1000)
+                cy = _rnd.randint(100, 600)
+                page.mouse.click(cx, cy)
+                stats["clicks"] += 1
+                _cw = min(window_end - _t.time(), _rnd.uniform(click_wait_cfg.get("min", 0.5), click_wait_cfg.get("max", 2.0)))
+                if _cw > 0:
+                    _t.sleep(_cw)
+                    stats["total_stay"] += _cw
             elif action == "key":
                 key = _rnd.choice(["PageDown", "PageUp", "ArrowDown", "ArrowUp", "End", "Home", "Space"])
                 page.keyboard.press(key)
                 stats["key_presses"] += 1
-                log.debug(f"[{page_name}] ⌨️ 按键 {key}（累计 {stats['key_presses']} 次）")
-            else:  # pause
-                pause = min(window_end - _t.time(), _rnd.uniform(1.0, 4.0))
-                if pause > 0:
-                    _t.sleep(pause)
-                    stats["total_stay"] += pause
-                stats["waits"] += 1
-                log.debug(f"[{page_name}] ⏸️ 停留 {pause:.1f}s（累计随机等待 {stats['waits']} 次）")
         except Exception:
             action_errors += 1
 
-        # 周期摘要（INFO 级别）
+        # 周期摘要
         if loop_count >= next_summary_at:
             next_summary_at = loop_count + summary_interval
             elapsed = _t.time() - start
@@ -2319,7 +2455,8 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                 f"[{page_name}] 🎭 真人模拟·实时摘要: 已进行 {elapsed:.1f}s，"
                 f"滚动 {stats['scrolls']} 次({stats['scroll_distance']}px)，"
                 f"鼠标 {stats['mouse_moves']} 次，"
-                f"键盘 {stats['key_presses']} 次，随机等待 {stats['waits']} 次"
+                f"点击 {stats['clicks']} 次，"
+                f"键盘 {stats['key_presses']} 次"
             )
 
     actual = _t.time() - start
@@ -2327,7 +2464,8 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
         f"[{page_name}] 🎭 真人模拟窗口结束: 实耗 {actual:.1f}s / 计划 {duration:.1f}s，"
         f"动作循环 {loop_count} 次，鼠标 {stats['mouse_moves']} 次，"
         f"滚动 {stats['scrolls']} 次({stats['scroll_distance']}px)，"
-        f"键盘 {stats['key_presses']} 次，随机等待 {stats['waits']} 次"
+        f"点击 {stats['clicks']} 次，"
+        f"键盘 {stats['key_presses']} 次"
         + (f"，动作失败 {action_errors} 次" if action_errors else "")
     )
     return current_x, current_y
@@ -2489,10 +2627,10 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
 
 def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config):
     """
-    执行完整英文谷歌/必应搜索跳转流程（带真人模拟）
+    执行完整搜索引擎搜索跳转流程（带真人模拟），支持所有搜索引擎
     :param page: 浏览器页面
     :param target_url: 目标网址（要从搜索结果里找它）
-    :param selected_engine_id: 引擎ID（google/bing）
+    :param selected_engine_id: 引擎ID（google/bing/baidu/sogou/so360等）
     :param selected_keyword: 搜索关键词
     :param stats: 页面统计字典（给真人模拟用）
     :param current_x, current_y: 当前鼠标坐标
@@ -2502,9 +2640,64 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
     from urllib.parse import urlparse
     import random
     import sys, os
-    print("Current directory:", os.getcwd())
-    print("sys.path:", sys.path)
     from seo_query_module import get_seo_query
+
+    # ===== 各搜索引擎专属选择器 =====
+    ENGINE_SELECTORS = {
+        "google": {
+            "search_box": 'input[name="q"]',
+            "result_links": [
+                'a[data-ved][href*="http"]',
+                'a[data-ved]',
+            ],
+            "privacy_buttons": [
+                'button[aria-label*="Accept all"]',
+                'button:has-text("Accept all")',
+                'button:has-text("Accept")',
+                'div[id*="L2AGLb"] button',
+            ],
+        },
+        "bing": {
+            "search_box": 'input[name="q"]',
+            "result_links": [
+                'li.b_algo h2 a',
+                'li.b_algo a[href*="http"]',
+            ],
+            "privacy_buttons": [
+                'button[id*="bnp_btn_accept"]',
+                'button:has-text("Accept")',
+                'button[aria-label*="Accept"]',
+            ],
+        },
+        "baidu": {
+            "search_box": 'input[id="kw"], input[name="wd"]',
+            "result_links": [
+                'h3.t a[href*="http"]',
+                'h3.c-title a',
+                '.result h3 a',
+                '.c-container h3 a',
+            ],
+            "privacy_buttons": [],  # 百度一般无隐私弹窗
+        },
+        "sogou": {
+            "search_box": 'input[id="upquery"], input[name="query"]',
+            "result_links": [
+                'h3.vr-title a',
+                '.results h3 a',
+                '.vrwrap h3 a',
+            ],
+            "privacy_buttons": [],
+        },
+        "so360": {
+            "search_box": 'input[id="keyword"], input[name="q"]',
+            "result_links": [
+                'h3.res-title a',
+                '.result h3 a',
+                'li.res-list h3 a',
+            ],
+            "privacy_buttons": [],
+        },
+    }
 
     try:
         log.info(f"🔍 [真搜索] 开始完整搜索跳转流程，引擎={selected_engine_id}, 关键词={selected_keyword}")
@@ -2522,49 +2715,34 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             log.warning(f"[真搜索] 提取主页失败，直接访问目标页")
             return False, current_x, current_y
 
+        # 获取该引擎的选择器（无则用通用兜底）
+        selectors = ENGINE_SELECTORS.get(selected_engine_id, {
+            "search_box": 'input[type="text"], input[name="q"], input[name="wd"], input[name="query"]',
+            "result_links": ['h3 a[href*="http"]', '.result a', 'a[href*="' + urlparse(target_url).netloc + '"]'],
+            "privacy_buttons": [],
+        })
+
         log.info(f"🔍 [真搜索] 访问搜索引擎主页: {homepage_url}")
         
         # 2. 访问搜索引擎主页
         page.goto(homepage_url, timeout=60000, wait_until="networkidle")
         time.sleep(random.uniform(1.5, 3.0))
 
-        # 2.5 新增：在搜索引擎主页加入真人模拟窗口！
+        # 2.5 在搜索引擎主页加入真人模拟窗口
         homepage_duration = random.uniform(1.5, 4.0)
         log.info(f"🔍 [真搜索] 在引擎主页停留：{homepage_duration:.1f}s，真人模型介入")
         current_x, current_y = simulate_human_in_window(page, homepage_duration, stats, current_x, current_y, config, page_name=f"搜索引擎主页({selected_engine_id})")
 
-        # 3. 处理隐私弹窗（Google/Bing 英文）
-        log.info(f"🔍 [真搜索] 尝试处理隐私弹窗")
-        if selected_engine_id == "google":
-            # Google 英文隐私弹窗
-            for selector in [
-                'button[aria-label*="Accept all"]',
-                'button:has-text("Accept all")',
-                'button:has-text("Accept")',
-                'div[id*="L2AGLb"] button',
-                'button[id*="L2AGLb"]'
-            ]:
+        # 3. 处理隐私弹窗（按引擎类型）
+        privacy_buttons = selectors.get("privacy_buttons", [])
+        if privacy_buttons:
+            log.info(f"🔍 [真搜索] 尝试处理隐私弹窗")
+            for selector in privacy_buttons:
                 try:
                     btn = page.wait_for_selector(selector, timeout=5000)
                     if btn:
                         btn.click()
-                        log.info(f"🔍 [真搜索] Google 隐私弹窗已同意")
-                        time.sleep(random.uniform(1.0, 2.5))
-                        break
-                except Exception:
-                    continue
-        elif selected_engine_id == "bing":
-            # Bing 英文隐私弹窗
-            for selector in [
-                'button[id*="bnp_btn_accept"]',
-                'button:has-text("Accept")',
-                'button[aria-label*="Accept"]'
-            ]:
-                try:
-                    btn = page.wait_for_selector(selector, timeout=5000)
-                    if btn:
-                        btn.click()
-                        log.info(f"🔍 [真搜索] Bing 隐私弹窗已同意")
+                        log.info(f"🔍 [真搜索] {selected_engine_id} 隐私弹窗已同意")
                         time.sleep(random.uniform(1.0, 2.5))
                         break
                 except Exception:
@@ -2572,7 +2750,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
 
         # 4. 定位搜索框
         log.info(f"🔍 [真搜索] 定位搜索框")
-        search_selector = 'input[name="q"]'
+        search_selector = selectors["search_box"]
         try:
             search_box = page.wait_for_selector(search_selector, timeout=15000)
         except Exception as e:
@@ -2639,18 +2817,18 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         log.info(f"🔍 [真搜索] 在搜索结果页停留：{results_duration:.1f}s，真人模型介入")
         current_x, current_y = simulate_human_in_window(page, results_duration, stats, current_x, current_y, config, page_name=f"搜索结果页({selected_engine_id})")
 
-        # 10. 找目标链接（带 data-ved 属性的自然搜索结果 a 标签）
+        # 10. 找目标链接（使用引擎专属结果选择器 + 通用兜底）
         log.info(f"🔍 [真搜索] 查找目标链接: {target_url}")
         target_parsed = urlparse(target_url)
         target_host = target_parsed.netloc
         target_link_found = None
 
+        # 构建结果链接选择器列表：引擎专属 + 通用域名匹配
+        result_selectors = list(selectors.get("result_links", []))
+        result_selectors.append('a[href*="' + target_host + '"]')
+
         # 遍历搜索结果中的 a 标签
-        for selector in [
-            'a[data-ved][href*="http"]',
-            'a[data-ved]',
-            'a[href*="' + target_host + '"]'
-        ]:
+        for selector in result_selectors:
             try:
                 links = page.query_selector_all(selector)
                 for l in links:
@@ -2705,10 +2883,8 @@ stats = {
     "total": 0, 
     "success": 0, 
     "fail": 0,
-    "video_view_count": 0,
     "video_item_success": 0,
     "video_item_fail": 0,
-    "total_video_watch_time": 0,
     "country_video_views": {}  # key: country_code, value: count
 }
 
@@ -2732,10 +2908,6 @@ _adsl_ip_history_lock = threading.Lock()
 planned_total_tasks = 0
 
 # 视频任务全局变量
-video_plan = None
-video_task_running = False
-video_worker_active = False
-current_video_task_idx = -1  # 当前正在执行的任务索引（-1表示无）
 human_model_state = {
     "running": False,
     "task_type": "",
@@ -2747,17 +2919,6 @@ human_model_lock = threading.Lock()
 human_model_stop_event = threading.Event()
 human_model_thread = None
 HUMAN_MODEL_HEARTBEAT_TIMEOUT = 120
-video_adsl_status = {
-    "running": False,
-    "status": "停止",
-    "total": 0,
-    "completed": 0,
-    "current": 0,
-    "current_ip": "",
-    "country": "",
-    "last_redial_time": "",
-    "last_error": ""
-}
 
 # HTML 模板
 HTML_TEMPLATE = r"""
@@ -2868,7 +3029,7 @@ HTML_TEMPLATE = r"""
         
         /* 红框 - 配置区域（左侧，约2/3宽度） */
         .config-panel { 
-            flex: 0 0 67%; 
+            flex: 0 0 58%; 
             min-width: 0;
             background: #dc3545; 
             padding: 5px; 
@@ -2980,9 +3141,9 @@ HTML_TEMPLATE = r"""
             display: none !important;
         }
         
-        /* 黄框 - 日志区域（右侧，约1/3宽度，与配置区等高） */
+        /* 黄框 - 日志区域（右侧，约1.5倍原宽度，与配置区等高） */
         .log-panel { 
-            flex: 0 0 32%; 
+            flex: 0 0 41%; 
             min-width: 0;
             background: #ffc107; 
             padding: 5px; 
@@ -3088,14 +3249,6 @@ HTML_TEMPLATE = r"""
                     <span class="status-label">失败:</span>
                     <span class="stat-number" style="color: #dc3545;">{{ statsfail }}</span>
                 </div>
-                <div class="status-item">
-                    <span class="status-label">视频观看:</span>
-                    <span class="stat-number" style="color: #ffc107;">{{ statsvideo_view_count }}次</span>
-                </div>
-                <div class="status-item">
-                    <span class="status-label">视频时长:</span>
-                    <span class="stat-number" style="color: #17a2b8;">{{ stats.total_video_watch_time }}s</span>
-                </div>
             </div>
         </div>
         
@@ -3106,140 +3259,19 @@ HTML_TEMPLATE = r"""
                 <div class="config-inner">
             <div class="tab-buttons">
                 <button class="tab-btn active" onclick="switchTab('websitetraffic', this)">网站流量</button>
-                <button class="tab-btn" onclick="switchTab('videotraffic', this)">视频流量</button>
-                <button class="tab-btn" onclick="switchTab('socialmedia', this)">社媒引流</button>
                 <button class="tab-btn" onclick="switchTab('network', this)">网络</button>
                 <button class="tab-btn" onclick="switchTab('seo', this)">SEO</button>
                 <button class="tab-btn" onclick="switchTab('model', this)">模型</button>
                 <button class="tab-btn" onclick="switchTab('taskvalidation', this)">任务验证</button>
-                <button class="tab-btn" onclick="switchTab('task', this)">QA任务</button>
             </div>
             
             <!-- QA任务Tab -->
-            <div class="tab-content" id="tab-task">
-                <div class="seo-panel" style="background:#1f2937;">
-                    <h3 style="color:#0ea5e9; margin-top:0;">🧪 QA任务（综合QA / 拨号VPS）</h3>
-                    <div style="display:flex; gap:10px; margin-bottom:15px;">
-                        <button class="btn btn-blue" onclick="saveQaConfig()">保存配置</button>
-                        <button class="btn btn-yellow" onclick="resetQaDefaults()">恢复默认</button>
-                        <button class="btn" style="background:#0ea5e9;color:#fff;" onclick="startQaTaskFromQaTab()">▶️ QA执行</button>
-                        <button class="btn" style="background:#ef4444;color:#fff;" onclick="stopQaTask()">⛔ QA停止</button>
-                    </div>
-                    <div class="form-group">
-                        <label>QA次数</label>
-                        <input type="number" id="qa_task_count_qa_tab" min="1" max="999" value="{{ config.get('vt_adsl_task_count', 1) }}" style="width:100%;">
-                    </div>
-                    <div class="form-group">
-                        <label>执行阶段选择（勾选执行，取消跳过）</label>
-                        <div style="display:flex; gap:20px; margin-top:8px;">
-                            <label style="display:flex; align-items:center; gap:5px;">
-                                <input type="checkbox" id="qa_run_website" {{ 'checked' if config.get('qa_run_phases', {}).get('website', True) else '' }}>
-                                浏览网站
-                            </label>
-                            <label style="display:flex; align-items:center; gap:5px;">
-                                <input type="checkbox" id="qa_run_video" {{ 'checked' if config.get('qa_run_phases', {}).get('video', True) else '' }}>
-                                观看视频
-                            </label>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label><input type="checkbox" id="qa_webrtc_leak_check_enabled" {{ 'checked' if config.get('webrtc_leak_check_enabled', True) else '' }}> 启用WebRTC防泄漏检测</label>
-                    </div>
-                    <div class="form-group">
-                        <label>全局会话策略 session_mode</label>
-                        <select id="qa_session_mode" style="width:100%;">
-                            <option value="country_host_7d" {{ 'selected' if config.get('session_mode', 'country_host_7d') == 'country_host_7d' else '' }}>国家+Host复用7天</option>
-                            <option value="new_each_task" {{ 'selected' if config.get('session_mode', 'country_host_7d') == 'new_each_task' else '' }}>每任务新会话</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>UA重复率阈值（0.10 - 0.20）</label>
-                        <input type="number" step="0.01" min="0.05" max="0.5" id="qa_ua_repeat_max_rate" value="{{ config.get('ua_repeat_max_rate', 0.2) }}" style="width:100%;">
-                    </div>
-                    <div class="form-group">
-                        <label>视频流量自定义Referer（为空则走通用referer）</label>
-                        <input type="text" id="qa_vt_udis_referer" value="{{ config.get('vt_udis_referer', '') }}" placeholder="https://example1.com/, https://example2.com/" style="width:100%;">
-                    </div>
-                </div>
-            </div>
             
-            <!-- 社媒引流Tab -->
-            <div class="tab-content" id="tab-socialmedia">
-                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
-                    <button class="btn btn-blue" onclick="saveSocialMediaConfig()">保存配置</button>
-                    <button class="btn btn-yellow" onclick="resetSocialMediaConfig()">恢复默认</button>
-                </div>
-                <div class="seo-panel">
-                    <h3 style="color: #4a9eff; margin-top: 0; margin-bottom: 20px;">📱 社交媒体引流配置</h3>
-                    <div class="form-group">
-                        <label>平台区域（语言分区，强制语言一致性）</label>
-                        <div style="display: flex; gap: 20px;">
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="radio" name="social_platform_region" value="auto" {{ 'checked' if config.social_media.platform_region == 'auto' else '' }}> 自动（跟随IP语言）
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="radio" name="social_platform_region" value="western" {{ 'checked' if config.social_media.platform_region == 'western' else '' }}> 欧美社媒（强制英文）
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="radio" name="social_platform_region" value="chinese" {{ 'checked' if config.social_media.platform_region == 'chinese' else '' }}> 中文社媒（强制中文）
-                            </label>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label>社交媒体平台（多选）</label>
-                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_facebook" value="facebook"> Facebook
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_twitter" value="twitter"> Twitter
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_instagram" value="instagram"> Instagram
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_linkedin" value="linkedin"> LinkedIn
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_reddit" value="reddit"> Reddit
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 5px;">
-                                <input type="checkbox" id="social_tiktok" value="tiktok"> TikTok
-                            </label>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label>引流频率（次/小时）</label>
-                        <div class="input-group">
-                            <input type="number" id="social_frequency_min" value="{{ config.social_media.frequency.min }}">
-                            <input type="number" id="social_frequency_max" value="{{ config.social_media.frequency.max }}">
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label>停留时间（秒）</label>
-                        <div class="input-group">
-                            <input type="number" id="social_stay_min" value="{{ config.social_media.stay_time.min }}">
-                            <input type="number" id="social_stay_max" value="{{ config.social_media.stay_time.max }}">
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label>互动概率（点赞/评论/分享）</label>
-                        <div class="input-group">
-                            <input type="number" step="0.01" id="social_interaction_min" value="{{ config.social_media.interaction_prob.min }}">
-                            <input type="number" step="0.01" id="social_interaction_max" value="{{ config.social_media.interaction_prob.max }}">
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label>引流来源帖子URL（逗号分隔，用于构造Referer，按语言自动匹配）</label>
-                        <textarea id="social_post_urls" placeholder="https://www.facebook.com/example/post1,https://www.facebook.com/example/post2" style="width: 100%; height: 60px;">{{ config.social_media.post_urls | join(', ') }}</textarea>
-                    </div>
-                </div>
-            </div>
             
             <!-- 网络Tab -->
             <div class="tab-content" id="tab-network">
                 <div style="display: flex; gap: 10px; margin-bottom: 15px;">
-                    <button class="btn btn-blue" onclick="saveNetworkConfig()">保存配置</button>
+                    <button class="btn btn-blue" onclick="console.log('saveNetworkConfig called'); saveNetworkConfig();">保存配置</button>
                     <button class="btn btn-yellow" onclick="resetNetworkConfig()">恢复默认</button>
                 </div>
                 <!-- 流量模型配置 -->
@@ -3263,6 +3295,10 @@ HTML_TEMPLATE = r"""
                                 <label style="display: flex; align-items: center; gap: 5px;">
                                     <input type="checkbox" class="model-check" data-model="poisson" {{ 'checked' if 'poisson' in config.selected_models else '' }}>
                                     泊松分布（秒级脉冲）
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 5px;">
+                                    <input type="checkbox" class="model-check" data-model="burst" {{ 'checked' if 'burst' in config.selected_models else '' }}>
+                                    突发流量（热点事件）
                                 </label>
                             </div>
                         </div>
@@ -3294,35 +3330,6 @@ HTML_TEMPLATE = r"""
                     </div>
                 </div>
                 
-                <div style="margin-bottom: 15px; padding: 12px; background: #2a2a2a; border-radius: 8px;">
-                    <h4 style="margin-top: 0; margin-bottom: 10px; color: #4a9eff;">IP获取方式</h4>
-                    <div style="display: flex; gap: 15px; align-items: center;">
-                        <label style="display: flex; align-items: center; gap: 5px;">
-                            <input type="radio" name="ip_provider_type" value="proxy_api" {{ 'checked' if config.get('ip_provider_type', 'proxy_api') == 'proxy_api' else '' }} onchange="toggleIPProviderConfig()">
-                            代理API接口
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 5px;">
-                            <input type="radio" name="ip_provider_type" value="adsl" {{ 'checked' if config.get('ip_provider_type') == 'adsl' else '' }} onchange="toggleIPProviderConfig()">
-                            ADSL拨号
-                        </label>
-                    </div>
-                    <div id="adsl-config-panel" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #444; display: {{ 'block' if config.get('ip_provider_type') == 'adsl' else 'none' }};">
-                        <div style="display: flex; gap: 15px; flex-wrap: wrap;">
-                            <div class="form-group" style="flex: 1; min-width: 180px;">
-                                <label for="adsl_username">ADSL用户名</label>
-                                <input type="text" id="adsl_username" value="{{ config.adsl_username|default('') }}" style="width: 100%;">
-                            </div>
-                            <div class="form-group" style="flex: 1; min-width: 180px;">
-                                <label for="adsl_password">ADSL密码</label>
-                                <input type="password" id="adsl_password" value="{{ config.adsl_password|default('') }}" style="width: 100%;">
-                            </div>
-                            <div class="form-group" style="flex: 1; min-width: 180px;">
-                                <label for="adsl_interface">网络接口</label>
-                                <input type="text" id="adsl_interface" value="{{ config.adsl_interface|default('ppp0') }}" style="width: 100%;">
-                            </div>
-                        </div>
-                    </div>
-                </div>
                 <div id="proxy-pool-container" style="display:flex; flex-direction:column; gap:10px; margin-bottom:20px;">
                     {% for idx in range([config.proxy_pool|length, 5]|min) %}
                     {% set p = config.proxy_pool[idx] %}
@@ -3353,39 +3360,19 @@ HTML_TEMPLATE = r"""
 
                 <hr style="border-color:#444; margin:20px 0;">
 
-                <h4 style="margin-top:0; color:#4a9eff;">VPS配置（不变）</h4>
+                <h4 style="margin-top:0; color:#4a9eff;">IPDeep 代理配置</h4>
                 <div class="form-grid">
                     <div>
                         <div class="form-group">
-                            <label for="vps_host">VPS-IP</label>
-                            <input type="text" id="vps_host" value="{{ config.vps_host }}">
-                        </div>
-                        <div class="form-group">
-                            <label for="vps_port">VPS-PORT</label>
-                            <input type="number" id="vps_port" value="{{ config.vps_port }}">
-                        </div>
-                    </div>
-                    <div>
-                        <div class="form-group">
-                            <label for="vps_user">VPS-User</label>
-                            <input type="text" id="vps_user" value="{{ config.vps_user }}">
-                        </div>
-                        <div class="form-group">
-                            <label for="vps_pass">VPS-Pwd</label>
-                            <input type="password" id="vps_pass" value="{{ config.vps_pass }}">
-                        </div>
-                    </div>
-                    <div>
-                        <div class="form-group">
-                            <label for="ip_proxy_api">【备用】旧单代理_api</label>
+                            <label for="ip_proxy_api">IPDeep API URL</label>
                             <input type="text" id="ip_proxy_api" value="{{ config.ip_proxy_api }}">
                         </div>
                         <div class="form-group">
-                            <label for="ip_proxy_user">【备用】旧单代理_User</label>
+                            <label for="ip_proxy_user">IPDeep User</label>
                             <input type="text" id="ip_proxy_user" value="{{ config.ip_proxy_user }}">
                         </div>
                         <div class="form-group">
-                            <label for="ip_proxy_pwd">【备用】旧单代理_pwd</label>
+                            <label for="ip_proxy_pwd">IPDeep Pwd</label>
                             <input type="password" id="ip_proxy_pwd" value="{{ config.ip_proxy_pwd }}">
                         </div>
                     </div>
@@ -3528,7 +3515,6 @@ HTML_TEMPLATE = r"""
                 <div class="seo-panel">
                     <div style="padding: 8px 12px; margin-bottom: 12px; background:#16213e; border:1px solid #00aaff; border-radius:6px; color:#dbeafe; font-size:13px;">
                         <div>网站任务状态：<b id="websiteConfigStatus" style="color:#ffd54f;">{{ '运行中' if runningtask else '已停止' }}</b></div>
-                        <div style="margin-top:4px; color:#a7f3d0;">ADSL任务状态：<b id="adslTaskStatus" style="color:#ffd54f;">停止</b>　ADSL完成（次）：<b id="adslCompletedCount" style="color:#00d4aa;">0</b></div>
                     </div>
                     <!-- 按钮区域 -->
                     <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
@@ -3536,16 +3522,15 @@ HTML_TEMPLATE = r"""
                         <button class="btn" onclick="resetWebsiteTrafficConfig()" style="background: #ffc107; color: #1a1a1a; padding: 5.4px 14.4px; font-size: 12.6px;">🔄 恢复默认</button>
                         <button class="btn" id="btn-generate-plan" onclick="generatePlan()" style="background: #10b981; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">📋 生成计划</button>
                         <button class="btn" id="btn-single-task" onclick="startSingleTask()" style="background: #06b6d4; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">⚡ 单独任务</button>
-                        <button class="btn" id="btn-adsl-task" onclick="startAdslIpTask()" style="background: #14b8a6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">📡 ADSL IP任务</button>
-                        <button class="btn" id="btn-execute-plan" onclick="executePlan()" style="background: #8b5cf6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">▶️ 执行任务</button>
+                        <button class="btn" id="btn-execute-plan" onclick="executePlan()" style="background: #8b5cf6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">▶️ 执行计划</button>
                         <button class="btn" id="btn-clear-plan" onclick="clearPlan()" style="background: #f97316; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">🗑️ 清除计划</button>
                         <button class="btn" onclick="stopTask()" style="background: #ef4444; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">⏹️ 停止任务</button>
                     </div>
                     <!-- 基础配置 -->
                     <div style="margin-bottom: 8px; padding: 8px; background: #2a2a2a; border-radius: 8px;">
-                        <h4 style="margin: 0 0 8px 0; color: #4a9eff;">目标网站池（固定5个，勾选的串联浏览）</h4>
+                        <h4 style="margin: 0 0 8px 0; color: #4a9eff;">目标网站池（固定3个，勾选的串联浏览）</h4>
                         <div style="display: flex; flex-direction: column; gap: 6px;">
-                            {% for i in range(1, 6) %}
+                            {% for i in range(1, 4) %}
                             <div style="display: flex; align-items: center; gap: 8px;">
                                 <label style="width: 50px; color: #bbb; margin: 0;">URL{{ i }}</label>
                                 <input type="checkbox" id="target_url_{{ i }}_enabled" style="width: auto; margin: 0;" {{ 'checked' if (config.target_urls[i-1].get('enabled', False) if config.get('target_urls') and config.target_urls[i-1] else (True if i == 1 else False)) else '' }}>
@@ -3563,10 +3548,6 @@ HTML_TEMPLATE = r"""
                         <div class="form-group" style="flex: 1; min-width: 0;">
                             <label for="plan_days">任务计划天数（天）</label>
                             <input type="number" id="plan_days" min="1" max="7" value="{{ config.plan_days|default(1) }}" style="width: 100%;">
-                        </div>
-                        <div class="form-group" style="flex: 1; min-width: 0;">
-                            <label for="adsl_task_count">ADSL任务数</label>
-                            <input type="number" id="adsl_task_count" min="1" max="999" value="{{ config.adsl_task_count|default(1) }}" style="width: 100%;">
                         </div>
                         <div class="form-group" style="flex: 1; min-width: 0;">
                             <label>任务间隔（秒）</label>
@@ -3623,8 +3604,8 @@ HTML_TEMPLATE = r"""
                                 <textarea id="webnav_layer1_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_1.fallback_urls|join(',') }}</textarea>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer1_stay_ratio" value="{{ config.web_navigation.layer_1.stay_ratio }}" style="width: 100%;">
+                                <label>停留时长比例</label>
+                                <input type="text" id="webnav_layer1_stay_ratio" value="{{ (config.web_navigation.layer_1.stay_ratio * 100)|int }}%" placeholder="10%" style="width: 100%;">
                             </div>
                         </div>
                     </div>
@@ -3642,8 +3623,8 @@ HTML_TEMPLATE = r"""
                                 <textarea id="webnav_layer2_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_2.fallback_urls|join(',') }}</textarea>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer2_stay_ratio" value="{{ config.web_navigation.layer_2.stay_ratio }}" style="width: 100%;">
+                                <label>停留时长比例</label>
+                                <input type="text" id="webnav_layer2_stay_ratio" value="{{ (config.web_navigation.layer_2.stay_ratio * 100)|int }}%" placeholder="10%" style="width: 100%;">
                             </div>
                         </div>
                     </div>
@@ -3661,8 +3642,8 @@ HTML_TEMPLATE = r"""
                                 <textarea id="webnav_layer3_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_3.fallback_urls|join(',') }}</textarea>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer3_stay_ratio" value="{{ config.web_navigation.layer_3.stay_ratio }}" style="width: 100%;">
+                                <label>停留时长比例</label>
+                                <input type="text" id="webnav_layer3_stay_ratio" value="{{ (config.web_navigation.layer_3.stay_ratio * 100)|int }}%" placeholder="10%" style="width: 100%;">
                             </div>
                         </div>
                     </div>
@@ -3680,15 +3661,15 @@ HTML_TEMPLATE = r"""
                                 <textarea id="webnav_layer4_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_4.fallback_urls|join(',') }}</textarea>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer4_stay_ratio" value="{{ config.web_navigation.layer_4.stay_ratio }}" style="width: 100%;">
+                                <label>停留时长比例</label>
+                                <input type="text" id="webnav_layer4_stay_ratio" value="{{ (config.web_navigation.layer_4.stay_ratio * 100)|int }}%" placeholder="10%" style="width: 100%;">
                             </div>
                         </div>
                     </div>
                     
                     <!-- 第5层配置 -->
                     <div style="margin-bottom: 8px; padding: 8px; background: #1e1e1e; border-radius: 8px;">
-                        <h4 style="margin: 0 0 6px 0; color: #e67e22;">第5层 → 第6层（可选）</h4>
+                        <h4 style="margin: 0 0 6px 0; color: #e67e22;">第5层</h4>
                         <div style="display: flex; flex-direction: row; gap: 8px; align-items: flex-start;">
                             <div class="form-group" style="flex: 3; min-width: 0;">
                                 <label>链接关键字池（逗号分隔）</label>
@@ -3699,169 +3680,15 @@ HTML_TEMPLATE = r"""
                                 <textarea id="webnav_layer5_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_5.fallback_urls|join(',') }}</textarea>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer5_stay_ratio" value="{{ config.web_navigation.layer_5.stay_ratio }}" style="width: 100%;">
+                                <label>停留时长比例</label>
+                                <input type="text" id="webnav_layer5_stay_ratio" value="{{ (config.web_navigation.layer_5.stay_ratio * 100)|int }}%" placeholder="10%" style="width: 100%;">
                             </div>
                         </div>
                     </div>
                     
-                    <!-- 第6层配置 -->
-                    <div style="margin-bottom: 8px; padding: 8px; background: #1e1e1e; border-radius: 8px;">
-                        <h4 style="margin: 0 0 6px 0; color: #f39c12;">第6层（最后一层，可选）</h4>
-                        <div style="display: flex; flex-direction: row; gap: 8px; align-items: flex-start;">
-                            <div class="form-group" style="flex: 3; min-width: 0;">
-                                <label>链接关键字池（逗号分隔）</label>
-                                <textarea id="webnav_layer6_keywords" placeholder="关键字1,关键字2,关键字3" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_6.keywords|join(',') }}</textarea>
-                            </div>
-                            <div class="form-group" style="flex: 3; min-width: 0;">
-                                <label>兜底链接池（逗号分隔）</label>
-                                <textarea id="webnav_layer6_fallback_urls" placeholder="https://url1,https://url2" style="width: 100%; min-height: 60px;">{{ config.web_navigation.layer_6.fallback_urls|join(',') }}</textarea>
-                            </div>
-                            <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>停留时长比例（0-1）</label>
-                                <input type="number" step="0.01" id="webnav_layer6_stay_ratio" value="{{ config.web_navigation.layer_6.stay_ratio }}" style="width: 100%;">
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- 返回链接配置 -->
-                    <div style="margin-bottom: 8px; padding: 8px; background: #1e1e1e; border-radius: 8px;">
-                        <h4 style="margin: 0 0 6px 0; color: #3498db;">返回链接配置</h4>
-                        <div style="display: flex; flex-direction: row; gap: 8px; align-items: flex-start;">
-                            <div class="form-group" style="flex: 3; min-width: 0;">
-                                <label>返回链接关键字（逗号分隔）</label>
-                                <textarea id="webnav_back_links" placeholder="返回,back,目录" style="width: 100%; min-height: 60px;">{{ config.web_navigation.back_links|join(',') }}</textarea>
-                            </div>
-                            <div class="form-group" style="flex: 3; min-width: 0;">
-                                <label>返回首页链接关键字（逗号分隔）</label>
-                                <textarea id="webnav_back_home_links" placeholder="首页,home" style="width: 100%; min-height: 60px;">{{ config.web_navigation.back_home_links|join(',') }}</textarea>
-                            </div>
-                        </div>
-                    </div>
                 </div>
             </div>
             
-            <!-- 视频流量配置Tab -->
-            <div class="tab-content" id="tab-videotraffic">
-                <div class="seo-panel">
-                    <div style="padding: 8px 12px; margin-bottom: 12px; background:#16213e; border:1px solid #ff9900; border-radius:6px; color:#dbeafe; font-size:13px;">
-                        <div style="color:#a7f3d0;">视频ADSL任务状态：<b id="videoAdslTaskStatus" style="color:#ffd54f;">停止</b>　ADSL完成（次）：<b id="videoAdslCompletedCount" style="color:#00d4aa;">0</b></div>
-                        <div style="margin-top:4px; color:#fbbf24;">视频流量只走拨号VPS/ADSL，不使用代理API或普通直连。</div>
-                    </div>
-
-                    <!-- 按钮区域 -->
-                    <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
-                        <button class="btn" onclick="saveVideoTrafficConfig()" style="background: #3b82f6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">💾 保存配置</button>
-                        <button class="btn" onclick="resetVideoTrafficConfig()" style="background: #ffc107; color: #1a1a1a; padding: 5.4px 14.4px; font-size: 12.6px;">🔄 恢复默认</button>
-                        <button class="btn" onclick="generateVideoPlan()" style="background: #10b981; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">📋 生成计划</button>
-                        <button class="btn" id="btn-start-video" onclick="startVideoTasks()" style="background: #8b5cf6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">▶️ 执行视频ADSL任务</button>
-                        <button class="btn" id="btn-stop-video" onclick="stopVideoTasks()" disabled style="background: #ef4444; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">⏹️ 停止任务</button>
-                        <button class="btn" onclick="clearVideoPlan()" style="background: #f97316; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">🗑️ 清除计划</button>
-                        <button class="btn" onclick="showVideoPlan()" style="background: #06b6d4; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">📊 查看计划</button>
-                        <button class="btn" onclick="showVideoStats()" style="background: #ec4899; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">📈 任务统计</button>
-                    </div>
-
-                    <div class="form-group" style="display: grid; grid-template-columns: 220px 220px 1fr; gap: 12px; align-items: start;">
-                        <div>
-                            <label>入口模式</label>
-                            <select id="vt_entry_mode" style="width: 100%;">
-                                <option value="auto" {{ 'selected' if config.get('vt_entry_mode', 'auto') == 'auto' else '' }}>自动识别</option>
-                                <option value="direct" {{ 'selected' if config.get('vt_entry_mode', 'auto') == 'direct' else '' }}>视频直链</option>
-                                <option value="layer" {{ 'selected' if config.get('vt_entry_mode', 'auto') == 'layer' else '' }}>Layer导航</option>
-                            </select>
-                            <div style="font-size:11px; color:#9ca3af; margin-top:4px; line-height:1.4;">
-                                自动：有直链走直链，否则走Layer<br>
-                                直链：跳过Layer1/Layer2<br>
-                                Layer：强制入口页→Layer2→视频
-                            </div>
-                        </div>
-                        <div>
-                            <label>Layer2视频模式</label>
-                            <select id="vt_layer2_video_mode" style="width: 100%;">
-                                <option value="auto" {{ 'selected' if config.get('vt_layer2_video_mode', 'auto') == 'auto' else '' }}>自动识别</option>
-                                <option value="link" {{ 'selected' if config.get('vt_layer2_video_mode', 'auto') == 'link' else '' }}>链接跳转</option>
-                                <option value="iframe" {{ 'selected' if config.get('vt_layer2_video_mode', 'auto') == 'iframe' else '' }}>iframe嵌入</option>
-                            </select>
-                            <div style="font-size:11px; color:#9ca3af; margin-top:4px; line-height:1.4;">
-                                自动：优先嵌入播放器，找不到再跳转<br>
-                                链接：按Layer2关键词/兜底跳转<br>
-                                iframe：只在Layer2当前页观看
-                            </div>
-                        </div>
-                        <div>
-                            <label>视频入口URL池（为空时使用网站流量目标URL；多个URL支持英文逗号或换行）</label>
-                            <textarea id="vt_video_urls" placeholder="https://入口1.com\nhttps://入口2.com" style="width: 100%; min-height: 80px;">{{ config.get('vt_video_urls', '') }}</textarea>
-                        </div>
-                    </div>
-
-                    <div class="form-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-                        <div>
-                            <label>Layer1关键词池（支持英文逗号或换行）</label>
-                            <textarea id="vt_layer1_keywords" placeholder="关键词1,关键词2" style="width: 100%; min-height: 70px;">{{ config.get('vt_layer1_keywords', [])|join('\n') }}</textarea>
-                        </div>
-                        <div>
-                            <label>Layer2关键词池（支持英文逗号或换行）</label>
-                            <textarea id="vt_layer2_keywords" placeholder="关键词1,关键词2" style="width: 100%; min-height: 70px;">{{ config.get('vt_layer2_keywords', [])|join('\n') }}</textarea>
-                        </div>
-                        <div>
-                            <label>Layer1兜底链接池（视频专用优先；为空复用网站Layer1）</label>
-                            <textarea id="vt_layer1_fallback_urls" placeholder="https://url1\nhttps://url2" style="width: 100%; min-height: 70px;">{{ config.get('vt_layer1_fallback_urls', [])|join('\n') }}</textarea>
-                        </div>
-                        <div>
-                            <label>Layer2兜底链接池（视频专用优先；为空复用网站Layer2）</label>
-                            <textarea id="vt_layer2_fallback_urls" placeholder="https://url1\nhttps://url2" style="width: 100%; min-height: 70px;">{{ config.get('vt_layer2_fallback_urls', [])|join('\n') }}</textarea>
-                        </div>
-                    </div>
-
-                    <!-- 视频任务基本配置（合并一行） -->
-                    <div class="form-group" style="display: flex; gap: 15px;">
-                        <div style="flex: 1;">
-                            <label>单次任务观看视频数量（个）</label>
-                            <input type="number" id="vt_watch_count" value="{{ config.get('vt_watch_count', 3) }}" min="1" style="width: 100%;">
-                        </div>
-                        <div style="flex: 1;">
-                            <label>任务计划天数（天）</label>
-                            <input type="number" id="vt_task_days" value="{{ config.get('vt_task_days', 1) }}" min="0" style="width: 100%;" title="0表示无限循环">
-                        </div>
-                        <div style="flex: 1;">
-                            <label>ADSL任务数</label>
-                            <input type="number" id="vt_adsl_task_count" value="{{ config.get('vt_adsl_task_count', 1) }}" min="1" max="999" style="width: 100%;">
-                        </div>
-                        <div style="flex: 1.5;">
-                            <label>查看时长（秒）</label>
-                            <div class="input-group" style="width: 100%;">
-                                <input type="number" id="vt_duration_min" value="{{ config.get('vt_duration_min', 30) }}" min="1" placeholder="最短">
-                                <input type="number" id="vt_duration_max" value="{{ config.get('vt_duration_max', 120) }}" min="1" placeholder="最长">
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- 视频倍速 -->
-                    <div class="form-group" style="display: flex; gap: 20px;">
-                        <div style="flex: 1;">
-                            <label>视频倍速（倍）</label>
-                            <div class="input-group" style="width: 100%;">
-                                <input type="number" step="0.1" id="vt_speed_min" value="{{ config.get('vt_speed_min', 1) }}" min="1" max="3" placeholder="最低倍速1">
-                                <input type="number" step="0.1" id="vt_speed_max" value="{{ config.get('vt_speed_max', 2) }}" min="1" max="3" placeholder="最高倍速3">
-                            </div>
-                        </div>
-                        <div style="flex: 1;">
-                            <label>视频间隔（秒）</label>
-                            <div class="input-group" style="width: 100%;">
-                                <input type="number" step="0.1" id="vt_interval_min" value="{{ config.get('vt_interval_min', 5) }}" min="0" placeholder="最短等待">
-                                <input type="number" step="0.1" id="vt_interval_max" value="{{ config.get('vt_interval_max', 15) }}" min="0" placeholder="最长等待">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label>视频Referer列表（多个用英文逗号分隔，按任务序号轮询选择）</label>
-                        <input type="text" id="vt_udis_referer" value="{{ config.get('vt_udis_referer', 'https://udisxxx.com/') }}" placeholder="https://freestoryweb.com/,https://example.com/" style="width: 100%;">
-                    </div>
-
-                    
-                </div>
-            </div>
             
             <!-- SEO配置Tab -->
             <div class="tab-content" id="tab-seo">
@@ -3871,44 +3698,49 @@ HTML_TEMPLATE = r"""
                 </div>
                 <div class="seo-panel">
 
-                    <!-- 第一组：搜索引擎管理 -->
-                    <div style="margin-bottom: 20px; padding: 2px; background: #2a2a2a; border-radius: 8px;">
-                        <h4 style="margin-top: 0; color: #4a9eff;">1. 搜索引擎管理</h4>
+                    <!-- 第一组：搜索引擎 & 社媒平台管理 -->
+                    <div style="margin-bottom: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;">
+                        <h4 style="margin-top: 0; color: #4a9eff;">1. 搜索引擎 & 社媒平台（Referer来源）</h4>
+                        <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">任务执行时根据IP国别语言自动匹配对应平台作为Referer进入目标网站（严禁直跳）</p>
                         <div id="engines-container">
                             {% for engine in config.seo.search_engines %}
-                            <div class="engine-item" style="display: flex; gap: 10px; margin-bottom: 10px; align-items: center;">
-                                <input type="text" class="engine-id" placeholder="引擎ID" value="{{ engine.id }}" style="flex: 1;">
-                                <input type="text" class="engine-name" placeholder="引擎名称" value="{{ engine.name }}" style="flex: 1;">
-                                <input type="text" class="engine-url" placeholder="搜索URL" value="{{ engine.url }}" style="flex: 2;">
-                                <select class="engine-lang" style="width: 100px;">
+                            <div class="engine-item" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center; padding: 6px 8px; background: {{ '#1a2332' if engine.get('type') == 'social' else '#1e1e1e' }}; border-radius: 6px; border-left: 3px solid {{ '#8b5cf6' if engine.get('type') == 'social' else '#3b82f6' }};">
+                                <span style="width:60px; font-size:11px; color:{{ '#a78bfa' if engine.get('type') == 'social' else '#60a5fa' }}; font-weight:bold;">{{ '📱社媒' if engine.get('type') == 'social' else '🔍搜索' }}</span>
+                                <input type="text" class="engine-id" placeholder="ID" value="{{ engine.id }}" style="width: 80px; font-size: 12px;">
+                                <input type="text" class="engine-name" placeholder="名称" value="{{ engine.name }}" style="width: 100px; font-size: 12px;">
+                                <input type="text" class="engine-url" placeholder="Referer URL" value="{{ engine.url }}" style="flex: 1; font-size: 12px;">
+                                <select class="engine-lang" style="width: 70px; font-size: 12px;">
                                     <option value="zh" {{ 'selected' if engine.language == 'zh' else '' }}>中文</option>
                                     <option value="en" {{ 'selected' if engine.language == 'en' else '' }}>英文</option>
                                 </select>
-                                <button class="btn btn-red" onclick="removeEngine(this)" style="padding: 5px 10px;">删除</button>
+                                <select class="engine-type" style="width: 70px; font-size: 12px;">
+                                    <option value="search" {{ 'selected' if engine.get('type') == 'search' else '' }}>搜索</option>
+                                    <option value="social" {{ 'selected' if engine.get('type') == 'social' else '' }}>社媒</option>
+                                </select>
+                                <button class="btn btn-red" onclick="removeEngine(this)" style="padding: 4px 8px; font-size: 11px;">删除</button>
                             </div>
                             {% endfor %}
                         </div>
-                        <button class="btn btn-green" onclick="addEngine()" style="margin-top: 10px;">+ 添加搜索引擎</button>
+                        <button class="btn btn-green" onclick="addEngine()" style="margin-top: 10px;">+ 添加平台</button>
                     </div>
 
-                    <!-- 第二组：地域-搜索引擎映射 -->
-                    <div style="margin-bottom: 20px; padding: 2px; background: #2a2a2a; border-radius: 8px;">
-                        <h4 style="margin-top: 0; color: #4a9eff;">2. 地域-搜索引擎映射</h4>
-                        <div style="display: flex; gap: 10px; flex-wrap: nowrap;">
-                            <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>中国-搜索引擎（ID，逗号分隔）</label>
-                                <input type="text" id="seo_region_china" value="{{ config.seo.region_engine_map.中国 | join(', ') }}" style="height: 56px; font-size: 14px;">
+                    <!-- 第二组：国别-平台映射 -->
+                    <div style="margin-bottom: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;">
+                        <h4 style="margin-top: 0; color: #4a9eff;">2. 国别语言 → 平台映射（IP国别自动匹配）</h4>
+                        <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">根据IP出口国别自动选择对应的搜索引擎/社媒平台作为Referer</p>
+                        <div id="region-map-container" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                            {% for region, engines in config.seo.region_engine_map.items() %}
+                            <div class="region-item" style="padding: 8px; background: #1e1e1e; border-radius: 6px;">
+                                <label style="font-weight:bold; color:#fbbf24; font-size:13px;">{{ region }}</label>
+                                <input type="text" class="region-engines" data-region="{{ region }}" value="{{ engines | join(', ') }}" style="width:100%; margin-top:4px; font-size:12px;" placeholder="平台ID，逗号分隔">
                             </div>
-                            <div class="form-group" style="flex: 1; min-width: 0;">
-                                <label>美国-搜索引擎（ID，逗号分隔）</label>
-                                <input type="text" id="seo_region_usa" value="{{ config.seo.region_engine_map.美国 | join(', ') }}" style="height: 56px; font-size: 14px;">
-                            </div>
+                            {% endfor %}
                         </div>
                     </div>
 
                     <!-- 第三组：关键词池 -->
-                    <div style="margin-bottom: 20px; padding: 2px; background: #2a2a2a; border-radius: 8px;">
-                        <h4 style="margin-top: 0; color: #4a9eff;">3. 关键词池</h4>
+                    <div style="margin-bottom: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;">
+                        <h4 style="margin-top: 0; color: #4a9eff;">3. 关键词池（按语言分组）</h4>
                         <div style="display: flex; gap: 10px; flex-wrap: nowrap;">
                             <div class="form-group" style="flex: 1; min-width: 0;">
                                 <label>中文关键词（逗号分隔）</label>
@@ -3922,17 +3754,17 @@ HTML_TEMPLATE = r"""
                     </div>
 
                     <!-- 第四组：Referer模式 -->
-                    <div style="margin-bottom: 20px; padding: 2px; background: #2a2a2a; border-radius: 8px;">
+                    <div style="margin-bottom: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;">
                         <h4 style="margin-top: 0; color: #4a9eff;">4. Referer模式</h4>
                         <div class="form-group">
                             <div style="display: flex; gap: 20px;">
                                 <label style="display: flex; align-items: center; gap: 5px;">
                                     <input type="radio" id="seo_referer_dynamic" {{ 'checked' if config.seo.referer_mode == 'dynamic' else '' }} name="referer-mode">
-                                    动态模式
+                                    动态模式（根据IP国别自动选择平台）
                                 </label>
                                 <label style="display: flex; align-items: center; gap: 5px;">
                                     <input type="radio" id="seo_referer_static" {{ 'checked' if config.seo.referer_mode == 'static' else '' }} name="referer-mode">
-                                    静态模式
+                                    静态模式（固定使用第一个平台）
                                 </label>
                             </div>
                         </div>
@@ -3947,6 +3779,7 @@ HTML_TEMPLATE = r"""
                     <button class="btn btn-blue" onclick="saveTaskValidationConfig()">保存配置</button>
                     <button class="btn btn-yellow" onclick="resetTaskValidationConfig()">恢复默认</button>
                     <button class="btn" style="background:#dc2626;color:#fff;" id="btnSecurityDrill" onclick="startSecurityDrill()">🛡️ 攻防演练</button>
+                    <button class="btn" style="background:linear-gradient(135deg, #f093fb 0%, #f5576c 100%);color:#fff;" id="btnKeywordExplore" onclick="startKeywordExplore()">🔍 关键词探索</button>
                 </div>
                 <div class="seo-panel">
                     <h4 style="margin-top: 0; color: #4a9eff;">攻防演练（风控漏洞检测）</h4>
@@ -3963,6 +3796,26 @@ HTML_TEMPLATE = r"""
                     </div>
                     <!-- 演练结果摘要 -->
                     <div id="drillResult" style="display:none;background:#0f172a;border-radius:8px;padding:14px;margin-top:12px;font-size:13px;line-height:1.7;"></div>
+                </div>
+                
+                <!-- 关键词探索面板 -->
+                <div class="seo-panel" style="margin-top:20px;">
+                    <h4 style="margin-top: 0; color: #f59e0b;"> 关键词探索（网站内容挖掘）</h4>
+                    <p style="color:#94a3b8;font-size:13px;margin-top:0;">自动爬取目标网站多层页面，提取关键词、标题、描述等SEO要素，生成兜底链接池。</p>
+                    
+                    <!-- 探索进度条 -->
+                    <div id="keywordExploreProgress" style="display:none; margin:16px 0;">
+                        <div style="display:flex;justify-content:space-between;font-size:13px;color:#cbd5e1;margin-bottom:6px;">
+                            <span id="keywordStage">准备中...</span>
+                            <span id="keywordPercent">0%</span>
+                        </div>
+                        <div style="width:100%;height:18px;background:#1e293b;border-radius:9px;overflow:hidden;">
+                            <div id="keywordBar" style="height:100%;width:0%;background:linear-gradient(90deg,#f093fb,#f5576c);transition:width .4s ease;"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- 探索结果摘要 -->
+                    <div id="keywordResult" style="display:none;background:#0f172a;border-radius:8px;padding:14px;margin-top:12px;font-size:13px;line-height:1.7;"></div>
                 </div>
             </div>
             
@@ -4214,10 +4067,6 @@ HTML_TEMPLATE = r"""
                     ip_proxy_api: document.getElementById('ip_proxy_api').value,
                     ip_proxy_user: document.getElementById('ip_proxy_user').value,
                     ip_proxy_pwd: document.getElementById('ip_proxy_pwd').value,
-                    vps_host: document.getElementById('vps_host').value,
-                    vps_port: parseInt(document.getElementById('vps_port').value),
-                    vps_user: document.getElementById('vps_user').value,
-                    vps_pass: document.getElementById('vps_pass').value,
                     webrtc_leak_check_enabled: document.getElementById('webrtc_leak_check_enabled') ? document.getElementById('webrtc_leak_check_enabled').checked : true,
                     session_mode: document.getElementById('session_mode') ? document.getElementById('session_mode').value : 'country_host_7d',
 
@@ -4243,7 +4092,6 @@ HTML_TEMPLATE = r"""
                     })(),
                     site_creation_date: document.getElementById('site_creation_date').value,
                     plan_days: Math.min(7, Math.max(1, parseInt(document.getElementById('plan_days').value) || 1)),
-                    adsl_task_count: Math.min(999, Math.max(1, parseInt(document.getElementById('adsl_task_count').value) || 1)),
                     selected_models: selectedModels,
                     daily_traffic_range: {
                         new: {min: dtNewMin, max: dtNewMax},
@@ -4309,10 +4157,6 @@ HTML_TEMPLATE = r"""
                         min: parseInt(document.getElementById('scroll_count_min').value),
                         max: parseInt(document.getElementById('scroll_count_max').value)
                     },
-                    mouse_move_steps: {
-                        min: parseInt(document.getElementById('mouse_move_steps_min').value),
-                        max: parseInt(document.getElementById('mouse_move_steps_max').value)
-                    },
                     bezier_pause_prob: {
                         min: parseFloat(document.getElementById('bezier_pause_prob_min').value),
                         max: parseFloat(document.getElementById('bezier_pause_prob_max').value)
@@ -4335,41 +4179,33 @@ HTML_TEMPLATE = r"""
                         layer_1: {
                             keywords: parseCommaList(document.getElementById('webnav_layer1_keywords').value),
                             fallback_urls: parseCommaList(document.getElementById('webnav_layer1_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer1_stay_ratio').value) || 0,
+                            stay_ratio: (parseFloat(document.getElementById('webnav_layer1_stay_ratio').value) || 0) / 100,
                             min_stay: 10
                         },
                         layer_2: {
                             keywords: parseCommaList(document.getElementById('webnav_layer2_keywords').value),
                             fallback_urls: parseCommaList(document.getElementById('webnav_layer2_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer2_stay_ratio').value) || 0,
+                            stay_ratio: (parseFloat(document.getElementById('webnav_layer2_stay_ratio').value) || 0) / 100,
                             min_stay: 10
                         },
                         layer_3: {
                             keywords: parseCommaList(document.getElementById('webnav_layer3_keywords').value),
                             fallback_urls: parseCommaList(document.getElementById('webnav_layer3_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer3_stay_ratio').value) || 0,
+                            stay_ratio: (parseFloat(document.getElementById('webnav_layer3_stay_ratio').value) || 0) / 100,
                             min_stay: 10
                         },
                         layer_4: {
                             keywords: parseCommaList(document.getElementById('webnav_layer4_keywords').value),
                             fallback_urls: parseCommaList(document.getElementById('webnav_layer4_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer4_stay_ratio').value) || 0,
+                            stay_ratio: (parseFloat(document.getElementById('webnav_layer4_stay_ratio').value) || 0) / 100,
                             min_stay: 10
                         },
                         layer_5: {
                             keywords: parseCommaList(document.getElementById('webnav_layer5_keywords').value),
                             fallback_urls: parseCommaList(document.getElementById('webnav_layer5_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer5_stay_ratio').value) || 0,
+                            stay_ratio: (parseFloat(document.getElementById('webnav_layer5_stay_ratio').value) || 0) / 100,
                             min_stay: 10
                         },
-                        layer_6: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer6_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer6_fallback_urls').value),
-                            stay_ratio: parseFloat(document.getElementById('webnav_layer6_stay_ratio').value) || 0,
-                            min_stay: 10
-                        },
-                        back_links: parseCommaList(document.getElementById('webnav_back_links').value),
-                        back_home_links: parseCommaList(document.getElementById('webnav_back_home_links').value)
                     }
                 })
             }).then(response => response.json())
@@ -4383,8 +4219,8 @@ HTML_TEMPLATE = r"""
         function collectConfigPayload() {
             const videoAdEl = document.getElementById('video_ad_enabled');
 
-            // 收集代理池配置
-            const proxyPoolItems = document.querySelectorAll('#proxy-pool-container .proxy-item');
+            // 收集代理池配置（使用全局选择器，确保即使不在网络标签页也能收集到）
+            const proxyPoolItems = document.querySelectorAll('.proxy-item');
             const proxyPool = [];
             proxyPoolItems.forEach(item => {
                 proxyPool.push({
@@ -4395,6 +4231,11 @@ HTML_TEMPLATE = r"""
                     proxy_pwd: item.querySelector('.proxy-pwd').value
                 });
             });
+            
+            // 收集IPDeep代理配置
+            const ipProxyApi = document.getElementById('ip_proxy_api')?.value || '';
+            const ipProxyUser = document.getElementById('ip_proxy_user')?.value || '';
+            const ipProxyPwd = document.getElementById('ip_proxy_pwd')?.value || '';
 
             // 收集流量模型选择
             const selectedModels = [];
@@ -4410,9 +4251,9 @@ HTML_TEMPLATE = r"""
             const dtOldMin = parseInt(document.getElementById('dt_old_min').value) || 500;
             const dtOldMax = parseInt(document.getElementById('dt_old_max').value) || 600;
 
-            // 收集目标网站池（5个URL）
+            // 收集目标网站池（3个URL）
             const targetUrls = [];
-            for (let i = 1; i <= 5; i++) {
+            for (let i = 1; i <= 3; i++) {
                 const urlEl = document.getElementById('target_url_' + i);
                 const enabledEl = document.getElementById('target_url_' + i + '_enabled');
                 targetUrls.push({
@@ -4430,7 +4271,6 @@ HTML_TEMPLATE = r"""
                 target_urls: targetUrls,
                 site_creation_date: document.getElementById('site_creation_date').value,
                 plan_days: Math.min(7, Math.max(1, parseInt(document.getElementById('plan_days').value) || 1)),
-                adsl_task_count: Math.min(999, Math.max(1, parseInt(document.getElementById('adsl_task_count').value) || 1)),
                 selected_models: selectedModels,
                 daily_traffic_range: {
                     new: {min: dtNewMin, max: dtNewMax},
@@ -4443,6 +4283,10 @@ HTML_TEMPLATE = r"""
                     max: parseFloat(document.getElementById('total_stay_max').value) || 300
                 },
                 qa_human_profile: (document.querySelector('input[name="qa_human_profile"]:checked') || {}).value || 'standard',
+                ip_proxy_api: ipProxyApi,
+                ip_proxy_user: ipProxyUser,
+                ip_proxy_pwd: ipProxyPwd,
+
                 web_navigation: {
                     loop_count: {
                         min: parseInt(document.getElementById('webnav_loop_count_min').value) || 1,
@@ -4455,41 +4299,33 @@ HTML_TEMPLATE = r"""
                     layer_1: {
                         keywords: parseCommaList(document.getElementById('webnav_layer1_keywords').value),
                         fallback_urls: parseCommaList(document.getElementById('webnav_layer1_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer1_stay_ratio').value) || 0,
+                        stay_ratio: (parseFloat(document.getElementById('webnav_layer1_stay_ratio').value) || 0) / 100,
                         min_stay: 10
                     },
                     layer_2: {
                         keywords: parseCommaList(document.getElementById('webnav_layer2_keywords').value),
                         fallback_urls: parseCommaList(document.getElementById('webnav_layer2_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer2_stay_ratio').value) || 0,
+                        stay_ratio: (parseFloat(document.getElementById('webnav_layer2_stay_ratio').value) || 0) / 100,
                         min_stay: 10
                     },
                     layer_3: {
                         keywords: parseCommaList(document.getElementById('webnav_layer3_keywords').value),
                         fallback_urls: parseCommaList(document.getElementById('webnav_layer3_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer3_stay_ratio').value) || 0,
+                        stay_ratio: (parseFloat(document.getElementById('webnav_layer3_stay_ratio').value) || 0) / 100,
                         min_stay: 10
                     },
                     layer_4: {
                         keywords: parseCommaList(document.getElementById('webnav_layer4_keywords').value),
                         fallback_urls: parseCommaList(document.getElementById('webnav_layer4_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer4_stay_ratio').value) || 0,
+                        stay_ratio: (parseFloat(document.getElementById('webnav_layer4_stay_ratio').value) || 0) / 100,
                         min_stay: 10
                     },
                     layer_5: {
                         keywords: parseCommaList(document.getElementById('webnav_layer5_keywords').value),
                         fallback_urls: parseCommaList(document.getElementById('webnav_layer5_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer5_stay_ratio').value) || 0,
+                        stay_ratio: (parseFloat(document.getElementById('webnav_layer5_stay_ratio').value) || 0) / 100,
                         min_stay: 10
                     },
-                    layer_6: {
-                        keywords: parseCommaList(document.getElementById('webnav_layer6_keywords').value),
-                        fallback_urls: parseCommaList(document.getElementById('webnav_layer6_fallback_urls').value),
-                        stay_ratio: parseFloat(document.getElementById('webnav_layer6_stay_ratio').value) || 0,
-                        min_stay: 10
-                    },
-                    back_links: parseCommaList(document.getElementById('webnav_back_links').value),
-                    back_home_links: parseCommaList(document.getElementById('webnav_back_home_links').value)
                 }
             };
             if (videoAdEl) {
@@ -4500,7 +4336,9 @@ HTML_TEMPLATE = r"""
 
         // 渲染计划预览
         function renderPlan(plan) {
+            console.log('renderPlan called with:', plan);
             if (!plan || !plan.tasks) {
+                console.error('Invalid plan data:', plan);
                 document.getElementById('planPreviewPanel').style.display = 'none';
                 return;
             }
@@ -4512,7 +4350,8 @@ HTML_TEMPLATE = r"""
                 'normal': '正态分布(平稳)',
                 'gamma': '伽马分布(活动突增)',
                 'bimodal': '双峰分布(早晚高峰)',
-                'poisson': '泊松分布(秒级脉冲)'
+                'poisson': '泊松分布(秒级脉冲)',
+                'burst': '突发流量(热点事件)'
             };
             const siteAgeNames = {
                 'new': '新站(≤30天)',
@@ -4627,16 +4466,26 @@ HTML_TEMPLATE = r"""
             
             // 把秒数（今日00:00起）转 HH:MM:SS，支持超过86400（跨天）
             function secToHHMMSS(utcSecToday) {
-                const todayUTC = new Date();
-                todayUTC.setUTCHours(0,0,0,0);
-                const d = new Date(todayUTC.getTime() + utcSecToday * 1000);
-                
-                // 直接获取本地时区的时间
-                const h = d.getHours();
-                const m = d.getMinutes();
-                const s = d.getSeconds();
-                
-                return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+                try {
+                    // 处理大数和非数字的情况
+                    if (typeof utcSecToday !== 'number' || isNaN(utcSecToday)) {
+                        return '00:00:00';
+                    }
+                    
+                    const todayUTC = new Date();
+                    todayUTC.setUTCHours(0,0,0,0);
+                    const d = new Date(todayUTC.getTime() + utcSecToday * 1000);
+                    
+                    // 直接获取本地时区的时间
+                    const h = d.getHours();
+                    const m = d.getMinutes();
+                    const s = d.getSeconds();
+                    
+                    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+                } catch (e) {
+                    console.error('secToHHMMSS error:', e);
+                    return '00:00:00';
+                }
             }
             
             // 渲染表格（多天计划按日期分组）
@@ -4677,35 +4526,57 @@ HTML_TEMPLATE = r"""
 
         // 生成计划
         function generatePlan() {
+            console.log('✅ 生成计划按钮被点击');
             const payload = collectConfigPayload();
+            console.log('✅ 收集到的配置:', payload);
             // 先保存配置，再生成计划
             fetch('/save_config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             }).then(() => {
+                console.log('✅ 配置保存成功');
                 return fetch('/generate_plan', {method: 'POST'});
-            }).then(r => r.json()).then(result => {
+            }).then(r => {
+                console.log('✅ 获取计划响应:', r);
+                return r.json();
+            }).then(result => {
+                console.log('✅ 解析的结果:', result);
                 if (result.status === 'ok') {
+                    console.log('✅ 开始渲染计划');
                     renderPlan(result.plan);
-                    alert('✅ 计划已生成，请在右侧查看，确认无误后点击"执行任务"');
+                    // 确保显示计划预览界面
+                    document.getElementById('planPreviewPanel').style.display = 'block';
+                    alert('✅ 计划已生成，请在右侧查看，确认无误后点击"执行计划"');
                 } else {
                     alert('❌ 计划生成失败: ' + (result.message || '未知错误'));
                 }
             }).catch(err => {
+                console.error('❌ 请求错误:', err);
                 alert('❌ 请求失败: ' + err);
             });
         }
 
+        // 清除日志显示
+        function clearLogBox() {
+            const logBox = document.getElementById('logBox');
+            if (logBox) {
+                logBox.innerHTML = '';
+                originalLogHTML = '';
+            }
+        }
+
         // 执行任务
         function executePlan() {
-            if (!confirm('确定要开始执行任务吗？')) return;
+            if (!confirm('确定要开始执行计划吗？')) return;
+            clearLogBox();
             fetch('/start_task', {method: 'POST'}).then(() => location.reload());
         }
 
         // 单独任务：保存当前配置后，立即执行 1 个任务，不生成/消费计划
         function startSingleTask() {
             if (!confirm('确定要立即执行一个单独网站任务吗？不会生成或使用计划。')) return;
+            clearLogBox();
             const payload = collectConfigPayload();
             fetch('/save_config', {
                 method: 'POST',
@@ -4723,55 +4594,6 @@ HTML_TEMPLATE = r"""
                 location.reload();
             }).catch(err => {
                 alert('❌ 单独任务启动失败: ' + err.message);
-            });
-        }
-
-        // ADSL IP任务：保存当前配置后，按 ADSL任务数循环执行网站任务
-        function startAdslIpTask() {
-            const count = Math.min(999, Math.max(1, parseInt(document.getElementById('adsl_task_count').value) || 1));
-            if (!confirm(`确定要执行 ADSL IP任务 ${count} 次吗？每轮会在本机执行 poff/pon 重拨，并可用“停止任务”中止。`)) return;
-            const payload = collectConfigPayload();
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r => r.json()).then(result => {
-                if (result.status === 'error' || result.success === false) {
-                    throw new Error(result.message || '配置保存失败');
-                }
-                return fetch('/start_adsl_ip_task', {method: 'POST'});
-            }).then(r => r.json()).then(result => {
-                if (result.status !== 'ok') {
-                    throw new Error(result.message || '启动失败');
-                }
-                location.reload();
-            }).catch(err => {
-                alert('❌ ADSL IP任务启动失败: ' + err.message);
-            });
-        }
-
-        // 综合QA：保存网站+视频配置后，在一条任务线内串行执行网站浏览/广告检测/视频检测
-        function startUnifiedQaTask(adsl) {
-            adsl = true;
-            const label = 'QA任务（ADSL）';
-            if (!confirm(`确定要执行${label}吗？将按一条线执行网站浏览QA、广告曝光检测、视频观看检测。`)) return;
-            const payload = Object.assign({}, collectConfigPayload(), collectVideoConfigPayload());
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r => r.json()).then(result => {
-                if (result.status === 'error' || result.success === false) {
-                    throw new Error(result.message || '配置保存失败');
-                }
-                return fetch(adsl ? '/start_unified_adsl_qa_task' : '/start_unified_qa_task', {method: 'POST'});
-            }).then(r => r.json()).then(result => {
-                if (result.status !== 'ok' && result.success === false) {
-                    throw new Error(result.message || '启动失败');
-                }
-                location.reload();
-            }).catch(err => {
-                alert('❌ ' + label + '启动失败: ' + err.message);
             });
         }
 
@@ -4971,12 +4793,70 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        // 页面加载时检查是否已有计划
+        // 页面加载时检查是否已有计划，并加载代理池配置
         document.addEventListener('DOMContentLoaded', function() {
+            // 1. 加载计划预览
             fetch('/get_plan').then(r => r.json()).then(data => {
                 if (data.plan) {
                     renderPlan(data.plan);
                 }
+            });
+            
+            // 2. 从服务器加载代理池配置（保持上次保存的参数）
+            fetch('/get_config').then(r => r.json()).then(data => {
+                if (data.config && data.config.proxy_pool) {
+                    const proxyPool = data.config.proxy_pool;
+                    const container = document.getElementById('proxy-pool-container');
+                    if (container && proxyPool.length > 0) {
+                        // 清空现有内容
+                        container.innerHTML = '';
+                        // 渲染每个代理配置
+                        proxyPool.forEach(proxy => {
+                            const proxyHtml = `
+                                <div class="proxy-item" style="display:flex; gap:8px; align-items:center; padding:8px; background:#2a2a2a; border-radius:8px;">
+                                    <div style="width:80px;">
+                                        <label style="display:flex; align-items:center; gap:5px;">
+                                            <input type="checkbox" class="proxy-enabled" ${proxy.enabled ? 'checked' : ''}>
+                                            启用
+                                        </label>
+                                    </div>
+                                    <div style="width:80px; font-weight:bold; font-size:16px;">
+                                        <input type="text" class="proxy-country" value="${proxy.country_code || 'US'}" maxlength="8" style="width:100%; font-weight:bold; font-size:14px; text-transform:uppercase;">
+                                    </div>
+                                    <div style="flex:1;">
+                                        <input type="text" class="proxy-api-url" value="${proxy.proxy_api_url || ''}" style="width:100%; font-size:12px; color:#aaa;">
+                                    </div>
+                                    <div style="width:80px;">
+                                        <input type="text" class="proxy-user" value="${proxy.proxy_user || ''}" style="width:100%; font-size:12px;">
+                                    </div>
+                                    <div style="width:80px;">
+                                        <input type="password" class="proxy-pwd" value="${proxy.proxy_pwd || ''}" style="width:100%; font-size:12px;">
+                                    </div>
+                                    <button class="btn btn-red" onclick="removeProxy(this)" style="padding:4px 8px; font-size:12px;">删除</button>
+                                </div>
+                            `;
+                            container.insertAdjacentHTML('beforeend', proxyHtml);
+                        });
+                        console.log('✅ 已加载代理池配置:', proxyPool.length, '个代理');
+                    }
+}
+                    
+                    // 4. 加载ADSL配置
+                    if (data.config.adsl_username) {
+                        const el = document.getElementById('adsl_username');
+                        if (el) el.value = data.config.adsl_username;
+                    }
+                    if (data.config.adsl_password) {
+                        const el = document.getElementById('adsl_password');
+                        if (el) el.value = data.config.adsl_password;
+                    }
+                    if (data.config.adsl_interface) {
+                        const el = document.getElementById('adsl_interface');
+                        if (el) el.value = data.config.adsl_interface;
+                    }
+                }
+            }).catch(err => {
+                console.error('❌ 加载代理池配置失败:', err);
             });
         });
 
@@ -5065,45 +4945,6 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        function saveQaConfig() {
-            const data = {
-                vt_adsl_task_count: Math.min(999, Math.max(1, parseInt(document.getElementById('qa_task_count_qa_tab').value) || 1)),
-                qa_run_phases: {
-                    website: document.getElementById('qa_run_website').checked,
-                    video: document.getElementById('qa_run_video').checked
-                },
-                webrtc_leak_check_enabled: document.getElementById('qa_webrtc_leak_check_enabled').checked,
-                session_mode: document.getElementById('qa_session_mode').value || 'country_host_7d',
-                ua_repeat_max_rate: Math.max(0.05, Math.min(0.5, parseFloat(document.getElementById('qa_ua_repeat_max_rate').value) || 0.2)),
-                vt_udis_referer: document.getElementById('qa_vt_udis_referer').value || ''
-            };
-            fetch('/save_config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)})
-                .then(r => r.json()).then(j => alert(j.success ? 'QA配置已保存' : ('保存失败: ' + (j.message || '未知错误'))))
-                .catch(e => alert('保存失败: ' + e));
-        }
-
-        function resetQaDefaults() {
-            if (!confirm('确定恢复QA任务页参数为默认值？')) return;
-            fetch('/reset_config_defaults', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({scope: 'qa'})})
-                .then(r => r.json()).then(j => { alert(j.success ? '已恢复默认，将刷新页面' : ('失败: ' + (j.message || ''))); if (j.success) location.reload(); });
-        }
-
-        function startQaTaskFromQaTab() {
-            const cnt = Math.min(999, Math.max(1, parseInt(document.getElementById('qa_task_count_qa_tab').value) || 1));
-            saveQaConfig();
-            if (!confirm('确定执行 QA任务（ADSL综合QA） ' + cnt + ' 次？')) return;
-            fetch('/start_unified_adsl_qa_task', {method: 'POST'})
-                .then(r => r.json()).then(j => alert(j.success ? 'QA任务已启动' : ('启动失败: ' + (j.message || ''))));
-        }
-
-        function stopQaTask() {
-            if (!confirm('确定停止QA任务吗？')) return;
-            fetch('/stop_video_tasks', {method: 'POST'})
-            .then(r => r.json())
-            .then(data => alert(data.message || '✅ 已发送停止信号'))
-            .catch(err => alert('❌ 请求失败: ' + err));
-        }
-
         // 更新日志
         setInterval(() => {
             // 更新日志
@@ -5150,83 +4991,6 @@ HTML_TEMPLATE = r"""
                     websiteConfigStatus.textContent = status.running ? '运行中' : '已停止';
                     websiteConfigStatus.style.color = status.running ? '#00d4aa' : '#ffd54f';
                 }
-                
-                // 更新视频任务状态（显示当前执行的任务）
-                fetch('/get_video_task_status').then(r => r.json()).then(videoStatus => {
-                    const currentTaskPanel = document.getElementById('currentTaskPanel');
-                    const planPreviewPanel = document.getElementById('planPreviewPanel');
-                    const videoTopStatus = document.getElementById('videoTopStatus');
-                    if (videoTopStatus) {
-                        videoTopStatus.className = 'status ' + (videoStatus.running ? 'running' : 'stopped');
-                        videoTopStatus.textContent = videoStatus.running ? '运行中' : '已停止';
-                    }
-                    const videoConfigStatus = document.getElementById('videoConfigStatus');
-                    if (videoConfigStatus) {
-                        videoConfigStatus.textContent = videoStatus.running ? '运行中' : '已停止';
-                        videoConfigStatus.style.color = videoStatus.running ? '#00d4aa' : '#ffd54f';
-                    }
-                    const btnStartVideo = document.getElementById('btn-start-video');
-                    const btnVideoAdsl = document.getElementById('btn-video-adsl-task');
-                    const btnUnifiedQa = document.getElementById('btn-unified-qa');
-                    const btnUnifiedAdslQa = document.getElementById('btn-unified-adsl-qa');
-                    const btnStopVideo = document.getElementById('btn-stop-video');
-                    if (btnStartVideo) btnStartVideo.disabled = !!videoStatus.running;
-                    if (btnVideoAdsl) btnVideoAdsl.disabled = !!videoStatus.running;
-                    if (btnUnifiedQa) btnUnifiedQa.disabled = !!videoStatus.running;
-                    if (btnUnifiedAdslQa) btnUnifiedAdslQa.disabled = !!videoStatus.running;
-                    if (btnStopVideo) btnStopVideo.disabled = !videoStatus.running;
-                    if (videoStatus.adsl) {
-                        const videoAdslStatusEl = document.getElementById('videoAdslTaskStatus');
-                        const videoAdslCompletedEl = document.getElementById('videoAdslCompletedCount');
-                        if (videoAdslStatusEl) {
-                            videoAdslStatusEl.textContent = `${videoStatus.adsl.status || '停止'} ${videoStatus.adsl.current || 0}/${videoStatus.adsl.total || 0}`;
-                        }
-                        if (videoAdslCompletedEl) {
-                            videoAdslCompletedEl.textContent = videoStatus.adsl.completed || 0;
-                        }
-                    }
-                    
-                    if (videoStatus.running && videoStatus.current_task) {
-                        // 任务运行中：显示当前任务面板和精简版计划面板
-                        currentTaskPanel.style.display = 'block';
-                        planPreviewPanel.style.display = 'block';
-                        
-                        // 更新当前任务信息
-                        const task = videoStatus.current_task;
-                        const progress = `第 ${task.idx}/${videoStatus.total_tasks} 个任务`;
-                        document.getElementById('currentTaskProgress').textContent = progress;
-                        
-                        let statusColor = '#aaa';
-                        let statusText = task.status || '执行中';
-                        if (task.status === '已完成') {
-                            statusColor = '#00d4aa';
-                        } else if (task.status === '失败') {
-                            statusColor = '#ff5555';
-                        }
-                        
-                        const taskInfo = `
-                            <div style="display:grid; grid-template-columns: 80px 1fr; gap:8px;">
-                                <span style="color:#888;">序号:</span>
-                                <span style="color:#00d4aa; font-weight:bold;">${task.idx}</span>
-                                <span style="color:#888;">计划时间:</span>
-                                <span>${task.plan_time || '-'}</span>
-                                <span style="color:#888;">代理国家:</span>
-                                <span>${task.proxy_country || '-'}</span>
-                                <span style="color:#888;">开始时间:</span>
-                                <span>${task.start_time || '-'}</span>
-                                <span style="color:#888;">完成状态:</span>
-                                <span style="color:${statusColor}; font-weight:bold;">${statusText}</span>
-                            </div>
-                        `;
-                        document.getElementById('currentTaskInfo').innerHTML = taskInfo;
-                        
-                        // 更新计划面板：只显示当前执行的任务
-                        updatePlanPanelWithCurrentTask(videoStatus);
-                    } else {
-                        // 任务未运行：隐藏当前任务面板，保持计划面板不变
-                        currentTaskPanel.style.display = 'none';
-                    }
-                });
                 
                 // 更新 ADSL 状态
                 if (status.adsl) {
@@ -5350,20 +5114,6 @@ HTML_TEMPLATE = r"""
             }
         }
         
-        function toggleIPProviderConfig() {
-            const providerType = document.querySelector('input[name="ip_provider_type"]:checked').value;
-            const adslPanel = document.getElementById('adsl-config-panel');
-            const proxyPanel = document.getElementById('proxy-pool-container');
-            
-            if (providerType === 'adsl') {
-                adslPanel.style.display = 'block';
-                proxyPanel.style.display = 'none';
-            } else {
-                adslPanel.style.display = 'none';
-                proxyPanel.style.display = 'flex';
-            }
-        }
-
         function addProxy() {
             const container = document.getElementById('proxy-pool-container');
             const proxyHtml = `
@@ -5423,29 +5173,6 @@ HTML_TEMPLATE = r"""
             resetDefaults('website');
         }
         
-        // 视频流量配置
-        function saveVideoTrafficConfig() {
-            const payload = collectVideoConfigPayload();
-
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r => r.json()).then(result => {
-                if (result.success) {
-                    alert('✅ 视频流量配置已保存');
-                } else {
-                    alert('❌ 保存失败: ' + (result.message || '未知错误'));
-                }
-            }).catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-
-        function resetVideoTrafficConfig() {
-            resetDefaults('video');
-        }
-        
         // SEO配置
         function saveSEOConfig() {
             alert('SEO配置已保存');
@@ -5500,22 +5227,369 @@ HTML_TEMPLATE = r"""
                     clearInterval(_drillPolling);
                     _drillPolling = null;
                     document.getElementById('btnSecurityDrill').disabled = false;
-                    if (d.report) {
-                        const rc = d.report;
-                        const reasons = (rc.risk_reason_list || []).map(x => '<li>' + x + '</li>').join('') || '<li>无明显风险项</li>';
-                        document.getElementById('drillResult').style.display = 'block';
-                        document.getElementById('drillResult').innerHTML =
-                            '<div style="font-size:16px;font-weight:bold;">风险分: ' + (rc.total_score ?? '-') + ' ｜ ' + (rc.risk_level || '') + '</div>' +
-                            '<div style="margin-top:8px;color:#93c5fd;">风险命中项:</div><ul>' + reasons + '</ul>' +
-                            (d.html_path ? '<div style="color:#94a3b8;margin-top:6px;">报告已保存: ' + d.html_path + '</div>' : '');
+                    if (d.full_report) {
+                        renderDrillReport(d.full_report, d.html_path);
                     }
                 }
             }).catch(() => {});
         }
         
+        // 渲染演练报告（精简版，直接列出问题）
+        function renderDrillReport(report, htmlPath) {
+            const rc = report.risk_calc || {};
+            const dimensions = rc.detection_dimensions || {};
+            const riskList = rc.risk_reason_list || [];
+            
+            let html = '';
+            
+            // 1. 风险总览
+            html += '<div style="background:#1e293b;border-radius:8px;padding:12px;margin-bottom:12px;">';
+            html += '<div style="font-size:18px;font-weight:bold;color:#f59e0b;margin-bottom:8px;">';
+            html += '🛡️ 风险评分: ' + (rc.total_score ?? '-') + ' - ' + (rc.risk_level || '未知') + '</div>';
+            html += '</div>';
+            
+            // 2. 八维度检测仪表盘
+            if (Object.keys(dimensions).length > 0) {
+                html += '<div style="margin-bottom:12px;">';
+                html += '<div style="font-size:14px;font-weight:bold;color:#93c5fd;margin-bottom:8px;">📊 八维度检测结果</div>';
+                html += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;">';
+                for (const [key, status] of Object.entries(dimensions)) {
+                    const color = status === '✅' ? '#22c55e' : (status === '⚠️' ? '#f59e0b' : '#ef4444');
+                    html += '<div style="background:#0f172a;border-radius:6px;padding:8px;text-align:center;">';
+                    html += '<div style="font-size:20px;margin-bottom:4px;">' + status + '</div>';
+                    html += '<div style="font-size:12px;color:#cbd5e1;">' + key + '</div>';
+                    html += '</div>';
+                }
+                html += '</div></div>';
+            }
+            
+            // 3. 具体问题列表（核心）
+            if (riskList.length > 0) {
+                html += '<div style="margin-bottom:12px;">';
+                html += '<div style="font-size:14px;font-weight:bold;color:#f59e0b;margin-bottom:8px;">❌ 检测到的问题 (' + riskList.length + '项)</div>';
+                html += '<ul style="margin:0;padding-left:20px;line-height:1.8;">';
+                for (const item of riskList) {
+                    // 提取关键信息高亮显示
+                    let displayItem = item;
+                    if (item.includes('[高风险]')) {
+                        displayItem = '<span style="color:#ef4444;font-weight:bold;">' + item + '</span>';
+                    } else if (item.includes('[中风险]')) {
+                        displayItem = '<span style="color:#f59e0b;">' + item + '</span>';
+                    } else if (item.includes('[低风险]')) {
+                        displayItem = '<span style="color:#93c5fd;">' + item + '</span>';
+                    }
+                    html += '<li style="margin-bottom:4px;">' + displayItem + '</li>';
+                }
+                html += '</ul></div>';
+            } else {
+                html += '<div style="background:#065f46;border-radius:8px;padding:12px;margin-bottom:12px;text-align:center;">';
+                html += '<div style="font-size:16px;color:#22c55e;font-weight:bold;">✅ 未检测到明显风险</div>';
+                html += '</div>';
+            }
+            
+            // 4. 详细数据折叠区（可选查看）
+            html += '<details style="margin-bottom:12px;">';
+            html += '<summary style="cursor:pointer;color:#93c5fd;font-size:13px;">📋 查看详细检测数据（点击展开）</summary>';
+            html += '<div style="background:#0f172a;border-radius:8px;padding:12px;margin-top:8px;font-size:12px;line-height:1.6;">';
+            
+            // 自动化探针结果
+            if (report.automation_probe) {
+                html += '<div style="margin-bottom:8px;"><strong>自动化探针:</strong><br>';
+                const autoProbe = report.automation_probe;
+                if (autoProbe.nav_webdriver) html += '- webdriver泄漏: <br>';
+                if (autoProbe.cdc_trace_leak) html += '- cdc_特征残留: ❌<br>';
+                if (autoProbe.playwright_residuals && autoProbe.playwright_residuals.length > 0) {
+                    html += '- Playwright残留: ' + autoProbe.playwright_residuals.join(', ') + '<br>';
+                }
+                html += '</div>';
+            }
+            
+            // HTTP请求头检测
+            if (report.http_header_deep) {
+                html += '<div style="margin-bottom:8px;"><strong>HTTP请求头:</strong><br>';
+                const httpDeep = report.http_header_deep;
+                if (httpDeep.completeness_pct !== undefined) html += '- 完整性: ' + httpDeep.completeness_pct + '%<br>';
+                if (httpDeep.ua_sec_ch_ua_version_match === false) html += '- UA与Sec-Ch-Ua版本不一致: ❌<br>';
+                if (httpDeep.ua_sec_ch_ua_platform_mismatch === true) html += '- UA与平台不一致: ❌<br>';
+                html += '</div>';
+            }
+            
+            // 广告合规检测
+            if (report.ad_risk) {
+                html += '<div style="margin-bottom:8px;"><strong>广告合规:</strong><br>';
+                const adRisk = report.ad_risk;
+                if (adRisk.hidden_ad_count > 0) html += '- 隐藏广告: ' + adRisk.hidden_ad_count + '个<br>';
+                if (adRisk.non_standard_size_count > 0) html += '- 非标准尺寸: ' + adRisk.non_standard_size_count + '个<br>';
+                if (adRisk.css_distorted_count > 0) html += '- CSS变形: ' + adRisk.css_distorted_count + '个<br>';
+                html += '</div>';
+            }
+            
+            html += '</div></details>';
+            
+            // 5. 报告文件路径
+            if (htmlPath) {
+                html += '<div style="color:#94a3b8;font-size:12px;margin-top:8px;">📄 完整报告已保存: ' + htmlPath + '</div>';
+            }
+            
+            document.getElementById('drillResult').style.display = 'block';
+            document.getElementById('drillResult').innerHTML = html;
+        }
+        
+        // ===== 关键词探索 =====
+        let _keywordPolling = null;
+        function startKeywordExplore() {
+            const btn = document.getElementById('btnKeywordExplore');
+            btn.disabled = true;
+            document.getElementById('keywordResult').style.display = 'none';
+            document.getElementById('keywordExploreProgress').style.display = 'block';
+            setKeywordProgress(0, '启动中...');
+            
+            // 获取目标URL（从配置中取第一个勾选的目标站）
+            let targetUrl = '';
+            for (let i = 1; i <= 3; i++) {
+                const checkbox = document.getElementById(`target_url_${i}_enabled`);
+                if (checkbox && checkbox.checked) {
+                    const urlInput = document.getElementById(`target_url_${i}`);
+                    if (urlInput && urlInput.value.trim()) {
+                        targetUrl = urlInput.value.trim();
+                        break;
+                    }
+                }
+            }
+            
+            if (!targetUrl) {
+                alert('请先在网站流量Tab勾选一个目标网站');
+                btn.disabled = false;
+                document.getElementById('keywordExploreProgress').style.display = 'none';
+                return;
+            }
+            
+            fetch('/api/keyword_explore', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    target_url: targetUrl,
+                    max_layer: 5,
+                    concurrency: 4
+                })
+            }).then(r => r.json()).then(d => {
+                if (!d.success) {
+                    alert('启动失败: ' + (d.message || '未知错误'));
+                    btn.disabled = false;
+                    document.getElementById('keywordExploreProgress').style.display = 'none';
+                    return;
+                }
+                _keywordPolling = setInterval(pollKeywordStatus, 2000);
+            }).catch(e => {
+                alert('请求异常: ' + e);
+                btn.disabled = false;
+                document.getElementById('keywordExploreProgress').style.display = 'none';
+            });
+        }
+        
+        function setKeywordProgress(pct, stage) {
+            document.getElementById('keywordBar').style.width = pct + '%';
+            document.getElementById('keywordPercent').textContent = pct + '%';
+            document.getElementById('keywordStage').textContent = stage || '准备中...';
+        }
+        
+        function pollKeywordStatus() {
+            fetch('/api/keyword_explore/status').then(r => r.json()).then(d => {
+                if (!d.success) return;
+                const data = d.data;
+                
+                // 更新进度
+                if (data.current_layer !== undefined && data.max_layer !== undefined) {
+                    const pct = Math.round((data.current_layer / data.max_layer) * 100);
+                    setKeywordProgress(pct, data.progress || `正在探索第 ${data.current_layer} 层`);
+                } else {
+                    setKeywordProgress(0, data.progress || '准备中...');
+                }
+                
+                if (!data.is_running) {
+                    clearInterval(_keywordPolling);
+                    _keywordPolling = null;
+                    document.getElementById('btnKeywordExplore').disabled = false;
+                    
+                    if (data.result) {
+                        renderKeywordResult(data.result);
+                    } else if (data.error) {
+                        document.getElementById('keywordStage').textContent = '探索失败: ' + data.error;
+                        document.getElementById('keywordBar').style.background = '#ef4444';
+                    }
+                }
+            }).catch(() => {});
+        }
+        
+        function renderKeywordResult(result) {
+            let html = '';
+            
+            // 1. 结果总览
+            html += '<div style="background:#1e293b;border-radius:8px;padding:12px;margin-bottom:12px;">';
+            html += '<div style="font-size:16px;font-weight:bold;color:#f59e0b;margin-bottom:8px;">';
+            html += ' 关键词探索完成</div>';
+            html += '<div style="display:flex;gap:20px;font-size:14px;color:#cbd5e1;">';
+            html += '<span>关键词(锚文本): <strong style="color:#22c55e;">' + result.total_keywords + '</strong></span>';
+            html += '<span>兜底链接: <strong style="color:#3b82f6;">' + (result.total_fallback_links || 0) + '</strong></span>';
+            html += '<span>层级: <strong style="color:#a78bfa;">' + result.layers_crawled + '</strong></span>';
+            html += '</div></div>';
+            
+            // 2. 各层关键词+兜底链接统计
+            if (result.layer_summary) {
+                html += '<div style="margin-bottom:12px;">';
+                html += '<div style="font-size:14px;font-weight:bold;color:#93c5fd;margin-bottom:8px;">📊 各层关键词与兜底链接</div>';
+                html += '<div style="display:flex;flex-wrap:wrap;gap:8px;">';
+                for (const [layer, count] of Object.entries(result.layer_summary)) {
+                    const fbCount = (result.fb_summary && result.fb_summary[layer]) || 0;
+                    html += '<div style="background:#0f172a;border-radius:6px;padding:8px 12px;text-align:center;">';
+                    html += '<div style="font-size:18px;font-weight:bold;color:#f093fb;">L' + layer + '</div>';
+                    html += '<div style="font-size:12px;color:#22c55e;">关键词: ' + count + '个</div>';
+                    html += '<div style="font-size:12px;color:#3b82f6;">兜底: ' + fbCount + '个</div>';
+                    html += '</div>';
+                }
+                html += '</div></div>';
+            }
+            
+            // 3. 下载报告按钮
+            html += '<div style="margin-top:12px;">';
+            html += '<a href="/api/keyword_explore/download/' + result.filename + '" '; 
+            html += 'class="btn" style="display:inline-block;padding:8px 16px;background:linear-gradient(135deg,#f093fb,#f5576c);color:#fff;border-radius:6px;text-decoration:none;cursor:pointer;">';
+            html += '📥 下载报告 (' + result.filename + ')</a>';
+            html += '</div>';
+            
+            // 4. 文件路径提示
+            html += '<div style="color:#94a3b8;font-size:12px;margin-top:8px;"> 报告已保存: data/keyword_explore/' + result.filename + '</div>';
+            
+            document.getElementById('keywordResult').style.display = 'block';
+            document.getElementById('keywordResult').innerHTML = html;
+            
+            // 保存结果数据
+            window._keywordExploreResult = result;
+            
+            // 自动填写配置到每层关键词池和兜底链接
+            applyKeywordToConfig(true);
+        }
+        
+        // 应用关键词到配置：自动填写每层关键词池和兜底链接
+        function applyKeywordToConfig(silent) {
+            const result = window._keywordExploreResult;
+            if (!result || !result.layer_data) {
+                if (!silent) alert('没有可用的探索数据');
+                return;
+            }
+            
+            const layerData = result.layer_data;
+            const mergedKws = result.merged_keywords || [];
+            const mergedFbs = result.merged_fallback_urls || [];
+            
+            for (let i = 1; i <= 6; i++) {
+                const layerKey = 'layer_' + i;
+                const data = layerData[layerKey];
+                if (!data) continue;
+                
+                const kwTextarea = document.getElementById('webnav_' + layerKey + '_keywords');
+                const fbTextarea = document.getElementById('webnav_' + layerKey + '_fallback_urls');
+                
+                if (kwTextarea) {
+                    // 如果该层没有关键词，使用合并的关键词
+                    const kws = data.keywords.length > 0 ? data.keywords : mergedKws;
+                    kwTextarea.value = kws.join(',');
+                }
+                
+                if (fbTextarea) {
+                    // 如果该层没有兜底链接，使用合并的兜底链接
+                    const fbs = data.fallback_urls.length > 0 ? data.fallback_urls : mergedFbs;
+                    fbTextarea.value = fbs.join(',');
+                }
+            }
+            
+            if (!silent) {
+                alert('✅ 已将关键词和兜底链接自动填写到各层配置！\n\n请切换到“网站流量”Tab查看，\n并点击“保存配置”按钮保存。');
+            }
+        }
+        
         // 网络配置
         function saveNetworkConfig() {
-            alert('网络配置已保存');
+            // 收集流量模型配置
+            const selectedModels = [];
+            document.querySelectorAll('.model-check').forEach(cb => {
+                if (cb.checked) selectedModels.push(cb.dataset.model);
+            });
+
+            // 收集日流量区间配置
+            const dailyTrafficRange = {
+                new: {
+                    min: parseInt(document.getElementById('dt_new_min').value),
+                    max: parseInt(document.getElementById('dt_new_max').value)
+                },
+                mid: {
+                    min: parseInt(document.getElementById('dt_mid_min').value),
+                    max: parseInt(document.getElementById('dt_mid_max').value)
+                },
+                old: {
+                    min: parseInt(document.getElementById('dt_old_min').value),
+                    max: parseInt(document.getElementById('dt_old_max').value)
+                }
+            };
+
+            // 收集ADSL配置
+            const adslConfig = {
+                adsl_username: document.getElementById('adsl_username')?.value || '',
+                adsl_password: document.getElementById('adsl_password')?.value || '',
+                adsl_interface: document.getElementById('adsl_interface')?.value || ''
+            };
+
+            // 收集代理池配置
+            const proxyItems = document.querySelectorAll('.proxy-item');
+            const proxyPool = [];
+            proxyItems.forEach(item => {
+                proxyPool.push({
+                    enabled: item.querySelector('.proxy-enabled').checked,
+                    country_code: item.querySelector('.proxy-country').value,
+                    proxy_api_url: item.querySelector('.proxy-api-url').value,
+                    proxy_user: item.querySelector('.proxy-user').value,
+                    proxy_pwd: item.querySelector('.proxy-pwd').value
+                });
+            });
+
+            // 收集VPS配置
+            const data = {
+                selected_models: selectedModels,
+                daily_traffic_range: dailyTrafficRange,
+
+                ip_proxy_api: document.getElementById('ip_proxy_api').value,
+                ip_proxy_user: document.getElementById('ip_proxy_user').value,
+                ip_proxy_pwd: document.getElementById('ip_proxy_pwd').value,
+                proxy_pool: proxyPool
+            };
+
+            console.log('发送到服务器的网络配置数据:', data);
+
+            // 发送到服务器保存
+            fetch('/save_config', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                console.log('服务器响应:', result);
+                
+                if (result.success) {
+                    alert('网络配置已保存');
+                    
+                    // 强制刷新页面以重新加载最新配置
+                    window.location.reload();
+                } else {
+                    alert('保存失败: ' + result.message);
+                }
+            })
+            .catch(error => {
+                console.error('保存配置时发生错误:', error);
+                alert('保存配置时发生错误');
+            });
         }
         
         function resetNetworkConfig() {
@@ -5543,90 +5617,34 @@ HTML_TEMPLATE = r"""
             resetDefaults('model');
         }
         
-        // 社媒引流配置
-        function saveSocialMediaConfig() {
-            // 收集选中的平台
-            const platforms = [];
-            if (document.getElementById('social_facebook').checked) platforms.push('facebook');
-            if (document.getElementById('social_twitter').checked) platforms.push('twitter');
-            if (document.getElementById('social_instagram').checked) platforms.push('instagram');
-            if (document.getElementById('social_linkedin').checked) platforms.push('linkedin');
-            if (document.getElementById('social_reddit').checked) platforms.push('reddit');
-            if (document.getElementById('social_tiktok').checked) platforms.push('tiktok');
-            
-            // 收集其他配置
-            // 解析帖子URL列表
-            const postUrlsText = document.getElementById('social_post_urls').value || '';
-            const postUrls = postUrlsText.split(',')
-                .map(url => url.trim())
-                .filter(url => url);
-                
-            const data = {
-                social_media: {
-                    platform_region: (document.querySelector('input[name="social_platform_region"]:checked') || {value: 'auto'}).value,
-                    platforms: platforms,
-                    frequency: {
-                        min: parseInt(document.getElementById('social_frequency_min').value),
-                        max: parseInt(document.getElementById('social_frequency_max').value)
-                    },
-                    stay_time: {
-                        min: parseInt(document.getElementById('social_stay_min').value),
-                        max: parseInt(document.getElementById('social_stay_max').value)
-                    },
-                    interaction_prob: {
-                        min: parseFloat(document.getElementById('social_interaction_min').value),
-                        max: parseFloat(document.getElementById('social_interaction_max').value)
-                    },
-                    post_urls: postUrls
-                }
-            };
-            
-            // 发送到服务器保存
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(result => {
-                if (result.success) {
-                    alert('社媒引流配置已保存');
-                    loadConfig(); // 重新加载配置以更新显示
-                } else {
-                    alert('保存失败: ' + result.message);
-                }
-            })
-            .catch(error => {
-                console.error('保存配置时发生错误:', error);
-                alert('保存配置时发生错误');
-            });
-        }
-        
-        function resetSocialMediaConfig() {
-            resetDefaults('social_media');
-        }
-        
         function saveSeoConfig() {
-            // 收集搜索引擎数据
-            const engineItems = document.querySelectorAll('.engine-item');
+            // 收集搜索引擎 & 社媒平台数据（含type字段）
+            const engineItems = document.querySelectorAll('#engines-container .engine-item');
             const searchEngines = [];
             engineItems.forEach(item => {
                 const id = item.querySelector('.engine-id').value.trim();
                 const name = item.querySelector('.engine-name').value.trim();
                 const url = item.querySelector('.engine-url').value.trim();
                 const language = item.querySelector('.engine-lang').value;
+                const type = item.querySelector('.engine-type').value;
                 if (id && name && url) {
-                    searchEngines.push({ id, name, url, language });
+                    searchEngines.push({ id, name, url, language, type });
                 }
             });
             
-            // 收集其他配置
+            // 收集国别-平台映射
+            const regionMap = {};
+            document.querySelectorAll('#region-map-container .region-item').forEach(item => {
+                const region = item.querySelector('label').textContent.trim();
+                const engines = item.querySelector('.region-engines').value.split(',').map(s => s.trim()).filter(s => s);
+                if (region && engines.length > 0) {
+                    regionMap[region] = engines;
+                }
+            });
+            
             const data = {
                 search_engines: searchEngines,
-                seo_region_china: document.getElementById('seo_region_china').value,
-                seo_region_usa: document.getElementById('seo_region_usa').value,
+                region_engine_map: regionMap,
                 seo_keywords_zh: document.getElementById('seo_keywords_zh').value,
                 seo_keywords_en: document.getElementById('seo_keywords_en').value,
                 seo_referer_mode: document.getElementById('seo_referer_dynamic').checked ? 'dynamic' : 'static'
@@ -5649,448 +5667,6 @@ HTML_TEMPLATE = r"""
         
         function resetSeoConfig() {
             resetDefaults('seo');
-        }
-        
-        // ==================== 视频任务控制函数 ====================
-        // 生成视频任务计划
-        function generateVideoPlan() {
-            const payload = collectVideoConfigPayload();
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(() => {
-                return fetch('/generate_video_plan', {method: 'POST'});
-            }).then(r => r.json()).then(result => {
-                if (result.status === 'ok') {
-                    renderVideoPlan(result.plan);
-                    alert('✅ 视频计划已生成，请在右侧查看，确认无误后点击"执行任务"');
-                } else {
-                    alert('❌ 视频计划生成失败: ' + (result.message || '未知错误'));
-                }
-            }).catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-        
-        // 收集视频配置参数
-        function collectVideoConfigPayload() {
-            return {
-                vt_video_urls: document.getElementById('vt_video_urls').value,
-                vt_entry_mode: document.getElementById('vt_entry_mode') ? document.getElementById('vt_entry_mode').value : 'auto',
-                vt_layer2_video_mode: document.getElementById('vt_layer2_video_mode') ? document.getElementById('vt_layer2_video_mode').value : 'auto',
-                vt_layer1_keywords: parseCommaList(document.getElementById('vt_layer1_keywords').value),
-                vt_layer2_keywords: parseCommaList(document.getElementById('vt_layer2_keywords').value),
-                vt_layer1_fallback_urls: parseCommaList(document.getElementById('vt_layer1_fallback_urls').value),
-                vt_layer2_fallback_urls: parseCommaList(document.getElementById('vt_layer2_fallback_urls').value),
-                vt_watch_count: parseInt(document.getElementById('vt_watch_count').value),
-                vt_task_days: parseInt(document.getElementById('vt_task_days').value),
-                vt_adsl_task_count: Math.min(999, Math.max(1, parseInt((document.getElementById('qa_task_count') || document.getElementById('vt_adsl_task_count')).value) || 1)),
-                vt_duration_min: parseInt(document.getElementById('vt_duration_min').value),
-                vt_duration_max: parseInt(document.getElementById('vt_duration_max').value),
-                vt_speed_min: parseFloat(document.getElementById('vt_speed_min').value),
-                vt_speed_max: parseFloat(document.getElementById('vt_speed_max').value),
-                vt_interval_min: parseFloat(document.getElementById('vt_interval_min').value),
-                vt_interval_max: parseFloat(document.getElementById('vt_interval_max').value),
-                vt_udis_referer: document.getElementById('vt_udis_referer').value,
-                qa_human_profile: (document.querySelector('input[name="qa_human_profile"]:checked') || {}).value || 'standard'
-            };
-        }
-        
-        // 启动视频 ADSL IP任务：保存配置后，按 ADSL任务数循环执行视频任务
-        function startVideoAdslIpTask() {
-            const count = Math.min(999, Math.max(1, parseInt(document.getElementById('vt_adsl_task_count').value) || 1));
-            if (!confirm(`确定要执行视频 ADSL IP任务 ${count} 次吗？每轮会在本机执行 poff/pon 重拨，并可用视频停止任务中止。`)) return;
-            const payload = collectVideoConfigPayload();
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r => r.json()).then(result => {
-                if (result.status === 'error' || result.success === false) {
-                    throw new Error(result.message || '配置保存失败');
-                }
-                return fetch('/start_video_adsl_ip_task', {method: 'POST'});
-            }).then(r => r.json()).then(result => {
-                if (result.status !== 'ok') {
-                    throw new Error(result.message || '启动失败');
-                }
-                location.reload();
-            }).catch(err => {
-                alert('❌ 视频 ADSL IP任务启动失败: ' + err.message);
-            });
-        }
-
-        // 执行视频任务
-        function startVideoTasks() {
-            if (!confirm('确定要开始执行视频任务吗？')) return;
-            document.getElementById('btn-start-video').disabled = true;
-            document.getElementById('btn-stop-video').disabled = false;
-            
-            fetch('/start_video_tasks', {method: 'POST'})
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    checkVideoTaskStatus();
-                } else {
-                    alert('❌ 启动失败: ' + data.message);
-                    document.getElementById('btn-start-video').disabled = false;
-                    document.getElementById('btn-stop-video').disabled = true;
-                }
-            })
-            .catch(err => {
-                alert('❌ 请求失败: ' + err);
-                document.getElementById('btn-start-video').disabled = false;
-                document.getElementById('btn-stop-video').disabled = true;
-            });
-        }
-        
-        // 停止视频任务
-        function stopVideoTasks() {
-            if (!confirm('确定要停止视频任务吗？')) return;
-            fetch('/stop_video_tasks', {method: 'POST'})
-            .then(r => r.json())
-            .then(data => {
-                document.getElementById('btn-stop-video').disabled = true;
-                document.getElementById('btn-start-video').disabled = false;
-                const adslBtn = document.getElementById('btn-video-adsl-task');
-                if (adslBtn) adslBtn.disabled = false;
-                const unifiedBtn = document.getElementById('btn-unified-qa');
-                const unifiedAdslBtn = document.getElementById('btn-unified-adsl-qa');
-                if (unifiedBtn) unifiedBtn.disabled = false;
-                if (unifiedAdslBtn) unifiedAdslBtn.disabled = false;
-                restoreFullPlanDisplay();
-                alert(data.message || '✅ 已发送停止信号，当前重拨/浏览器清理会尽快中断');
-            })
-            .catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-        
-        // 清除视频计划
-        function clearVideoPlan() {
-            if (!confirm('确定要清除视频任务计划吗？')) return;
-            fetch('/clear_video_plan', {method: 'POST'})
-            .then(() => {
-                document.getElementById('planPreviewPanel').style.display = 'none';
-                alert('✅ 视频计划已清除');
-            })
-            .catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-        
-        // 显示视频任务计划
-        function showVideoPlan() {
-            fetch('/get_video_plan')
-            .then(r => r.json())
-            .then(data => {
-                if (data.plan) {
-                    renderVideoPlan(data.plan);
-                } else {
-                    alert('❌ 未找到视频任务计划');
-                }
-            })
-            .catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-        
-        // 显示视频任务统计
-        function showVideoStats() {
-            fetch('/get_video_stats')
-            .then(r => r.json())
-            .then(data => {
-                displayVideoStats(data.stats);
-            })
-            .catch(err => {
-                alert('❌ 请求失败: ' + err);
-            });
-        }
-        
-        // 恢复完整计划显示
-        function restoreFullPlanDisplay() {
-            // 恢复国家分布显示
-            const distribDiv = document.getElementById('countryDistribStats');
-            if (distribDiv) distribDiv.style.display = 'block';
-            
-            // 恢复覆盖时段信息
-            const coverageInfo = document.getElementById('coverageInfo');
-            if (coverageInfo) coverageInfo.style.display = 'block';
-            
-            // 如果有视频计划，重新渲染完整计划
-            if (window.videoPlanData) {
-                renderVideoPlan(window.videoPlanData);
-            }
-        }
-        
-        // 更新计划面板为只显示当前任务
-        function updatePlanPanelWithCurrentTask(videoStatus) {
-            const task = videoStatus.current_task;
-            const total = videoStatus.total_tasks;
-            
-            // 更新计划摘要为当前任务进度
-            document.getElementById('planSummary').innerHTML = 
-                `<span style="color:#ff9900;">🚀 执行中</span> | ` +
-                `当前任务: <b style="color:#00d4aa;">${task.idx}/${total}</b> | ` +
-                `代理国家: <b style="color:#00aaff;">${task.proxy_country || '-'}</b>`;
-            
-            // 隐藏国家分布和其他统计
-            const distribDiv = document.getElementById('countryDistribStats');
-            if (distribDiv) distribDiv.style.display = 'none';
-            
-            const coverageInfo = document.getElementById('coverageInfo');
-            if (coverageInfo) coverageInfo.style.display = 'none';
-            
-            // 更新表格只显示当前任务
-            const thead = document.querySelector('#planTable thead tr');
-            thead.innerHTML = `
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">序号</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">开始时间</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">预估时长</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">结束时间</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">代理国家</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">完成状态</th>
-            `;
-            
-            const tbody = document.getElementById('planTableBody');
-            tbody.innerHTML = '';
-            
-            // 把秒数（今日00:00起）转 HH:MM:SS
-            function secToHHMMSS(utcSecToday) {
-                const todayUTC = new Date();
-                todayUTC.setUTCHours(0,0,0,0);
-                const d = new Date(todayUTC.getTime() + utcSecToday * 1000);
-                
-                // 直接获取本地时区的时间
-                const h = d.getHours();
-                const m = d.getMinutes();
-                const s = d.getSeconds();
-                
-                return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-            }
-            
-            const startStr = secToHHMMSS(task.actual_start || 0);
-            const endStr = secToHHMMSS(task.actual_end || 0);
-            const duration = (task.task_duration || 0).toFixed(1);
-            const status = task.status || '执行中';
-            let statusColor = '#aaa';
-            if (status === '已完成') statusColor = '#00d4aa';
-            if (status === '失败') statusColor = '#ff5555';
-            if (status === '执行中') statusColor = '#ff9900';
-            
-            const row = document.createElement('tr');
-            row.style.background = '#2a2a4a';
-            row.innerHTML = 
-                `<td style="padding:4px 6px; border-bottom:1px solid #222;">${task.idx}</td>` +
-                `<td style="padding:4px 6px; border-bottom:1px solid #222;">${startStr}</td>` +
-                `<td style="padding:4px 6px; border-bottom:1px solid #222;">${duration}s</td>` +
-                `<td style="padding:4px 6px; border-bottom:1px solid #222;">${endStr}</td>` +
-                `<td style="padding:4px 6px; border-bottom:1px solid #222;">${task.proxy_country || '-'}</td>` +
-                `<td style="padding:4px 6px; border-bottom:1px solid #222; color:${statusColor}; font-weight:bold;">${status}</td>`;
-            tbody.appendChild(row);
-        }
-        
-        // 渲染视频任务计划
-        function renderVideoPlan(plan) {
-            // 保存计划数据到全局变量，用于任务停止后恢复显示
-            window.videoPlanData = plan;
-            
-            // 把秒数（今日00:00起）转 HH:MM:SS，支持超过86400（跨天）
-            function secToHHMMSS(utcSecToday) {
-                // 直接使用本地时间计算，不转换时区
-                const todayLocal = new Date();
-                todayLocal.setHours(0, 0, 0, 0);
-                const d = new Date(todayLocal.getTime() + utcSecToday * 1000);
-                
-                const h = d.getHours();
-                const m = d.getMinutes();
-                const s = d.getSeconds();
-                
-                return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-            }
-            // 显示计划面板
-            document.getElementById('planPreviewPanel').style.display = 'block';
-            
-            // 模型中文名映射
-            const modelNames = {
-                'simple': '简单随机',
-                'normal': '正态分布(平稳)',
-                'gamma': '伽马分布(活动突增)',
-                'bimodal': '双峰分布(早晚高峰)',
-                'poisson': '泊松分布(秒级脉冲)',
-                'simple_video': '视频均匀分布'
-            };
-            const usedModel = plan.model_used || plan.chosen_model || 'simple_video';
-            const tasks = plan.tasks || [];
-            
-            // 计算总时长（最后一个任务的结束时间 - 第一个任务的开始时间）
-            let totalSec = 0;
-            if (tasks.length > 0) {
-                const lastTask = tasks[tasks.length - 1];
-                const firstTask = tasks[0];
-                totalSec = (lastTask.actual_end || 0) - (firstTask.actual_start || 0);
-            }
-            const hours = Math.floor(totalSec / 3600);
-            const mins = Math.floor((totalSec % 3600) / 60);
-            
-            // 获取统计数据
-            const valid = plan.total_tasks || tasks.length;
-            const totalPlanned = plan.planned_tasks || plan.initial_count || tasks.length;
-            const discarded = plan.discarded_tasks || plan.discarded_count || 0;
-            
-            // 作废任务数提示（按原因分类）
-            let discardedTip = '';
-            if (discarded > 0) {
-                const reasons = plan.discard_reasons || {};
-                const details = [];
-                if (reasons.past_time) details.push(`过去${reasons.past_time}`);
-                if (reasons.out_of_coverage) details.push(`非工作时间${reasons.out_of_coverage}`);
-                if (reasons.soft_boundary) details.push(`边界${reasons.soft_boundary}`);
-                if (reasons.out_of_window) details.push(`超窗口${reasons.out_of_window}`);
-                const detailStr = details.length > 0 ? `（${details.join('/')}）` : '';
-                discardedTip = ` | <span style="color:#ff5555;">作废: ${discarded}${detailStr}</span>`;
-            }
-            
-            // 国家数量
-            const countryCount = Object.keys(plan.country_distribution || {}).length;
-            // 平均每小时任务数
-            const avgPerHour = totalSec > 0 ? (valid / (totalSec / 3600)).toFixed(1) : 0;
-            
-            // 渲染计划摘要
-            document.getElementById('planSummary').innerHTML = 
-                `有效任务: <b style="color:#00d4aa;">${valid}</b>` +
-                (totalPlanned ? ` / 计划: <b>${totalPlanned}</b>` : '') +
-                ` | 模型: <b style="color:#ffaa00;">${modelNames[usedModel] || usedModel}</b> | ` +
-                `国家: <b style="color:#00aaff;">${countryCount}</b> | ` +
-                `跨度: <b style="color:#00d4aa;">${hours}h ${mins}m</b> | ` +
-                `平均: <b style="color:#00d4aa;">${avgPerHour}/h</b>` + discardedTip;
-            
-            // 渲染国家分布统计
-            const distribDiv = document.getElementById('countryDistribStats');
-            if (distribDiv) {
-                const distrib = plan.country_distribution || {};
-                const sortedCountries = Object.keys(distrib).sort((a,b) => distrib[b] - distrib[a]);
-                const countryFlags = {
-                    'US':'🇺🇸','GB':'🇬🇧','DE':'🇩🇪','FR':'🇫🇷','JP':'🇯🇵',
-                    'SG':'🇸🇬','HK':'🇭🇰','ID':'🇮🇩','AU':'🇦🇺','NZ':'🇳🇿'
-                };
-                let html = '<div style="display:flex; flex-wrap:wrap; gap:6px;">';
-                sortedCountries.forEach(cc => {
-                    const count = distrib[cc];
-                    const flag = countryFlags[cc] || '🏳️';
-                    html += `<span style="background:#222; padding:3px 8px; border-radius:4px; font-size:11px;">` +
-                            `${flag} <b>${cc}</b>: ${count}</span>`;
-                });
-                html += '</div>';
-                distribDiv.innerHTML = html;
-            }
-            
-            // 渲染任务表格 - 与网站流量保持一致
-            const thead = document.querySelector('#planTable thead tr');
-            thead.innerHTML = `
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">序号</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">开始时间</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">预估时长</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">结束时间</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">代理国家</th>
-                <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">完成状态</th>
-            `;
-            
-            const tbody = document.getElementById('planTableBody');
-            tbody.innerHTML = '';
-            plan.tasks.forEach(t => {
-                const startStr = secToHHMMSS(t.actual_start || 0);
-                const endStr = secToHHMMSS(t.actual_end || 0);
-                const duration = (t.task_duration || 0).toFixed(1);
-                const status = t.status || '未完成';
-                let statusColor = '#aaa';
-                if (status === '已完成') statusColor = '#00d4aa';
-                if (status === '失败') statusColor = '#ff5555';
-                
-                const row = document.createElement('tr');
-                row.innerHTML = 
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222;">${t.idx}</td>` +
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222;">${startStr}</td>` +
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222;">${duration}s</td>` +
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222;">${endStr}</td>` +
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222;">${t.proxy_country || '-'}</td>` +
-                    `<td style="padding:4px 6px; border-bottom:1px solid #222; color:${statusColor}; font-weight:bold;">${status}</td>`;
-                tbody.appendChild(row);
-            });
-            
-            // 启用执行按钮
-            document.getElementById('btn-execute-plan').disabled = true; // 禁用网站流量任务执行按钮
-            document.getElementById('btn-start-video').disabled = false; // 启用视频任务执行按钮
-            document.getElementById('btn-clear-plan').disabled = false;
-        }
-        
-        // 显示视频任务统计
-        function displayVideoStats(stats) {
-            const panel = document.getElementById('fingerprintStatsPanel');
-            const container = document.getElementById('fingerprintStatsContainer');
-            
-            let html = '';
-            
-            // 总视频观看次数
-            html += `<div style="margin-bottom:15px; padding:10px; background:#1a1a2e; border:1px solid #333; border-radius:4px;">
-                <div style="color:#28a745; font-weight:bold; font-size:16px;">📊 总视频观看次数：${stats.total_views || 0}</div>
-            </div>`;
-            
-            // 国家视频观看次数
-            if (stats.country_views && Object.keys(stats.country_views).length > 0) {
-                html += `<div style="margin-bottom:15px;">
-                    <h4 style="color:#ffc107; margin:0 0 10px 0;">🎯 国家视频观看统计</h4>
-                    <div style="max-height:200px; overflow-y:auto;">
-                        <table style="width:100%; color:#fff; font-size:11px; border-collapse:collapse;">
-                            <thead style="background:#1a1a2e;">
-                                <tr>
-                                    <th style="padding:4px; border-bottom:1px solid #444; text-align:left; width:60px;">观看次数</th>
-                                    <th style="padding:4px; border-bottom:1px solid #444; text-align:left;">国家</th>
-                                </tr>
-                            </thead>
-                            <tbody>`;
-                Object.entries(stats.country_views).sort((a, b) => b[1] - a[1]).forEach(([country, count]) => {
-                    const color = count > 50 ? '#ff5555' : (count > 20 ? '#ffc107' : '#28a745');
-                    html += `<tr>
-                        <td style="padding:4px; border-bottom:1px solid #222; color:${color}; font-weight:bold;">${count}次</td>
-                        <td style="padding:4px; border-bottom:1px solid #222;">${country}</td>
-                    </tr>`;
-                });
-                html += `</tbody></table></div></div>`;
-            }
-            
-            if (!html) {
-                html = '<div style="color:#aaa; text-align:center; padding:20px;">暂无视频统计数据</div>';
-            }
-            
-            container.innerHTML = html;
-            panel.style.display = 'block';
-        }
-        
-        // 检查视频任务状态
-        function checkVideoTaskStatus() {
-            fetch('/get_video_task_status')
-            .then(r => r.json())
-            .then(data => {
-                if (data.running) {
-                    // 任务仍在运行，更新计划面板显示当前任务
-                    if (data.current_task) {
-                        updatePlanPanelWithCurrentTask(data);
-                    }
-                    // 继续检查
-                    setTimeout(checkVideoTaskStatus, 5000);
-                } else {
-                    // 任务已停止
-                    document.getElementById('btn-start-video').disabled = false;
-                    document.getElementById('btn-stop-video').disabled = true;
-                    alert('✅ 视频任务已完成');
-                }
-            })
-            .catch(err => {
-                console.error('检查视频任务状态失败:', err);
-                setTimeout(checkVideoTaskStatus, 5000);
-            });
         }
         
     </script>
@@ -6250,14 +5826,14 @@ log = StructuredLogger()
 ua_pool_manager = UAPoolManager()
 
 def get_proxy_from_vps():
-    """从VPS获取代理和IP信息（旧方式：单代理）"""
+    """从 IPDeep 获取代理和IP信息（兼容旧调用）"""
     return get_proxy_from_api_url(config["ip_proxy_api"], config.get("ip_proxy_user", ""), config.get("ip_proxy_pwd", ""), "US")
 
 def get_proxy_from_api_url(api_url, api_user, api_pwd, country_code="US"):
-    """从VPS获取代理（代理池方式）
+    """直连 IPDeep API 获取代理（代理池方式）
     
     统一使用 ip_provider 模块，消除重复代码。
-    内部复用 IPProvider._fetch_proxy_from_vps 的实现。
+    内部复用 IPProvider._fetch_proxy_from_ipdeep 的实现。
     """
     # 确保 ip_provider 使用最新配置
     try:
@@ -6950,19 +6526,44 @@ def simulate_human_behavior(page, ad_selector, config):
     if ad_elements:
         ad_element = random.choice(ad_elements)
         try:
-            # 滚动到广告位置
-            ad_element.scroll_into_view_if_needed()
-            behavior_stats["scrolls"] += 1
+            # === 自然滚动到广告位置（渐进式，模拟用户边读内容边往下翻） ===
+            try:
+                ad_box_raw = ad_element.bounding_box()
+                if ad_box_raw:
+                    # 分 2~4 次渐进滚动到广告附近（而不是一步到位）
+                    _scroll_steps = random.randint(2, 4)
+                    for _si in range(_scroll_steps):
+                        _step_px = random.randint(150, 450)
+                        page.evaluate(f"window.scrollBy(0, {_step_px})")
+                        behavior_stats["scrolls"] += 1
+                        behavior_stats["scroll_distance"] += _step_px
+                        # 每次滚动后“阅读”停顿
+                        _read_pause = random.uniform(0.8, 2.5)
+                        time.sleep(_read_pause)
+                        behavior_stats["waits"] += 1
+                        behavior_stats["total_stay"] += int(_read_pause * 1000)
+                    # 最后确保广告可见
+                    ad_element.scroll_into_view_if_needed()
+                    behavior_stats["scrolls"] += 1
+            except Exception:
+                ad_element.scroll_into_view_if_needed()
+                behavior_stats["scrolls"] += 1
             
             # 获取广告元素的中心位置
             box = ad_element.bounding_box()
             if box:
-                ad_center_x = box["x"] + box["width"] / 2
-                ad_center_y = box["y"] + box["height"] / 2
+                # 不精确瞄准中心，添加随机偏移（模拟人类视觉焦点不精确）
+                ad_center_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+                ad_center_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
                 
-                # 使用贝塞尔曲线移动到广告中心
+                # 使用贝塞尔曲线移动到广告附近
                 human_mouse_move(page, current_x, current_y, ad_center_x, ad_center_y, config)
                 current_x, current_y = ad_center_x, ad_center_y
+                
+                # 微观犹豫：人类看到广告后会有短暂停顿（0.3~1.2s）
+                _hesitation = random.uniform(0.3, 1.2)
+                time.sleep(_hesitation)
+                behavior_stats["total_stay"] += int(_hesitation * 1000)
             
             # 在广告区域停留
             ad_stay_time = get_random_value(config["ad_stay_time"])
@@ -7039,7 +6640,7 @@ def simulate_human_behavior(page, ad_selector, config):
                                     _driver.switch_to.window(_driver.window_handles[0])
                 except Exception as _lp_err:
                     log.debug(f"落地页行为处理异常（忽略）: {type(_lp_err).__name__}: {str(_lp_err)[:80]}")
-        except:
+        except Exception:
             pass
     
     # 随机点击页面其他位置（使用贝塞尔曲线移动过去）
@@ -7060,7 +6661,7 @@ def simulate_human_behavior(page, ad_selector, config):
             time.sleep(random_wait)
             behavior_stats["waits"] += 1
             behavior_stats["total_stay"] += int(random_wait * 1000)
-        except:
+        except Exception:
             pass
     
     # 总停留时间
@@ -7329,9 +6930,9 @@ def simulate_vids_st_login(page, config):
 def convert_udis_video_url(video_url, config, current_task=None):
     """
     阶段3：视频 URL 不再拼接 HTTP 代理地址。
-    浏览器数据面统一通过 socks5://VPS:1666 出网，因此视频链接必须保持原始 URL。
+    浏览器数据面统一通过 IPDeep HTTP 代理出网，因此视频链接必须保持原始 URL。
     """
-    log.info("阶段3 SOCKS5 模式：视频URL保持原始地址，由浏览器代理统一出网")
+    log.info("IPDeep 代理模式：视频URL保持原始地址，由浏览器代理统一出网")
     return video_url
 
 
@@ -7371,7 +6972,7 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
     actual_watch_time = 0
     
     try:
-        if not video_task_running:
+        if not task_running:
             log.warning("⛔ 任务已停止，视频广告观看已取消")
             return 0, current_x, current_y, behavior_stats
             
@@ -7605,7 +7206,7 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         except Exception as e:
             log.debug(f"检查video元素失败: {str(e)}")
         
-        if not video_task_running:
+        if not task_running:
             log.warning("⛔ 任务已停止，视频播放已取消")
             return 0, current_x, current_y, behavior_stats
             
@@ -7773,7 +7374,7 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         except Exception as e:
             log.debug(f"检查播放状态异常: {str(e)}")
         
-        if not video_task_running:
+        if not task_running:
             log.warning("⛔ 任务已停止，观看流程已取消")
             return 0, current_x, current_y, behavior_stats
             
@@ -7943,7 +7544,7 @@ def click_chicken_soup_link(page, target_url, current_x, current_y, config):
                 if "chicken" in text or "soup" in text or "/chicken-soup" in href:
                     target_links.append(link)
                     log.debug(f"✅ 找到候选链接: {text[:50]} → {href}")
-            except:
+            except Exception:
                 continue
         
         if target_links:
@@ -8019,7 +7620,7 @@ def click_book_link_to_list(page, target_url, current_x, current_y, config):
                 if "book" in text:
                     target_links.append(link)
                     log.debug(f"✅ 找到候选链接: {text[:50]}")
-            except:
+            except Exception:
                 continue
         
         if target_links:
@@ -8080,7 +7681,7 @@ def click_chapter_link_to_page(page, target_url, current_x, current_y, config):
                     log.debug(f"✅ 找到 Chapter 候选链接: {text[:50]}")
                 else:
                     other_links.append(link)
-            except:
+            except Exception:
                 continue
         
         if chapter_links:
@@ -8100,7 +7701,7 @@ def click_chapter_link_to_page(page, target_url, current_x, current_y, config):
                 log.warning(f"⚠️ 滚动到 chapter 链接超时，使用 JS 兜底滚动: {str(e)[:60]}")
                 try:
                     page.evaluate("(el) => el && el.scrollIntoView({block:'center'})", target_link)
-                except:
+                except Exception:
                     pass
             time.sleep(random.uniform(0.5, 1.5))
             
@@ -8155,7 +7756,7 @@ def click_back_home_button(page, target_url, current_x, current_y, config):
                 if "返回" in text or "back" in text or "home" in text or "首页" in text:
                     target_elements.append(elem)
                     log.debug(f"✅ 找到候选按钮: {text[:50]}")
-            except:
+            except Exception:
                 continue
         
         if target_elements:
@@ -8166,7 +7767,7 @@ def click_back_home_button(page, target_url, current_x, current_y, config):
                 log.warning(f"⚠️ 滚动返回按钮超时，尝试 JS 兜底滚动: {str(e)[:60]}")
                 try:
                     page.evaluate("(el) => el && el.scrollIntoView({block:'center'})", target_elem)
-                except:
+                except Exception:
                     pass
             time.sleep(random.uniform(0.5, 1.5))
             
@@ -8210,7 +7811,7 @@ def click_back_home_button(page, target_url, current_x, current_y, config):
         try:
             page.goto(target_url, timeout=60000, wait_until='domcontentloaded')
             return True, current_x, current_y
-        except:
+        except Exception:
             pass
     
     return False, current_x, current_y
@@ -8303,7 +7904,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                                     _seen_href.add(normalized)
                                     _candidates.append((normalized, text or href_low, target_text))
                                 break
-                    except:
+                    except Exception:
                         continue
                 
                 if _candidates:
@@ -8316,7 +7917,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                         f"{str(target_text_found)[:40]} | match={_chosen[2]} | {target_href}"
                     )
                     break
-            except:
+            except Exception:
                 time.sleep(0.5)
                 continue
         
@@ -8340,7 +7941,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                         if normalized_href == target_href:
                             target_link = link
                             break
-                    except:
+                    except Exception:
                         continue
                 
                 if target_link:
@@ -8351,7 +7952,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                         log.warning(f"⚠️ 滚动链接超时，使用 JS 兜底滚动: {str(e)[:60]}")
                         try:
                             page.evaluate("(el) => el && el.scrollIntoView({block:'center'})", target_link)
-                        except:
+                        except Exception:
                             pass
                     time.sleep(random.uniform(0.8, 1.5))
                     
@@ -8379,7 +7980,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                             time.sleep(wait_load)
                             try:
                                 page.wait_for_load_state('domcontentloaded', timeout=30000)
-                            except:
+                            except Exception:
                                 log.warning("等待页面load状态超时，但继续执行...")
                             return True, current_x, current_y
                     except Exception as e:
@@ -8590,7 +8191,7 @@ def watch_video_ad_from_page(page, config, current_x, current_y):
                         iframe.set_attribute('src', src)
                         log.info(f"已替换udis视频iframe链接: {original_src} -> {src}")
                     iframes.append(iframe)
-            except:
+            except Exception:
                 pass
         
         log.info(f"找到 {len(iframes)} 个有 src 的 iframe")
@@ -9012,7 +8613,7 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
             page.evaluate(f"window.scrollBy(0, {scroll_amount})")
             behavior_stats["scrolls"] += 1
             behavior_stats["scroll_distance"] += scroll_amount
-        except:
+        except Exception:
             pass
         wait_after_scroll = random.uniform(0.5, 1.5)
         time.sleep(wait_after_scroll)
@@ -9028,14 +8629,14 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
             # 寻找页面上的可点击链接
             try:
                 links = page.query_selector_all('a[href]')
-            except:
+            except Exception:
                 links = []
             
             if not links:
                 log.warning("未找到可点击链接，尝试寻找按钮")
                 try:
                     links = page.query_selector_all('button, [role="button"], [onclick]')
-                except:
+                except Exception:
                     links = []
             
             if not links:
@@ -9074,9 +8675,9 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
                                 if any(kw.lower() in link_text.lower() for kw in preferred_keywords):
                                     preferred_links.append(link)
                                     log.info(f"✅ 找到关键词匹配链接: {link_text[:40]}")
-                            except:
+                            except Exception:
                                 pass
-                except:
+                except Exception:
                     continue
             
             if not valid_links:
@@ -9129,7 +8730,7 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
                         page.evaluate(f"window.scrollBy(0, {scroll_amount})")
                         behavior_stats["scrolls"] += 1
                         behavior_stats["scroll_distance"] += scroll_amount
-                    except:
+                    except Exception:
                         pass
                     wait_after_click_scroll = random.uniform(0.5, 1)
                     time.sleep(wait_after_click_scroll)
@@ -9140,7 +8741,7 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
                     try:
                         current_url = page.url
                         log.info(f"当前页面: {current_url}")
-                    except:
+                    except Exception:
                         pass
                 else:
                     log.warning("无法获取链接位置，跳过此链接")
@@ -9286,6 +8887,9 @@ def sync_process_timezone_to_ip(resolved):
     language = (resolved or {}).get("language")
     if not timezone_name or not language:
         raise RuntimeError("缺少 timezone/language，无法同步时区")
+    # H-4: 白名单校验时区字符串，防止外部 API 返回恶意值导致命令注入
+    if not re.match(r'^[A-Za-z0-9_/+\-]+$', timezone_name):
+        raise RuntimeError(f"时区名称包含非法字符: {timezone_name!r}")
     pytz.timezone(timezone_name)
     try:
         subprocess.run(["timedatectl", "set-timezone", timezone_name], check=True, capture_output=True, timeout=10)
@@ -9750,41 +9354,31 @@ def worker_task(single_task=False, adsl_ip_task=False):
             if not task_running:
                 log.warning("⛔ 任务已停止（任务清单遍历中）")
                 break
-            
+                        
             # ========== Step B: 使用任务计划中预定的代理国家（v1.60） ==========
             planned_country = task.get('proxy_country', 'US')
             current_task = dict(task)
-            is_adsl_task = current_task.get("ip_mode") == "adsl"
+            # 在代理池中找到匹配的代理
             log.info(f"🎯 任务计划代理国家: {planned_country}")
-            
-            if is_adsl_task:
-                selected_proxy = {"country_code": "ADSL", "proxy_api_url": "", "proxy_user": "", "proxy_pwd": ""}
-                current_task['proxy_api_url'] = ""
-                current_task['proxy_user'] = ""
-                current_task['proxy_pwd'] = ""
-                current_task['proxy_country'] = "ADSL"
-                log.info("[ADSL] 当前任务使用本机 ADSL 直连，不走代理池/6666/1666")
+            matched_proxies = [p for p in proxy_pool_enabled if p.get('country_code') == planned_country]
+            if not matched_proxies:
+                # 如果找不到预定国家的代理，从可用代理中选一个（兆底切换）
+                log.warning(f"⚠️ 未找到 {planned_country} 代理，启动兆底切换")
+                available_proxies = get_available_proxies(proxy_pool_enabled)
+                if not available_proxies:
+                    log.error("❌ 没有可用代理（工作时间内），跳过本任务")
+                    stats["fail"] += 1
+                    stats["total"] += 1
+                    continue
+                selected_proxy = random.choice(available_proxies)
+                log.info(f"🔄 兆底切换至: {selected_proxy.get('country_code')}")
             else:
-                # 在代理池中找到匹配的代理
-                matched_proxies = [p for p in proxy_pool_enabled if p.get('country_code') == planned_country]
-                if not matched_proxies:
-                    # 如果找不到预定国家的代理，从可用代理中选一个（兜底切换）
-                    log.warning(f"⚠️ 未找到 {planned_country} 代理，启动兜底切换")
-                    available_proxies = get_available_proxies(proxy_pool_enabled)
-                    if not available_proxies:
-                        log.error("❌ 没有可用代理（工作时间内），跳过本任务")
-                        stats["fail"] += 1
-                        stats["total"] += 1
-                        continue
-                    selected_proxy = random.choice(available_proxies)
-                    log.info(f"🔄 兜底切换至: {selected_proxy.get('country_code')}")
-                else:
-                    selected_proxy = random.choice(matched_proxies)
-                    log.info(f"✅ 使用计划代理: {selected_proxy.get('country_code')}")
-                current_task['proxy_api_url'] = selected_proxy.get('proxy_api_url')
-                current_task['proxy_user'] = selected_proxy.get('proxy_user')
-                current_task['proxy_pwd'] = selected_proxy.get('proxy_pwd')
-                current_task['proxy_country'] = selected_proxy.get('country_code', 'US')
+                selected_proxy = random.choice(matched_proxies)
+                log.info(f"✅ 使用计划代理: {selected_proxy.get('country_code')}")
+            current_task['proxy_api_url'] = selected_proxy.get('proxy_api_url')
+            current_task['proxy_user'] = selected_proxy.get('proxy_user')
+            current_task['proxy_pwd'] = selected_proxy.get('proxy_pwd')
+            current_task['proxy_country'] = selected_proxy.get('country_code', 'US')
             
             task_start_time = time.time()
             log.task_separator(task_idx + 1, total_tasks)
@@ -9817,6 +9411,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 interval_min = config.get("task_interval", {}).get("min", 20)
                 interval_max = config.get("task_interval", {}).get("max", 40)
                 wait_sec = random.uniform(interval_min, interval_max)
+                # 增强随机性：10% 分心暂停 + 高斯微抖动
+                if random.random() < 0.10:
+                    wait_sec += random.uniform(30, 90)
+                wait_sec = max(3, wait_sec * (1 + random.gauss(0, 0.12)))
                 log.info(f"⏳ 任务间隔等待 {wait_sec:.1f} 秒...")
             
             if wait_sec > 0:
@@ -9850,7 +9448,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 resolved_ip_info = None
                 
                 # —— SEO 在重试循环里准备 ——
-                selected_engine = None
+                selected_engine_id = None
                 selected_keyword = None
                 generated_referer = None
                 ip_region = None
@@ -9868,33 +9466,47 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         log.warning("⛔ 任务已停止（IP 重试循环中）")
                         break
                     try:
-                        if is_adsl_task:
-                            adsl_status["current"] = task_idx + 1
-                            adsl_status["status"] = "重拨取IP"
-                            exit_ip, resolved_ip_info = redial_adsl_and_get_ip()
-                            ip_info = dict(resolved_ip_info)
-                            proxy_info = {
-                                "success": True,
-                                "proxy_host": "DIRECT",
-                                "proxy_port": "DIRECT",
-                                "ip_info": ip_info,
-                                "adsl_direct": True
-                            }
-                            layer1_success = True
-                            ipdeep_success = True
-                            region = resolved_ip_info.get("region", "未知") or "未知"
-                            city = resolved_ip_info.get("city", "未知") or "未知"
-                        elif ip_attempt > 0:
+                        # 直连 IPDeep 获取代理
+                        if ip_attempt > 0:
                             log.warning(f"🔁 重新获取代理 IP（第 {ip_attempt+1}/{ip_retry_max} 次）...")
                         else:
-                            log.info(f"正在从VPS获取代理 (国家: {current_task['proxy_country']})...")
-                        if not is_adsl_task:
-                            proxy_info = get_proxy_from_api_url(
-                            current_task["proxy_api_url"],
-                            current_task["proxy_user"],
-                            current_task["proxy_pwd"],
-                            current_task["proxy_country"]
-                        )
+                            log.info(f"正在从 IPDeep 获取代理 (国家: {current_task['proxy_country']})...")
+                        # ========== 超时保护：防止请求无限卡死 ==========
+                        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+                        
+                        def _fetch_proxy_with_timeout():
+                            """带超时的代理获取函数"""
+                            try:
+                                result = get_proxy_from_api_url(
+                                    current_task["proxy_api_url"],
+                                    current_task["proxy_user"],
+                                    current_task["proxy_pwd"],
+                                    current_task["proxy_country"]
+                                )
+                                return result
+                            except Exception as e:
+                                log.error(f"❌ IPDeep代理获取异常: {type(e).__name__}: {e}")
+                                return {"success": False, "error": f"{type(e).__name__}: {e}"}
+                        
+                        # 使用线程池执行器，设置45秒超时
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(_fetch_proxy_with_timeout)
+                            try:
+                                proxy_info = future.result(timeout=45)
+                                log.info(f"✅ IPDeep代理获取完成")
+                            except FuturesTimeoutError:
+                                log.error(f"⛔ IPDeep代理获取超时(45s)，强制取消任务")
+                                proxy_info = {"success": False, "error": "IPDeep请求超时(45s)"}
+                            except Exception as e:
+                                log.error(f" IPDeep代理获取失败: {type(e).__name__}: {e}")
+                                proxy_info = {"success": False, "error": f"{type(e).__name__}: {e}"}
+                        
+                        # 记录获取结果
+                        if proxy_info and proxy_info.get("success"):
+                            log.info(f"✅ IPDeep代理获取成功: {proxy_info.get('proxy_host')}:{proxy_info.get('proxy_port')}")
+                        else:
+                            err_msg = proxy_info.get('error', '未知错误')[:100] if proxy_info else '返回None'
+                            log.warning(f"❌ IPDeep代理获取失败: {err_msg}")
                         
                         # 检查代理获取是否成功
                         if proxy_info is None:
@@ -9942,6 +9554,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 f"⚠️ 第 {ip_attempt+1} 次代理 proxy_host/proxy_port 为空串，舍弃"
                             )
                             continue
+
+                        # ===== C段分散检查：避免同/24子网集中访问触发 AdSense 风控 =====
+                        if exit_ip and exit_ip != "未知":
+                            if not _ip_provider.check_c_segment_diversity(exit_ip):
+                                log.warning(
+                                    f"⚠️ IP {exit_ip} 的C段({_ip_provider.get_c_segment(exit_ip)}.0/24)"
+                                    f"近期使用过多，舍弃换下一个 IP"
+                                )
+                                continue
+                            _ip_provider.record_c_segment_use(exit_ip)
 
                         # —— Step 1: 精准识别 IP 三要素 country/timezone/language ——
                         log.info(f"🔎 精准识别 IP 信息: {exit_ip}")
@@ -10023,88 +9645,59 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         language = resolved_ip_info.get("language") or "en-US"
                         cc_upper = (resolved_ip_info.get("country_code") or "").upper()
                         
-                        # ========== 社媒引流：强制语言锁定 ==========
-                        social_config = config.get("social_media", {})
-                        platform_region = social_config.get("platform_region", "auto")
-                        if platform_region == "western":
-                            # 欧美社媒：强制锁定英文，过滤非英文IP
-                            original_lang = language
-                            language = "en-US"
-                            resolved_ip_info["language"] = "en-US"
-                            log.info(f"🌍 [社媒强制] 欧美社媒区域：强制锁定语言为 en-US（原语言: {original_lang}）")
-                            # 如果IP国家不是欧美/英文区域，仍然允许，但日志提醒
-                            if not lang_lower.startswith("en"):
-                                log.warning("⚠️ [社媒强制] 当前IP语言非英文，但配置要求欧美社媒，继续运行（语言已强制覆盖）")
-                        elif platform_region == "chinese":
-                            # 中文社媒：强制锁定中文，过滤非中文IP
-                            original_lang = language
-                            language = "zh-CN"
-                            resolved_ip_info["language"] = "zh-CN"
-                            log.info(f"🌍 [社媒强制] 中文社媒区域：强制锁定语言为 zh-CN（原语言: {original_lang}）")
-                            # 如果IP国家不是中国，仍然允许，但日志提醒
-                            if not lang_lower.startswith("zh"):
-                                log.warning("⚠️ [社媒强制] 当前IP语言非中文，但配置要求中文社媒，继续运行（语言已强制覆盖）")
-                        
                         lang_lower = (language or "").lower()
+                        
                         log.info(
                             f"✅ IP 三要素识别成功 country={country}, timezone={timezone}, "
                             f"language={language}, source={resolved_ip_info.get('source')}"
                         )
-                        if is_adsl_task:
-                            current_task['proxy_country'] = cc_upper or country or "ADSL"
-                        
                         # —— Step 2: 决定 SEO 区域（严禁跳过 SEO，不可支持的语言直接舍弃 IP） ——
                         if not config.get("enable_seo", True):
                             log.error("❌ enable_seo=False，无法启动任务（严禁跳过 SEO）")
                             ip_region = REGION_FAILED
                             break
                         
-                        if lang_lower.startswith("zh") and cc_upper == "CN":
-                            ip_region = "中国"
-                            log.info(f"✓ language=zh + country=CN → 中国 SEO")
+                        # 根据IP国别代码匹配region_engine_map
+                        region_map = config.get('seo', {}).get('region_engine_map', {})
+                        if cc_upper in region_map:
+                            ip_region = cc_upper
+                            log.info(f"✓ country={cc_upper} → 匹配国别平台映射 {ip_region}")
+                        elif lang_lower.startswith("zh"):
+                            ip_region = "CN"
+                            log.info(f"✓ language=zh → CN 平台映射")
                         elif lang_lower.startswith("en"):
-                            ip_region = "美国"
-                            log.info(f"✓ language={language} → 美国 SEO（英文搜索引擎）")
+                            ip_region = "US"
+                            log.info(f"✓ language={language} → US 平台映射")
                         elif lang_lower.startswith(("de", "fr", "it", "es", "nl", "sv", "no", "da", "fi", "pl", "pt", "el", "ja", "ko")):
-                            # 非英语欧美/日韩 → 用美国（英文）SEO 兜底（这些用户访问英文内容是常态）
-                            ip_region = "美国"
-                            log.info(f"✓ language={language}（欧美/日韩）→ 美国 SEO 兜底")
+                            # 非英语欧美/日韩 → 用US（英文）平台兜底
+                            ip_region = "US"
+                            log.info(f"✓ language={language}（欧美/日韩）→ US 平台兜底")
                         else:
                             log.warning(f"⚠️ language={language} 不在 SEO 支持范围，舍弃 IP 换下一个")
                             continue
                         
-                        # —— Step 3: 选搜索引擎 / 关键词 / 生成 Referer ——
-                        log.info(f"根据地域选择搜索引擎: {ip_region}")
-                        selected_engine = seo_query.get_random_engine_for_region(ip_region)
-                        if not selected_engine:
-                            log.warning(f"⚠️ 地域 {ip_region} 没有可用搜索引擎，舍弃 IP 换下一个")
+                        # —— Step 3: 选搜索引擎/社媒平台 / 关键词 / 生成 Referer ——
+                        log.info(f"根据国别选择平台: {ip_region}")
+                        selected_engine_id = seo_query.get_random_engine_for_region(ip_region)
+                        if not selected_engine_id:
+                            log.warning(f"⚠️ 国别 {ip_region} 没有可用平台，舍弃 IP 换下一个")
                             continue
                         
-                        selected_keyword = seo_query.get_random_keyword_for_engine(selected_engine)
+                        selected_keyword = seo_query.get_random_keyword_for_engine(selected_engine_id)
                         if not selected_keyword:
-                            log.warning(f"⚠️ 搜索引擎 {selected_engine} 没有可用关键词，舍弃 IP 换下一个")
+                            log.warning(f"⚠️ 平台 {selected_engine_id} 没有可用关键词，舍弃 IP 换下一个")
                             continue
                         
-                        generated_referer = seo_query.generate_referer(selected_engine, selected_keyword)
+                        generated_referer = seo_query.generate_referer(selected_engine_id, selected_keyword)
                         if not generated_referer:
                             log.warning(f"⚠️ Referer 生成失败，舍弃 IP 换下一个")
                             continue
-                        
-                        # ========== 社媒引流：帖子 Referer 语种匹配 ==========
-                        social_config = config.get("social_media", {})
-                        post_urls = social_config.get("post_urls", [])
-                        if post_urls:
-                            # 有社媒帖子URL配置：随机选一个作为Referer，确保语言一致性（已由平台区域锁定保证）
-                            selected_post_url = random.choice(post_urls)
-                            generated_referer = selected_post_url
-                            platform_region = social_config.get("platform_region", "auto")
-                            log.info(f"📱 [社媒Referer] 使用配置的帖子URL: {generated_referer} (区域={platform_region})")
                         
                         # —— 全部成功 ——
                         ip_success = True
                         seo_ready = True
                         log.info(
-                            f"✓ SEO流量模拟准备就绪: 地域={ip_region}, 引擎={selected_engine}, "
+                            f"✓ SEO流量模拟准备就绪: 地域={ip_region}, 引擎={selected_engine_id}, "
                             f"关键词={selected_keyword}, Referer={generated_referer}"
                         )
                         break  # 成功，跳出 IP 重试循环
@@ -10182,7 +9775,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     stats["fail"] += 1
                     continue
                 
-                # 构建代理配置（连接 VPS 代理需要 VPS 的认证）
+                # 构建代理配置（直连 IPDeep 代理出网）
                 try:
                     proxy_host = proxy_info.get('proxy_host', 'UNKNOWN')
                     proxy_port = proxy_info.get('proxy_port', 'UNKNOWN')
@@ -10196,15 +9789,17 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         stats["fail"] += 1
                         continue
                     
-                    if is_adsl_task:
-                        proxy_config = None
-                        log.info("[ADSL] ✅ 浏览器数据面使用本机直连出口，不设置 SOCKS5/HTTP 代理")
+                    # 直接使用 IPDeep 返回的 HTTP 代理出网
+                    proxy_username = proxy_info.get('proxy_username', '')
+                    proxy_password = proxy_info.get('proxy_password', '')
+                    if proxy_username and proxy_password:
+                        proxy_server = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
                     else:
-                        vps_socks5_port = int(config.get("vps_socks5_port") or 1666)
-                        proxy_config = {
-                            "server": f"socks5://{config['vps_host']}:{vps_socks5_port}",
-                        }
-                        log.info(f"[代理配置] ✅ 浏览器数据面使用 SOCKS5: {proxy_config['server']}（控制面预热节点来自 {proxy_host}:{proxy_port}）")
+                        proxy_server = f"http://{proxy_host}:{proxy_port}"
+                    proxy_config = {
+                        "server": proxy_server,
+                    }
+                    log.info(f"[代理配置] ✅ 浏览器数据面使用 IPDeep HTTP 代理: {proxy_host}:{proxy_port}")
                 except Exception as e:
                     log.error(f"❌ 构建代理配置失败: {e}")
                     log.error(f"❌ 错误类型: {type(e).__name__}")
@@ -10228,16 +9823,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     _target_url = config.get("target_url", "")
                 if _target_url:
                     try:
-                        if is_adsl_task:
-                            _proxy_for_check = None
-                            log.info(f"🩺 [ADSL诊断] 本机直连访问 {_target_url} ...")
+                        # 使用 IPDeep 代理进行诊断
+                        _diag_host = proxy_info.get('proxy_host', '')
+                        _diag_port = proxy_info.get('proxy_port', '')
+                        _diag_user = proxy_info.get('proxy_username', '')
+                        _diag_pwd = proxy_info.get('proxy_password', '')
+                        if _diag_user and _diag_pwd:
+                            _diag_url = f"http://{_diag_user}:{_diag_pwd}@{_diag_host}:{_diag_port}"
                         else:
-                            vps_control_port = int(config.get("vps_new_port") or 6666)
-                            _proxy_for_check = {
-                                "http": f"http://{config.get('vps_user', 'admin')}:{config.get('vps_pass', 'admin123')}@{config['vps_host']}:{vps_control_port}",
-                                "https": f"http://{config.get('vps_user', 'admin')}:{config.get('vps_pass', 'admin123')}@{config['vps_host']}:{vps_control_port}"
-                            }
-                            log.info(f"🩺 [诊断] 通过代理访问 {_target_url} ...")
+                            _diag_url = f"http://{_diag_host}:{_diag_port}"
+                        _proxy_for_check = {
+                            "http": _diag_url,
+                            "https": _diag_url
+                        }
+                        log.info(f"🩺 [诊断] 通过 IPDeep 代理访问 {_target_url} ...")
                         _health_resp = requests.get(
                             _target_url,
                             proxies=_proxy_for_check,
@@ -10271,8 +9870,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 log.info("正在启动浏览器...")
                 _headless_mode = bool(config.get("headless", True))
                 _use_real_chrome = bool(config.get("use_real_chrome", True))
-                if proxy_config and str(proxy_config.get("server", "")).startswith("socks5://"):
-                    log.info("SOCKS5代理模式：通过Selenium Chrome访问，噪音请求已通过--host-rules和JS hook拦截")
+                if proxy_config and str(proxy_config.get("server", "")).startswith("http://"):
+                    log.info("IPDeep HTTP代理模式：通过Selenium Chrome访问，噪音请求已通过--host-rules和JS hook拦截")
                 log.info(f"浏览器模式: {'无头(headless=True)' if _headless_mode else '有界面(headless=False, 调试用)'}，浏览器内核: {'本地 Chrome（带 H.264/AAC）' if _use_real_chrome else '系统Chrome（无专有 codec）'}")
                 
                 # 使用指纹生成的 User-Agent（与IP匹配）
@@ -10301,12 +9900,22 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         f"--proxy-server={proxy_config['server']}",
                         "--proxy-bypass-list=*.google.com;*.googleapis.com;*.gstatic.com;*.gvt1.com;accounts.google.com;clients2.google.com;safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;httpbin.org;api.ipify.org;icanhazip.com;ifconfig.me;checkip.amazonaws.com;ident.me",
                     ])
-                _launch_args.extend([
-                        f"--lang={_launch_lang}",
-                        f"--window-size={width},{height}",
+                # WebRTC防护与配置面板同步
+                if config.get("webrtc_leak_check_enabled", True):
+                    _launch_args.extend([
                         "--disable-webrtc",
                         "--disable-webrtc-encryption",
                         "--disable-webrtc-stun-origin",
+                        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        "--webrtc-max-packet-size=0"
+                    ])
+                    log.info("WebRTC防泄漏已启用")
+                else:
+                    log.warning("WebRTC防泄漏已禁用（可能导致IP泄漏风险）")
+                
+                _launch_args.extend([
+                        f"--lang={_launch_lang}",
+                        f"--window-size={width},{height}",
                         "--autoplay-policy=no-user-gesture-required",
                         "--mute-audio",
                         "--disable-features=AutoplayIgnoreWebAudio,MediaRouter,Translate,TranslateUI,LanguageDetection,OptimizationHints",
@@ -10345,39 +9954,37 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 # ❌ 之前用子线程 _lworker 启动 chromium，会导致
                 #    "Task was destroyed but it is pending! / task switched to a different thread"
                 #    因为 Selenium WebDriver 实例需要绑定主线程，子线程操作会导致会话异常。
-                def _launch_browser(_pw, _use_chrome_channel, _kwargs, _max_wait_sec=60):
-                    import signal as _sig
-                    class _TimeoutError(Exception):
-                        pass
-                    def _on_timeout(_signum, _frame):
-                        raise _TimeoutError(f"浏览器启动超时（>{_max_wait_sec}s）")
-                    _prev = None
-                    try:
-                        try:
-                            _prev = _sig.signal(_sig.SIGALRM, _on_timeout)
-                            _sig.alarm(_max_wait_sec)
-                        except (ValueError, AttributeError, OSError):
-                            _prev = "no-sig"
+                # ========== 修复：使用 ThreadPoolExecutor 实现可靠的超时保护（子线程兼容） ==========
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+                
+                def _launch_browser_with_timeout(_pw, _use_chrome_channel, _kwargs, _max_wait_sec=30):
+                    """启动浏览器，带超时保护和异常处理（使用ThreadPoolExecutor，支持子线程）"""
+                    def _do_launch():
                         try:
                             if _use_chrome_channel:
                                 _browser = _pw.chromium.launch(channel="chrome", **_kwargs)
                             else:
                                 _browser = _pw.chromium.launch(**_kwargs)
                             return _browser, None
-                        except _TimeoutError as _te:
-                            return None, str(_te)
                         except Exception as _e:
-                            return None, f"{type(_e).__name__}: {str(_e)[:300]}"
-                    finally:
+                            err_msg = f"{type(_e).__name__}: {str(_e)[:300]}"
+                            log.debug(f"️ 浏览器启动异常: {err_msg}")
+                            return None, err_msg
+                    
+                    # 使用线程池执行器实现超时保护
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(_do_launch)
                         try:
-                            _sig.alarm(0)
-                        except Exception:
-                            pass
-                        try:
-                            if _prev not in (None, "no-sig"):
-                                _sig.signal(_sig.SIGALRM, _prev)
-                        except Exception:
-                            pass
+                            browser, error = future.result(timeout=_max_wait_sec)
+                            return browser, error
+                        except FuturesTimeoutError:
+                            timeout_err = f"浏览器启动超时（>{_max_wait_sec}s）"
+                            log.warning(f"️ {timeout_err}")
+                            return None, timeout_err
+                        except Exception as e:
+                            exec_err = f"执行器异常: {type(e).__name__}: {str(e)[:200]}"
+                            log.error(f"❌ {exec_err}")
+                            return None, exec_err
 
                 def _minimal_launch_kwargs():
                     args = [
@@ -10394,25 +10001,39 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                 browser = None
                 launch_errors = []
+                
+                # 启动策略：先尝试本地Chrome（支持H.264），失败后快速降级到系统Chrome
                 if _use_real_chrome:
-                    browser, _lerr = _launch_browser(p, True, _launch_kwargs, 60)
+                    log.info("🚀 尝试使用本地 Chrome 启动...")
+                    browser, _lerr = _launch_browser_with_timeout(p, True, _launch_kwargs, 30)
                     if browser is not None:
                         log.info("✅ 使用本地 Chrome 启动成功（支持 H.264/AAC）")
                     else:
                         launch_errors.append(f"chrome-full={_lerr or '未知'}")
-                        log.warning(f"⚠️ 本地 Chrome 启动失败/超时，回退到 系统Chrome: {_lerr or '未知'}")
+                        log.warning(f"️ 本地 Chrome 启动失败: {_lerr}")
+                
+                # 如果本地Chrome失败，尝试系统Chrome（完整参数）
                 if browser is None:
-                    browser, _lerr2 = _launch_browser(p, False, _launch_kwargs, 60)
-                    if browser is None:
-                        launch_errors.append(f"chromium-full={_lerr2 or '未知'}")
-                        log.warning(f"⚠️ Chrome 完整参数启动失败，尝试极简参数: {_lerr2 or '未知'}")
-                        browser, _lerr3 = _launch_browser(p, False, _minimal_launch_kwargs(), 60)
-                        if browser is None:
-                            launch_errors.append(f"chromium-minimal={_lerr3 or '未知'}")
-                            raise RuntimeError("浏览器启动失败: " + " | ".join(launch_errors))
-                        log.info("✅ 使用 Chrome 极简参数启动成功")
+                    log.info("🚀 尝试使用系统 Chrome 启动（完整参数）...")
+                    browser, _lerr2 = _launch_browser_with_timeout(p, False, _launch_kwargs, 30)
+                    if browser is not None:
+                        log.info("✅ 使用系统 Chrome 启动成功（可能不支持 HLS/H.264）")
                     else:
-                        log.info("使用系统 Chrome 启动（可能不支持 HLS/H.264）")
+                        launch_errors.append(f"chromium-full={_lerr2 or '未知'}")
+                        log.warning(f"⚠️ 系统 Chrome 完整参数启动失败: {_lerr2}")
+                        
+                        # 最后尝试极简参数
+                        log.info("🚀 尝试使用极简参数启动...")
+                        browser, _lerr3 = _launch_browser_with_timeout(p, False, _minimal_launch_kwargs(), 20)
+                        if browser is not None:
+                            log.info("✅ 使用 Chrome 极简参数启动成功")
+                        else:
+                            launch_errors.append(f"chromium-minimal={_lerr3 or '未知'}")
+                            log.error(f"❌ 所有浏览器启动方式均失败！")
+                            raise RuntimeError(
+                                f"浏览器启动失败（已尝试3种方式）:\n" +
+                                "\n".join([f"  - {err}" for err in launch_errors])
+                            )
                 
                 # 创建浏览器上下文，严格应用指纹配置
                 
@@ -10443,10 +10064,22 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 extra_http_headers.setdefault("Sec-Fetch-User", "?1")
                 extra_http_headers.setdefault("Sec-Fetch-Dest", "document")
 
-                # 添加缺失的 Sec-Ch-Ua 请求头
-                extra_http_headers["Sec-Ch-Ua"] = '"Not_A Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"'
+                # 添加缺失的 Sec-Ch-Ua 请求头（动态匹配UA中的Chrome版本）
+                _ua_chrome_ver = "126"  # 默认值
+                _ua_match = re.search(r'Chrome/(\d+)', user_agent)
+                if _ua_match:
+                    _ua_chrome_ver = _ua_match.group(1)
+                extra_http_headers["Sec-Ch-Ua"] = f'"Not_A Brand";v="8", "Chromium";v="{_ua_chrome_ver}", "Google Chrome";v="{_ua_chrome_ver}"'
                 extra_http_headers["Sec-Ch-Ua-Mobile"] = "?0"
-                extra_http_headers["Sec-Ch-Ua-Platform"] = '"Windows"' 
+                # 平台一致性：根据UA中的平台信息动态设置
+                _ua_platform_str = '"Windows"'
+                if 'Mac OS X' in user_agent or 'Macintosh' in user_agent:
+                    _ua_platform_str = '"macOS"'
+                elif 'Linux' in user_agent and 'Android' not in user_agent:
+                    _ua_platform_str = '"Linux"'
+                elif 'Android' in user_agent:
+                    _ua_platform_str = '"Android"'
+                extra_http_headers["Sec-Ch-Ua-Platform"] = _ua_platform_str 
                 
                 # 根据IP信息动态配置浏览器上下文（与代理IP严格匹配）
                 browser_locale = fingerprint.get("language", "en-US")
@@ -10548,10 +10181,25 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     delete window.__webdriver_script_fn;
                     delete window.__fxdriver_evaluate;
                     delete window.__driver_unwrapped;
+                    delete window._Selenium_IDE_Recorder;
+                    delete window.callSelenium;
+                    delete window._selenium;
+                    delete window.__webdriver;
+                    delete window.__selenium_evaluate;
+                    delete window.domAutomationController;
+                    delete window.domAutomation;
                     delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
                     delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
                     delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
                     delete window.$cdc_asdjflasutopfhvcZLmcfl_;
+                    // 动态清除所有 cdc_ 开头的属性
+                    try {{
+                        for (const k of Object.getOwnPropertyNames(window)) {{
+                            if (k.indexOf('cdc_') === 0 || k.indexOf('$cdc_') === 0) {{
+                                try {{ delete window[k]; }} catch(e) {{}}
+                            }}
+                        }}
+                    }} catch(e) {{}}
                     
                     // 隐藏CDP特征
                     const originalQuery = window.navigator.permissions.query;
@@ -10603,14 +10251,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         }});
                     }}
                     
-                    // ========== 3. Canvas和WebGL指纹（合规化：噪声扰动 + 真实GPU字符串） ==========
+                    // ========== 3. Canvas和WebGL指纹（合规化：噪声扰动 + 真实GPU字符串 + toString保护） ==========
                     // Canvas：对真实渲染结果注入稳定的逐像素微噪声（基于会话种子），而非返回固定串
                     (function() {{
                         const _seed = {canvas_noise_seed} >>> 0;
                         let _s = _seed || 1;
                         const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
                         const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                        CanvasRenderingContext2D.prototype.getImageData = function() {{
+                        const _hookedGetImageData = function() {{
                             const data = _origGetImageData.apply(this, arguments);
                             try {{
                                 const d = data.data;
@@ -10625,6 +10273,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             }} catch(e) {{}}
                             return data;
                         }};
+                        // toString保护：让hook函数返回native code格式
+                        Object.defineProperty(_hookedGetImageData, 'toString', {{
+                            value: function() {{ return 'function getImageData() {{ [native code] }}'; }},
+                            configurable: true
+                        }});
+                        CanvasRenderingContext2D.prototype.getImageData = _hookedGetImageData;
                         const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
                         HTMLCanvasElement.prototype.toDataURL = function() {{
                             try {{
@@ -10652,11 +10306,17 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         const _patch = function(proto) {{
                             if (!proto || !proto.getParameter) return;
                             const _orig = proto.getParameter;
-                            proto.getParameter = function(param) {{
+                            const _hookedGetParam = function(param) {{
                                 if (param === 37445) return _vendor;
                                 if (param === 37446) return _renderer;
                                 return _orig.call(this, param);
                             }};
+                            // toString保护
+                            Object.defineProperty(_hookedGetParam, 'toString', {{
+                                value: function() {{ return 'function getParameter() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                            proto.getParameter = _hookedGetParam;
                         }};
                         try {{ _patch(WebGLRenderingContext.prototype); }} catch(e) {{}}
                         try {{ _patch(WebGL2RenderingContext.prototype); }} catch(e) {{}}
@@ -10964,18 +10624,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 if browser_success and consistency:
                     # 获取国家代码
                     country_code = ""
-                    # 尝试使用 cc_upper 变量
+                    # 尝试使用 cc_upper 变量（用 locals().get 替代 exec）
                     try:
-                        # 使用 exec 避免编译器检查变量是否绑定
-                        exec("if 'cc_upper' in locals() and cc_upper: country_code = cc_upper")
+                        _cc = locals().get("cc_upper", "")
+                        if _cc:
+                            country_code = _cc
+                        else:
+                            # 从 resolved_ip_info 中获取国家代码
+                            _rii = locals().get("resolved_ip_info")
+                            if _rii is not None:
+                                country_code = (_rii.get("country_code") or "").upper()
+                            else:
+                                log.warning("⚠️ 无法获取国家代码")
                     except Exception as e:
                         log.warning(f"⚠️ 无法获取 cc_upper 变量: {e}")
-                    else:
-                        # 从 resolved_ip_info 中获取国家代码
-                        if "resolved_ip_info" in locals() and resolved_ip_info is not None:
-                            country_code = (resolved_ip_info.get("country_code") or "").upper()
-                        else:
-                            log.warning("⚠️ 无法获取国家代码")
                     record_fingerprint_usage(fingerprint_id, user_agent, country_code)
                 
                 if not browser_success or not consistency:
@@ -11042,8 +10704,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # ========== [新增] 真搜索跳转流程 ==========
                         search_mode = config.get("seo", {}).get("search_mode", "direct_referer")
                         already_on_target = False
-                        if search_mode == "real_search" and selected_engine_id in ["google", "bing"]:
-                            # 执行完整搜索跳转流程（带真人模拟）
+                        if search_mode == "real_search":
+                            # 执行完整搜索跳转流程（带真人模拟，支持所有搜索引擎）
                             search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config)
                             if search_success:
                                 log.info(f"🔍 [真搜索] 已成功跳转至目标页，跳过直接导航")
@@ -11106,16 +10768,28 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     l["ratio"] = share
                         total_ratio = sum(l["ratio"] for l in layers) or 1.0
 
-                        # ★ 新逻辑：每轮独立随机一个浏览时长，总时长 = 各轮之和（循环越多任务越长，无保险绳上限）
-                        #   每轮内部：该轮随机时长 按六层 stay_ratio 比率分配到 L1→L6
+                        # ★ 修正逻辑：配置时长优先，保险绳保底
+                        #   每轮独立随机，但总时长不超过7-9分钟保险绳
+                        import random
+                        if enter_site_time is None:
+                            enter_site_time = time.time()
+                        task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机保险绳
+                        
                         round_total_stays = []
+                        remaining_time = task_deadline - time.time()  # 剩余可运行时间
+                        
                         for _r in range(chapter_loop_count):
-                            _rt = random.uniform(config["total_stay"]["min"], config["total_stay"]["max"])
-                            round_total_stays.append(max(_rt, 10.0))
+                            max_round_time = config["total_stay"]["max"]
+                            # 计算该轮最大可分配时间（不超过配置和剩余时间）
+                            available_time = min(max_round_time, remaining_time / (chapter_loop_count - _r))
+                            round_time = random.uniform(config["total_stay"]["min"], available_time)
+                            round_total_stays.append(round_time)
+                            remaining_time -= round_time
+                            
                         total_task_stay = sum(round_total_stays)
 
-                        # 每轮每层停留时长矩阵：round_layer_stays[轮][层] = 该轮随机时长 × (层比率/总比率)
-                        # ★ 纯比率瓜分：严格保证 Σ(各层) = 该轮随机时长，不再用 min_stay 抬高（避免总时长超标）
+                        # 每轮每层停留时长矩阵：round_layer_stays[轮][层] = 该轮时长 × (层比率/总比率)
+                        # ★ 纯比率瓜分：严格保证 Σ(各层) = 该轮时长，不再用 min_stay 抬高（避免总时长超标）
                         round_layer_stays = []
                         for _ridx, _rt in enumerate(round_total_stays):
                             _per_layer = [_rt * (_l["ratio"] / total_ratio) for _l in layers]
@@ -11161,18 +10835,55 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if "enter_site_time" not in locals() or enter_site_time is None:
                                 enter_site_time = time.time()
                         else:
+                            # ========== 严禁直跳：先访问Referer来源页（搜索引擎/社媒），再跳转目标网站 ==========
+                            if generated_referer:
+                                try:
+                                    log.info(f"🔗 [严禁直跳] 先访问Referer来源页: {generated_referer[:80]}")
+                                    page.goto(generated_referer, timeout=30000, wait_until="domcontentloaded")
+                                    time.sleep(random.uniform(1.5, 3.5))
+                                    log.info(f"✅ [严禁直跳] Referer来源页已访问，准备跳转目标网站")
+                                except Exception as e:
+                                    log.warning(f"⚠️ [严禁直跳] Referer来源页访问失败({str(e)[:60]})，继续跳转目标")
+                            
                             _retry_wait_list = [6, 10]  # 第1、2次失败后的等待（秒）
                             for retry in range(3):
                                 try:
                                     # wait_until="commit" 最快返回（响应头到达即算成功），后续自行等待内容
-                                    page.goto(target_url, timeout=45000, wait_until="commit")
-                                    # commit 后再等待网络空闲/内容稳定，避免出现空白页
-                                    try:
-                                        page.wait_for_load_state("domcontentloaded", timeout=30000)
-                                    except Exception:
-                                        pass  # 即使内容未完全加载，只要能响应就继续
-                                    # 额外给页面 JavaScript 渲染 2.5-4 秒时间
-                                    time.sleep(random.uniform(2.5, 4.0))
+                                    # 优化网络请求：添加重试机制和资源拦截
+                                    def optimized_page_goto(page, url, max_retries=2, referer=None):
+                                        # 拦截不必要的资源（图片、视频等，提升加载速度）
+                                        try:
+                                            page.route("**/*.png", lambda route: route.abort())
+                                            page.route("**/*.jpg", lambda route: route.abort())
+                                            page.route("**/*.jpeg", lambda route: route.abort())
+                                            page.route("**/*.mp4", lambda route: route.abort())
+                                            page.route("**/*.gif", lambda route: route.abort())
+                                            page.route("**/*.webp", lambda route: route.abort())
+                                            page.route("**/*.svg", lambda route: route.abort())
+                                            # 拦截已知广告域名（不用过于宽泛的模式，避免误伤正常JS）
+                                            page.route("**/*googleadservices*.com*", lambda route: route.abort())
+                                            page.route("**/*googlesyndication*.com*", lambda route: route.abort())
+                                            page.route("**/*doubleclick*.net*", lambda route: route.abort())
+                                        except Exception:
+                                            pass
+                                        for attempt in range(max_retries):
+                                            try:
+                                                # 优化页面加载（带Referer严禁直跳）
+                                                page.goto(url, timeout=25000, wait_until="domcontentloaded", referer=referer)
+                                                return True
+                                            except Exception as e:
+                                                log.warning(f"第{attempt+1}次访问失败: {e}")
+                                                if attempt < max_retries - 1:
+                                                    time.sleep(2)
+                                        return False
+                                        
+                                    # 执行优化后的页面访问（带Referer严禁直跳）
+                                    if not optimized_page_goto(page, target_url, referer=generated_referer):
+                                        log.error(f"页面访问多次失败，任务终止")
+                                        return False
+                                        
+                                    # 给页面 JavaScript 渲染 1.5-3 秒时间
+                                    time.sleep(random.uniform(1.5, 3.0))
                                     _ok, _bl, _u = _detect(page)
                                     if _ok:
                                         home_load_success = True
@@ -11240,12 +10951,22 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # ⏱️ 进入网站时间锚点（首页加载完成 → 浏览正式开始）
                         if "enter_site_time" not in locals() or enter_site_time is None:
                             enter_site_time = time.time()
+                        # ========== 本地IP泄露检测（已简化） ==========
+                        # 注释：浏览器出口IP由SOCKS5链路层保证，不再通过访问外部IP检测服务验证
+                        # 外部服务(ipify/icanhazip/ifconfig.me)经常超时导致任务卡死
+                        log.info(f"🛡️ IP泄漏检测：跳过外部探测（由链路层保证出口IP={exit_ip}）")
+                        
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "首页加载后")
-    
-                        # ========== 停止信号检查辅助（已移除全局保险绳；仅响应用户停止） ==========
+
+                        # ========== 任务总时长保险绳（防止任务无限延长） ==========
+                        import random
+                        task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机时长
+                        
                         def _check_rope(stage_desc=""):
                             if not task_running:
                                 raise RuntimeError("任务已停止")
+                            if time.time() >= task_deadline:
+                                raise RuntimeError(f"任务超时（已运行 {time.time() - enter_site_time:.1f}秒）")
     
                         current_x, current_y = 100, 100
 
@@ -11279,7 +11000,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 log.info(f"[第{loop_idx+1}轮] 首页(L1)停留窗口: {home_stay:.1f}秒")
                                 current_x, current_y = simulate_human_in_window(
                                     page, home_stay, page_behavior_stats, current_x or 100, current_y or 100,
-                                    config, page_name=f"[T{task_idx+1}] 首页"
+                                    config, page_name=f"[T{task_idx+1}] 首页", deadline=task_deadline
                                 )
                                 ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮首页停留后")
 
@@ -11297,7 +11018,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     current_x, current_y = simulate_human_in_window(
                                         page, list_stay, page_behavior_stats,
                                         current_x or 300, current_y or 300,
-                                        config, page_name="列表页"
+                                        config, page_name="列表页", deadline=task_deadline
                                     )
                                     ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮列表页停留后")
                                 else:
@@ -11337,7 +11058,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     current_x, current_y = simulate_human_in_window(
                                         page, stay, page_behavior_stats,
                                         current_x or 300, current_y or 300,
-                                        config, page_name=f"layer_{level_idx+1}"
+                                        config, page_name=f"layer_{level_idx+1}", deadline=task_deadline
                                     )
                                     ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮layer_{level_idx+1}停留后")
 
@@ -11365,14 +11086,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                         log.warning(f"⚠️ 返回首页 goto 失败: {str(e)[:80]}")
                                 ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮返回首页后")
     
-                                # 每轮间隔
+                                # 每轮间隔（真人行为持续，不停止）
                                 if loop_idx < chapter_loop_count - 1 and loop_interval > 0:
                                     try:
                                         _check_rope("每轮间隔前")
                                     except RuntimeError:
                                         break
-                                    log.info(f"⏸ 每轮浏览间隔: {loop_interval:.1f}秒")
-                                    time.sleep(loop_interval)
+                                    log.info(f"⏸ 每轮浏览间隔: {loop_interval:.1f}秒（真人行为持续）")
+                                    current_x, current_y = simulate_human_in_window(
+                                        page, loop_interval, page_behavior_stats,
+                                        current_x or 100, current_y or 100,
+                                        config, page_name=f"[轮间间隔{loop_idx+1}]", deadline=task_deadline
+                                    )
     
                             # ========== 网页浏览模式结束 → 全程真人行为统计 ==========
                             log.info(
@@ -11503,13 +11228,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         
                         if success:
                             stats["success"] += 1
-                            if is_adsl_task:
-                                adsl_status["completed"] += 1
-                                adsl_status["status"] = "单轮完成"
                         else:
                             stats["fail"] += 1
-                            if is_adsl_task:
-                                adsl_status["status"] = "单轮失败"
                         
                         # ⏱️ 时间统计：前置流程时长（拨号→进入网站）、浏览网站时长（进入网站→任务结束）
                         _task_end_time = time.time()
@@ -11582,7 +11302,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 f"<span style='color:#ff3333;font-weight:bold'>浏览网站时长（进入网站→任务结束）: {_browse_dur:.1f}秒</span>"
                             )
 
-                        log.task_result(task_time, False, False, f"系统异常: {str(e)}")
+                        # 增强报警信息：包含异常类型、阶段、堆栈摘要
+                        import traceback as _tb_inner
+                        _err_type = type(e).__name__
+                        _err_msg = str(e)[:200]
+                        _tb_lines = _tb_inner.format_exc().splitlines()
+                        _tb_summary = _tb_lines[-1] if _tb_lines else "无堆栈"
+                        _stage = "浏览中" if locals().get("enter_site_time") else "前置流程"
+                        log.error(
+                            f"🚨 [任务报警] 任务#{task_idx+1} {_stage}异常 | "
+                            f"类型={_err_type} | 信息={_err_msg} | 堆栈={_tb_summary}"
+                        )
+                        log.task_result(task_time, False, False, f"系统异常[{_err_type}]: {_err_msg}")
                         
                         # 更新任务状态为失败
                         if task_idx < len(tasks_list):
@@ -11681,6 +11412,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
     
     # 将任务计划添加到历史记录
     add_to_historical_tasks(daily_plan)
+    record_kpi_snapshot()
     
     task_running = False
     if adsl_ip_task:
@@ -11692,2194 +11424,19 @@ def worker_task(single_task=False, adsl_ip_task=False):
     log.info("任务已停止")
 
 
-def generate_video_daily_tasks(cfg):
-    """生成视频任务每日任务清单 - 24小时全球分布版
-    
-    核心逻辑：
-    1. 根据视频观看数量、时长、间隔计算每个任务的预计时间
-    2. 根据计划天数计算总任务数（24小时均匀分布）
-    3. 计算全球覆盖时段（自动检测启用代理的工作时间）
-    4. 国家配额平均分配
-    5. 生成任务时间点并筛选到工作时段内
-    6. 智能选代理（优先剩余配额多的国家）
-    
-    任务计算示例：
-    - 每个任务观看 vt_watch_count 个视频
-    - 每个视频时长 total_stay (30-120秒)
-    - 视频间隔 vt_task_interval (5-15秒)
-    - 任务间隔 vt_global_interval (默认10-30秒)
-    - 一天任务数 ≈ 86400 / (视频数×最大时长 + (视频数-1)×最大间隔 + 任务间隔)
-    """
-    import datetime as _dt
-    
-    # 获取视频任务配置
-    vt_watch_count = cfg.get('vt_watch_count', 3)  # 每个任务观看的视频数量
-    vt_task_days = cfg.get('vt_task_days', 1)      # 任务计划天数（0=无限循环）
-    
-    # 获取视频链接池
-    vt_video_urls = cfg.get('vt_video_urls', '').split(',')
-    vt_video_urls = [url.strip() for url in vt_video_urls if url.strip()]
-    
-    if not vt_video_urls:
-        raise Exception("视频链接池为空")
-    
-    # 准备代理池
-    proxy_pool_enabled = [p for p in cfg.get("proxy_pool", []) if p.get("enabled", False) and p.get("proxy_api_url")]
-    if not proxy_pool_enabled:
-        proxy_pool_enabled = [{
-            "country_code": "US",
-            "proxy_api_url": cfg.get("ip_proxy_api", ""),
-            "proxy_user": cfg.get("ip_proxy_user", ""),
-            "proxy_pwd": cfg.get("ip_proxy_pwd", "")
-        }]
-    
-    # 配置参数
-    total_stay_cfg = cfg.get("total_stay", {"min": 30, "max": 120})      # 单个视频观看时长
-    video_ad_cfg = cfg.get("video_ad", {})                                # 视频广告配置（包含观看时长）
-    interval_cfg = cfg.get("vt_task_interval", {"min": 5, "max": 15})    # 视频之间的间隔时间
-    global_interval_cfg = cfg.get("vt_global_interval", {"min": 10, "max": 30})  # 任务之间的间隔
-    
-    # 计算每个任务的最大耗时（用于估算任务数量）
-    # 使用视频观看时长配置，而不是total_stay配置
-    video_max_time = video_ad_cfg.get("max_watch_time", 60)
-    max_task_duration = vt_watch_count * video_max_time + (vt_watch_count - 1) * interval_cfg["max"]
-    avg_global_interval = (global_interval_cfg["min"] + global_interval_cfg["max"]) / 2
-    
-    # 计算每天可安排的任务数（按最大耗时计算，确保不会超时）
-    daily_capacity = int(86400 / (max_task_duration + avg_global_interval))
-    
-    # 1. 计算全球覆盖时段（根据任务计划天数）
-    now_utc = _dt.datetime.now(pytz.UTC)
-    today_utc_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_now_utc = (now_utc - today_utc_start).total_seconds()
-    
-    # 确定计划结束时间和总任务数
-    if vt_task_days == 0:
-        # 无限循环，表示没有特定的结束时间（显示7天计划）
-        end_of_window = seconds_now_utc + 86400 * 7
-        total_planned_tasks = daily_capacity * 7  # 7天的任务数
-    else:
-        # 有限天数的计划
-        end_of_window = seconds_now_utc + 86400 * vt_task_days
-        total_planned_tasks = daily_capacity * vt_task_days  # 按天数计算任务数
-    
-    # 收集各代理国家的工作时段
-    all_covered_segments = []
-    enabled_countries = list({p.get("country_code", "US") for p in proxy_pool_enabled})
-    country_segments = {}
-    
-    for cc in enabled_countries:
-        tz_str = get_timezone_for_country(cc)
-        try:
-            tz = pytz.timezone(tz_str)
-        except Exception:
-            tz = pytz.timezone("America/New_York")
-        
-        if cc not in country_segments:
-            country_segments[cc] = []
-        
-        # 计算需要检查的天数范围
-        start_day_offset = 0  # 今天
-        if vt_task_days == 0:
-            end_day_offset = 7  # 7天后
-        else:
-            end_day_offset = vt_task_days - 1  # 计划天数内
-        
-        # 检查各天的本地工作时段（7:00-24:00）
-        for day_offset in range(start_day_offset, end_day_offset + 1):
-            local_date = today_utc_start.date() + _dt.timedelta(days=day_offset)
-            local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(7, 0)))
-            local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(0, 0))) + _dt.timedelta(days=1)
-            
-            # 转换为 UTC 时间
-            utc_start = local_start.astimezone(pytz.UTC)
-            utc_end = local_end.astimezone(pytz.UTC)
-            
-            # 转换为相对于 today_utc_start 的秒数
-            start_sec = (utc_start - today_utc_start).total_seconds()
-            end_sec = (utc_end - today_utc_start).total_seconds()
-            
-            # 只添加有效的时段
-            if start_sec < end_sec:
-                all_covered_segments.append((start_sec, end_sec))
-                country_segments[cc].append((start_sec, end_sec))
-    
-    # 合并重叠的覆盖时段
-    all_covered_segments.sort()
-    merged_covered = []
-    for s, e in all_covered_segments:
-        if merged_covered and s <= merged_covered[-1][1]:
-            merged_covered[-1] = (merged_covered[-1][0], max(merged_covered[-1][1], e))
-        else:
-            merged_covered.append((s, e))
-    
-    # 只保留从现在往后窗口内的覆盖时段
-    future_covered = []
-    for s, e in merged_covered:
-        if e <= seconds_now_utc:
-            continue
-        if s >= end_of_window:
-            continue
-        new_s = max(s, seconds_now_utc)
-        new_e = min(e, end_of_window)
-        future_covered.append((new_s, new_e))
-    
-    # 计算覆盖百分比
-    total_coverage_seconds = sum(e - s for s, e in future_covered)
-    coverage_pct = (total_coverage_seconds / (86400 * (7 if vt_task_days == 0 else vt_task_days))) * 100
-    coverage = {
-        "coverage_pct": coverage_pct,
-        "covered_segments": future_covered,
-        "uncovered_segments": [],
-        "country_segments": country_segments
-    }
-    
-    # 检查是否有启用的国家
-    if not enabled_countries:
-        return {
-            "total_tasks": 0,
-            "planned_tasks": total_planned_tasks,
-            "discarded_tasks": total_planned_tasks,
-            "discard_reasons": {},
-            "compensated_count": 0,
-            "model_used": "none",
-            "tasks": [],
-            "coverage": coverage,
-            "country_distribution": {},
-            "country_quota_target": {},
-            "warnings": ["⚠️ 没有启用任何代理"]
-        }
-    
-    # 2. 国家配额分配（平均分配）
-    base_quota = total_planned_tasks / len(enabled_countries)
-    country_quota_target = {}
-    for cc in enabled_countries:
-        quota = base_quota * random.uniform(0.8, 1.2)
-        country_quota_target[cc] = max(1, int(round(quota)))
-    
-    # 调整配额总和等于总任务数
-    total_quota = sum(country_quota_target.values())
-    if total_quota != total_planned_tasks:
-        diff = total_planned_tasks - total_quota
-        for cc in enabled_countries:
-            if diff == 0:
-                break
-            country_quota_target[cc] += 1
-            diff -= 1
-    
-    # 3. 生成全局任务时间点（根据选择的流量模型）
-    chosen_model = "simple_video"
-    raw_time_points = []
-    
-    # 获取用户选择的流量模型
-    selected_models = cfg.get("selected_models", ["normal", "gamma", "bimodal", "poisson"])
-    selected_models = [m for m in selected_models if m in MODEL_FUNCTIONS]
-    
-    if selected_models:
-        # 使用选择的流量模型随机生成任务时间点
-        chosen_model = random.choice(selected_models)
-        model_func = MODEL_FUNCTIONS[chosen_model]
-        hour_list = model_func(total_planned_tasks)
-        
-        for h in hour_list:
-            tp = seconds_now_utc + h * 3600
-            # 确保时间点在计划窗口内
-            if tp >= seconds_now_utc and tp < end_of_window:
-                raw_time_points.append(tp)
-    else:
-        # 默认使用均匀分布
-        chosen_model = "simple_video"
-        if future_covered:
-            total_available = sum(e - s for s, e in future_covered)
-            if total_available > 0 and total_planned_tasks > 0:
-                avg_interval = total_available / total_planned_tasks
-                cursor = seconds_now_utc
-                
-                # 按覆盖时段分配任务
-                for seg_start, seg_end in future_covered:
-                    current_start = max(cursor, seg_start)
-                    while current_start < seg_end and len(raw_time_points) < total_planned_tasks:
-                        raw_time_points.append(current_start)
-                        current_start += avg_interval
-    
-    raw_time_points.sort()
-    
-    # 4. 应用软边界概率筛选 + 落到覆盖时段内
-    valid_time_points = []
-    discard_reasons = {
-        "past_time": 0,
-        "out_of_window": 0,
-        "out_of_coverage": 0,
-        "soft_boundary": 0,
-    }
-    
-    for tp in raw_time_points:
-        if tp < seconds_now_utc:
-            discard_reasons["past_time"] += 1
-            continue
-        if tp >= end_of_window:
-            discard_reasons["out_of_window"] += 1
-            continue
-        in_coverage = any(s <= tp < e for s, e in future_covered)
-        if not in_coverage:
-            discard_reasons["out_of_coverage"] += 1
-            continue
-        countries_at = get_countries_at_utc_sec(tp, country_segments)
-        if not countries_at:
-            discard_reasons["out_of_coverage"] += 1
-            continue
-        max_prob = max(soft_boundary_probability(tp, cc) for cc in countries_at)
-        if random.random() <= max_prob:
-            valid_time_points.append(tp)
-        else:
-            discard_reasons["soft_boundary"] += 1
-    
-    valid_time_points.sort()
-    
-    # 5. 任务实际分配（智能代理选择 + 间隔抖动 + 顺延冲突）
-    tasks = []
-    country_quota_used = {cc: 0 for cc in enabled_countries}
-    
-    # 获取本地时区
-    local_tz = pytz.timezone('Asia/Shanghai')
-    # 计算本地时间的 00:00
-    import datetime as _dt
-    local_now = _dt.datetime.now(local_tz)
-    today_local_start = local_tz.localize(_dt.datetime(local_now.year, local_now.month, local_now.day, 0, 0, 0))
-    # 转换为 UTC 时间
-    today_local_start_utc = today_local_start.astimezone(pytz.UTC)
-    
-    # 计算相对于本地时间 00:00 的秒数
-    seconds_now_local = (local_now - today_local_start).total_seconds()
-    prev_end_time = seconds_now_local
-    is_first = True
-    
-    # 找到最接近当前时间的任务时间点作为第一条任务
-    if valid_time_points:
-        # 转换 valid_time_points 为相对于本地时间 00:00 的秒数
-        local_time_points = []
-        for tp in valid_time_points:
-            utc_datetime = today_utc_start + _dt.timedelta(seconds=tp)
-            local_datetime = utc_datetime.astimezone(local_tz)
-            local_seconds = (local_datetime - today_local_start).total_seconds()
-            local_time_points.append(local_seconds)
-        
-        # 找到最接近当前时间的任务时间点
-        closest_idx = min(range(len(local_time_points)), key=lambda i: abs(local_time_points[i] - seconds_now_local))
-        closest_time = local_time_points[closest_idx]
-        
-        # 如果最接近的时间点距离当前时间超过5分钟，尝试创建一个更接近的时间点
-        time_diff = abs(closest_time - seconds_now_local)
-        if time_diff > 300:  # 5分钟
-            # 创建一个新的时间点，尽可能接近当前时间
-            new_time = seconds_now_local
-            # 确保新时间点在覆盖时段内
-            # 首先需要将覆盖时段转换为相对于本地时间的秒数
-            local_covered_segments = []
-            for s, e in future_covered:
-                utc_s = today_utc_start + _dt.timedelta(seconds=s)
-                utc_e = today_utc_start + _dt.timedelta(seconds=e)
-                local_s = utc_s.astimezone(local_tz)
-                local_e = utc_e.astimezone(local_tz)
-                ls = (local_s - today_local_start).total_seconds()
-                le = (local_e - today_local_start).total_seconds()
-                local_covered_segments.append((ls, le))
-                
-            in_coverage = False
-            for s, e in local_covered_segments:
-                if s <= new_time < e:
-                    in_coverage = True
-                    break
-            
-            if in_coverage:
-                # 将新时间点添加到列表开头
-                valid_time_points.insert(0, (today_local_start_utc + _dt.timedelta(seconds=new_time) - today_utc_start).total_seconds())
-                local_time_points.insert(0, new_time)
-                print(f"🎯 第一条任务距离当前时间较远 ({time_diff:.0f}秒)，已创建新的任务时间点")
-            else:
-                # 如果当前时间不在覆盖时段内，使用原方法
-                valid_time_points.insert(0, valid_time_points.pop(closest_idx))
-        else:
-            # 如果距离在5分钟内，直接使用原方法
-            valid_time_points.insert(0, valid_time_points.pop(closest_idx))
-    
-    for tp in valid_time_points:
-        # 将 tp（UTC时间戳）转换为本地时区的时间
-        utc_datetime = today_utc_start + _dt.timedelta(seconds=tp)
-        local_datetime = utc_datetime.astimezone(local_tz)
-        local_tp = (local_datetime - today_local_start).total_seconds()
-        
-        # 任务间隔抖动
-        task_gap = 0 if is_first else random.uniform(global_interval_cfg["min"], global_interval_cfg["max"])
-        is_first = False
-        
-        # 顺延冲突处理：确保任务不会重叠
-        actual_start = max(local_tp, prev_end_time + task_gap, seconds_now_local)
-        
-        # 超过计划窗口作废
-        # 计算计划窗口的本地时区结束时间
-        end_of_window_local = None
-        if vt_task_days == 0:
-            end_of_window_local = seconds_now_local + 86400 * 7
-        else:
-            end_of_window_local = seconds_now_local + 86400 * vt_task_days
-        
-        if actual_start >= end_of_window_local:
-            break
-        
-        # 找到在该时间点覆盖的国家（需要使用UTC时间戳）
-        countries_at_tp = get_countries_at_utc_sec(tp, country_segments)
-        if not countries_at_tp:
-            continue
-        
-        # 从覆盖国家中，选一个剩余配额最多的
-        available_countries = []
-        for cc in countries_at_tp:
-            if country_quota_used.get(cc, 0) < country_quota_target.get(cc, 0):
-                available_countries.append(cc)
-        
-        if not available_countries:
-            # 如果覆盖国家的配额用完了，在总池中找配额没用完的
-            available_countries = []
-            for cc in enabled_countries:
-                if country_quota_used.get(cc, 0) < country_quota_target.get(cc, 0):
-                    available_countries.append(cc)
-        
-        if not available_countries:
-            continue
-        
-        selected_country = max(
-            available_countries,
-            key=lambda cc: (country_quota_target[cc] - country_quota_used[cc], random.random())
-        )
-        
-        country_quota_used[selected_country] += 1
-        
-        # 计算任务持续时间（所有视频观看时间 + 间隔时间）
-        # 使用视频观看时间配置，而不是total_stay配置
-        task_duration = 0
-        for i in range(vt_watch_count):
-            task_duration += random.randint(video_ad_cfg.get("min_watch_time", 30), video_ad_cfg.get("max_watch_time", 60))
-            if i < vt_watch_count - 1:
-                task_duration += random.randint(interval_cfg["min"], interval_cfg["max"])
-        
-        task_start = actual_start
-        task_end = task_start + task_duration
-        prev_end_time = task_end
-        
-        # 计划时间字符串（本地时区）
-        plan_time_str = local_datetime.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # 为任务随机选择一个视频URL（用于IP使用策略检查）
-        target_url = random.choice(vt_video_urls)
-        
-        tasks.append({
-            "idx": len(tasks) + 1,
-            "plan_time": plan_time_str,
-            "actual_start": int(task_start),
-            "actual_end": int(task_end),
-            "task_duration": task_duration,
-            "proxy_country": selected_country,
-            "watch_count": vt_watch_count,
-            "status": "未完成",
-            "target_url": target_url
-        })
-    
-    # 计算国家任务分布
-    country_distribution = {}
-    for task in tasks:
-        country = task['proxy_country']
-        if country in country_distribution:
-            country_distribution[country] += 1
-        else:
-            country_distribution[country] = 1
-    
-    return {
-        "total_tasks": len(tasks),
-        "planned_tasks": total_planned_tasks,
-        "discarded_tasks": total_planned_tasks - len(tasks),
-        "initial_count": total_planned_tasks,
-        "discarded_count": total_planned_tasks - len(tasks),
-        "discard_reasons": discard_reasons,
-        "compensated_count": 0,
-        "model_used": chosen_model,
-        "tasks": tasks,
-        "coverage": coverage,
-        "country_distribution": country_distribution,
-        "country_quota_target": country_quota_target,
-        "warnings": [],
-        "daily_capacity": daily_capacity,
-        "max_task_duration": max_task_duration
-    }
-
-
-def _split_mixed_list(value):
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    if not value:
-        return []
-    return [p.strip() for p in re.split(r"[\n,]+", str(value)) if p.strip()]
-
-
-def get_video_referer_list(cfg):
-    referers = _split_mixed_list(cfg.get("vt_udis_referer", ""))
-    return referers or ["https://udisxxx.com/"]
-
-
-def select_video_referer_for_task(cfg, task_idx=0):
-    referers = get_video_referer_list(cfg)
-    selected = referers[int(task_idx or 0) % len(referers)]
-    parsed = urllib.parse.urlparse(selected)
-    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else selected.rstrip("/")
-    return selected, origin
-
-
-def get_video_entry_urls(cfg):
-    urls = _split_mixed_list(cfg.get("vt_video_urls", ""))
-    if urls:
-        return urls
-    target_url = str(cfg.get("target_url", "")).strip()
-    return [target_url] if target_url else []
-
-
-def get_video_layer_values(cfg, layer_no, key):
-    video_key = f"vt_layer{layer_no}_{key}"
-    values = _split_mixed_list(cfg.get(video_key, []))
-    if values:
-        return values
-    web_layer = cfg.get("web_navigation", {}).get(f"layer_{layer_no}", {})
-    return _split_mixed_list(web_layer.get(key, []))
-
-
-def qa_profile_float(min_value, max_value, profile):
-    mn = float(min_value)
-    mx = float(max_value)
-    if mx < mn:
-        mn, mx = mx, mn
-    span = mx - mn
-    profile = profile if profile in ("light", "standard", "heavy") else "standard"
-    if profile == "light":
-        lo, hi = mn, mn + span * 0.4
-    elif profile == "heavy":
-        lo, hi = mn + span * 0.5, mx
-    else:
-        lo, hi = mn + span * 0.25, mn + span * 0.75
-    return random.uniform(lo, hi)
-
-
-def qa_profile_int(min_value, max_value, profile):
-    return max(0, int(round(qa_profile_float(min_value, max_value, profile))))
-
-
-def qa_human_profile_settings(profile):
-    profile = profile if profile in ("light", "standard", "heavy") else "standard"
-    settings = {
-        "light": {
-            "gap": (2.0, 4.0), "scroll": (60, 260), "mouse_steps": (6, 12),
-            "clicks": (0, 1), "weights": ["scroll"] * 4 + ["mouse"] * 4 + ["pause"] * 3 + ["key"] * 1 + ["safe_click"] * 1
-        },
-        "standard": {
-            "gap": (1.2, 3.0), "scroll": (80, 420), "mouse_steps": (8, 18),
-            "clicks": (1, 2), "weights": ["scroll"] * 5 + ["mouse"] * 4 + ["pause"] * 2 + ["key"] * 1 + ["safe_click"] * 2
-        },
-        "heavy": {
-            "gap": (0.8, 2.2), "scroll": (120, 620), "mouse_steps": (12, 26),
-            "clicks": (1, 3), "weights": ["scroll"] * 5 + ["mouse"] * 5 + ["pause"] * 2 + ["key"] * 1 + ["safe_click"] * 3
-        },
-    }
-    return settings[profile]
-
-
-def qa_safe_random_click(page, current_x, current_y, cfg, stats, label):
-    try:
-        viewport = page.viewport_size or {"width": 1280, "height": 720}
-        result = page.evaluate("""
-            ({width, height}) => {
-                const danger = 'a,button,input,textarea,select,video,[role="button"],.adsbygoogle,ins.adsbygoogle,iframe,[id*="ad" i],[class*="ad" i],[aria-label*="close" i],[aria-label*="skip" i],[title*="close" i],[title*="skip" i],[class*="close" i],[class*="skip" i],[id*="close" i],[id*="skip" i]';
-                for (let i = 0; i < 18; i++) {
-                    const x = Math.floor(80 + Math.random() * Math.max(120, width - 160));
-                    const y = Math.floor(80 + Math.random() * Math.max(120, height - 160));
-                    const el = document.elementFromPoint(x, y);
-                    if (!el) continue;
-                    if (el.closest(danger)) continue;
-                    const txt = ((el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '').toLowerCase();
-                    if (txt.includes('close') || txt.includes('skip') || txt.includes('关闭') || txt.includes('跳过')) continue;
-                    return {ok:true, x, y};
-                }
-                return {ok:false};
-            }
-        """, {"width": int(viewport.get("width", 1280)), "height": int(viewport.get("height", 720))})
-        if result and result.get("ok"):
-            x, y = result["x"], result["y"]
-            human_mouse_move(page, current_x, current_y, x, y, cfg)
-            page.mouse.click(x, y)
-            stats["clicks"] = stats.get("clicks", 0) + 1
-            log.debug(f"[{label}] QA安全随机点击 ({x},{y})")
-            return x, y
-    except Exception as e:
-        log.debug(f"[{label}] QA安全随机点击失败: {str(e)[:120]}")
-    return current_x, current_y
-
-
-def video_human_window(page, duration, stats, current_x, current_y, label="视频页面", cfg=None):
-    cfg = cfg or {}
-    profile = cfg.get("qa_human_profile", "standard")
-    profile_cfg = qa_human_profile_settings(profile)
-    start = time.time()
-    duration = max(0.0, float(duration or 0))
-    max_safe_clicks = qa_profile_int(profile_cfg["clicks"][0], profile_cfg["clicks"][1], profile)
-    safe_clicks_done = 0
-    log.info(f"[{label}] 🎭 QA真人行为窗口启动: {duration:.1f}s，强度={profile}，安全点击上限={max_safe_clicks}")
-    while video_task_running and time.time() - start < duration:
-        human_model_tick(label)
-        if not ensure_human_model_alive():
-            break
-        remain = duration - (time.time() - start)
-        if remain <= 0:
-            break
-        try:
-            action = random.choice(profile_cfg["weights"])
-            if action == "scroll":
-                dy = qa_profile_int(profile_cfg["scroll"][0], profile_cfg["scroll"][1], profile) * (-1 if random.random() < 0.15 else 1)
-                page.evaluate(f"window.scrollBy(0, {dy})")
-                stats["scrolls"] = stats.get("scrolls", 0) + 1
-                stats["scroll_distance"] = stats.get("scroll_distance", 0) + abs(dy)
-            elif action == "mouse":
-                viewport = page.viewport_size or {"width": 1280, "height": 720}
-                x = random.randint(80, max(120, int(viewport.get("width", 1280)) - 80))
-                y = random.randint(80, max(120, int(viewport.get("height", 720)) - 80))
-                steps = qa_profile_int(profile_cfg["mouse_steps"][0], profile_cfg["mouse_steps"][1], profile)
-                page.mouse.move(x, y, steps=max(4, steps))
-                current_x, current_y = x, y
-                stats["mouse_moves"] = stats.get("mouse_moves", 0) + 1
-            elif action == "safe_click" and safe_clicks_done < max_safe_clicks:
-                before_clicks = stats.get("clicks", 0)
-                current_x, current_y = qa_safe_random_click(page, current_x, current_y, cfg, stats, label)
-                if stats.get("clicks", 0) > before_clicks:
-                    safe_clicks_done += 1
-            elif action == "key":
-                page.keyboard.press(random.choice(["ArrowDown", "PageDown", "ArrowUp"]))
-                stats["key_presses"] = stats.get("key_presses", 0) + 1
-            else:
-                stats["waits"] = stats.get("waits", 0) + 1
-        except Exception as e:
-            log.debug(f"[{label}] 真人行为动作失败: {str(e)[:120]}")
-        sleep_time = min(qa_profile_float(profile_cfg["gap"][0], profile_cfg["gap"][1], profile), max(0.1, duration - (time.time() - start)))
-        if not video_interruptible_sleep(sleep_time):
-            break
-        stats["total_stay"] = stats.get("total_stay", 0) + sleep_time
-    log.info(
-        f"[{label}] 🎭 QA真人行为窗口结束: 鼠标{stats.get('mouse_moves', 0)}次，"
-        f"滚动{stats.get('scrolls', 0)}次({stats.get('scroll_distance', 0)}px)，"
-        f"安全点击{stats.get('clicks', 0)}次，键盘{stats.get('key_presses', 0)}次，等待{stats.get('waits', 0)}次"
-    )
-    return current_x, current_y
-
-
-def click_video_link_by_keywords_or_fallback(page, keywords, fallback_urls, current_x, current_y, cfg, label, watched_video_urls=None):
-    watched_video_urls = watched_video_urls if watched_video_urls is not None else set()
-    keywords = _split_mixed_list(keywords)
-    fallback_urls = _split_mixed_list(fallback_urls)
-    base_url = page_url_safe(page, "")
-    random.shuffle(keywords)
-    for keyword in keywords:
-        kw = keyword.lower()
-        candidates = []
-        for link in page.query_selector_all("a[href]"):
-            try:
-                text = (link.text_content() or "").strip()
-                href = (link.get_attribute("href") or "").strip()
-                title = (link.get_attribute("title") or "").strip()
-                haystack = f"{text} {href} {title}".lower()
-                target_url = normalize_video_url(urljoin(base_url, href))
-                if target_url in watched_video_urls:
-                    continue
-                if kw and kw in haystack:
-                    candidates.append(link)
-            except Exception:
-                continue
-        if candidates:
-            target = random.choice(candidates)
-            try:
-                target.scroll_into_view_if_needed()
-                video_human_window(page, random.uniform(1.0, 2.5), {}, current_x, current_y, label, cfg)
-                bbox = target.bounding_box()
-                if bbox:
-                    click_x = bbox["x"] + bbox["width"] / 2
-                    click_y = bbox["y"] + bbox["height"] / 2
-                    human_mouse_move(page, current_x, current_y, click_x, click_y, cfg)
-                    current_x, current_y = click_x, click_y
-                target.click()
-                page.wait_for_load_state("domcontentloaded", timeout=60000)
-                final_url = page_url_safe(page, '')
-                watched_video_urls.add(normalize_video_url(final_url))
-                log.info(f"[{label}] ✅ 关键词点击成功: {keyword} → {final_url}")
-                return True, current_x, current_y
-            except Exception as e:
-                log.warning(f"[{label}] 关键词点击失败: {keyword}, {str(e)[:160]}")
-    available_fallbacks = [urljoin(base_url, u) for u in fallback_urls if normalize_video_url(urljoin(base_url, u)) not in watched_video_urls]
-    if available_fallbacks:
-        fallback = random.choice(available_fallbacks)
-        watched_video_urls.add(normalize_video_url(fallback))
-        log.info(f"[{label}] 使用兜底链接: {fallback}")
-        page.goto(fallback, timeout=30000, wait_until="domcontentloaded")
-        return True, current_x, current_y
-    log.warning(f"[{label}] 未匹配关键词且无兜底链接")
-    return False, current_x, current_y
-
-
-def is_embedded_video_src(src):
-    if not src:
-        return False
-    src_l = str(src).lower()
-    return bool(
-        is_video_direct_entry(src_l) or
-        "embed" in src_l or
-        "/e/" in src_l or
-        src_l.endswith((".mp4", ".m3u8", ".webm", ".mov", ".flv"))
-    )
-
-
-def collect_embedded_video_targets(page, watched_video_urls):
-    targets = []
-    try:
-        raw = page.evaluate("""
-            () => {
-                const items = [];
-                document.querySelectorAll('iframe[src]').forEach((el, index) => {
-                    const rect = el.getBoundingClientRect();
-                    items.push({kind:'iframe', index, src: el.src || el.getAttribute('src') || '', width: rect.width, height: rect.height});
-                });
-                document.querySelectorAll('video').forEach((el, index) => {
-                    const rect = el.getBoundingClientRect();
-                    const src = el.currentSrc || el.src || (el.querySelector('source[src]') && el.querySelector('source[src]').src) || '';
-                    items.push({kind:'video', index, src, width: rect.width, height: rect.height});
-                });
-                return items;
-            }
-        """)
-        for item in raw or []:
-            src = item.get("src") or f"inline-video-{item.get('index')}"
-            key = normalize_video_url(src)
-            if key in watched_video_urls:
-                continue
-            if item.get("kind") == "video" or is_embedded_video_src(src):
-                if float(item.get("width") or 0) >= 80 and float(item.get("height") or 0) >= 60:
-                    targets.append({**item, "key": key})
-    except Exception as e:
-        log.debug(f"[Layer2嵌入视频] 扫描失败: {str(e)[:120]}")
-    return targets
-
-
-def play_embedded_video_target(page, target):
-    try:
-        if target.get("kind") == "video":
-            videos = page.query_selector_all("video")
-            idx = int(target.get("index") or 0)
-            if idx < len(videos):
-                videos[idx].scroll_into_view_if_needed()
-                videos[idx].evaluate("""el => {
-                    el.muted = false;
-                    el.volume = Math.max(0.2, Math.min(0.8, Math.random()));
-                    return el.play && el.play().catch(() => null);
-                }""")
-                return True
-        if target.get("kind") == "iframe":
-            iframes = page.query_selector_all("iframe[src]")
-            idx = int(target.get("index") or 0)
-            src = target.get("src") or ""
-            if idx < len(iframes):
-                iframes[idx].scroll_into_view_if_needed()
-            for frame in page.frames:
-                if src and (src in frame.url or normalize_video_url(src) in normalize_video_url(frame.url)):
-                    frame.evaluate("""() => {
-                        document.querySelectorAll('video').forEach(v => {
-                            v.muted = false;
-                            v.volume = Math.max(0.2, Math.min(0.8, Math.random()));
-                            if (v.play) v.play().catch(() => null);
-                        });
-                    }""")
-                    return True
-    except Exception as e:
-        log.debug(f"[Layer2嵌入视频] 尝试播放失败: {str(e)[:120]}")
-    return False
-
-
-def watch_layer2_embedded_videos(page, cfg, current_x, current_y, total_stats, watched_video_urls, watch_count):
-    targets = collect_embedded_video_targets(page, watched_video_urls)
-    if len(targets) < watch_count:
-        raise RuntimeError(f"[Layer2嵌入视频] 可用嵌入视频数量不足：需要{watch_count}个，实际{len(targets)}个，终止本任务")
-    random.shuffle(targets)
-    selected = targets[:watch_count]
-    for idx, target in enumerate(selected):
-        if not video_task_running:
-            break
-        if idx > 0:
-            interval_min = float(cfg.get("vt_interval_min", 5) or 5)
-            interval_max = float(cfg.get("vt_interval_max", 15) or 15)
-            if interval_max < interval_min:
-                interval_min, interval_max = interval_max, interval_min
-            wait_time = random.uniform(interval_min, interval_max)
-            log.info(f"[Layer2嵌入视频] 视频间隔等待 {wait_time:.1f}s")
-            current_x, current_y = video_human_window(page, wait_time, total_stats, current_x, current_y, "iframe视频间隔", cfg)
-        watched_video_urls.add(target["key"])
-        log.info(f"[Layer2嵌入视频] 当前页观看 {idx + 1}/{watch_count}: kind={target.get('kind')} src={target.get('src', '')[:160]}")
-        played = play_embedded_video_target(page, target)
-        log.info(f"[Layer2嵌入视频] 播放尝试结果: {'成功或已触发' if played else '不可直接控制，按父页面停留观看'}")
-        duration_min = float(cfg.get("vt_duration_min", 30) or 30)
-        duration_max = float(cfg.get("vt_duration_max", 120) or 120)
-        if duration_max < duration_min:
-            duration_min, duration_max = duration_max, duration_min
-        watch_time = random.uniform(duration_min, duration_max)
-        current_x, current_y = video_human_window(page, watch_time, total_stats, current_x, current_y, "Layer2嵌入视频观看", cfg)
-        total_stats["total_stay"] = total_stats.get("total_stay", 0) + watch_time
-    return total_stats, current_x, current_y
-
-
-def count_available_video_targets(page, keywords, fallback_urls, watched_video_urls):
-    base_url = page_url_safe(page, "")
-    keywords = [k.lower() for k in _split_mixed_list(keywords) if k]
-    candidates = set()
-    try:
-        for link in page.query_selector_all("a[href]"):
-            text = (link.text_content() or "").strip()
-            href = (link.get_attribute("href") or "").strip()
-            title = (link.get_attribute("title") or "").strip()
-            haystack = f"{text} {href} {title}".lower()
-            if keywords and not any(kw in haystack for kw in keywords):
-                continue
-            target_url = normalize_video_url(urljoin(base_url, href))
-            if target_url and target_url not in watched_video_urls:
-                candidates.add(target_url)
-    except Exception as e:
-        log.debug(f"[视频流程] 统计Layer视频候选失败: {str(e)[:120]}")
-    for fallback in _split_mixed_list(fallback_urls):
-        target_url = normalize_video_url(urljoin(base_url, fallback))
-        if target_url and target_url not in watched_video_urls:
-            candidates.add(target_url)
-    return len(candidates)
-
-
-def watch_current_video_page(page, cfg, current_x, current_y):
-    stats = {
-        "mouse_moves": 0, "scrolls": 0, "scroll_distance": 0,
-        "clicks": 0, "key_presses": 0, "focus_switches": 0,
-        "refreshes": 0, "total_stay": 0, "waits": 0
-    }
-    duration_min = float(cfg.get("vt_duration_min", 30) or 30)
-    duration_max = float(cfg.get("vt_duration_max", 120) or 120)
-    if duration_max < duration_min:
-        duration_min, duration_max = duration_max, duration_min
-    watch_time = random.uniform(duration_min, duration_max)
-    speed_min = float(cfg.get("vt_speed_min", 1) or 1)
-    speed_max = float(cfg.get("vt_speed_max", 1) or 1)
-    if speed_max < speed_min:
-        speed_min, speed_max = speed_max, speed_min
-    playback_rate = random.uniform(speed_min, speed_max)
-    try:
-        result = page.evaluate("""
-            (rate) => {
-                const video = document.querySelector('video');
-                if (!video) return {hasVideo:false};
-                video.muted = true;
-                video.playsInline = true;
-                video.playbackRate = rate;
-                const p = video.play();
-                return {hasVideo:true, paused: video.paused, currentTime: video.currentTime, playbackRate: video.playbackRate};
-            }
-        """, playback_rate)
-        log.info(f"[视频观看] video元素状态: {result}, 倍速={playback_rate:.2f}")
-    except Exception as e:
-        log.warning(f"[视频观看] 设置播放/倍速失败，继续停留: {str(e)[:160]}")
-    current_x, current_y = video_human_window(page, watch_time, stats, current_x, current_y, "视频观看", cfg)
-    return watch_time, current_x, current_y, stats
-
-
-def is_video_direct_entry(url):
-    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
-    path = urllib.parse.urlparse(url or "").path.lower()
-    return bool(
-        ("vids.st" in host and path.startswith("/v/")) or
-        is_udis_video_url(url) or
-        path.endswith((".mp4", ".m3u8", ".webm", ".mov", ".flv"))
-    )
-
-
-def normalize_video_url(url):
-    parsed = urllib.parse.urlparse(url or "")
-    if not parsed.scheme or not parsed.netloc:
-        return (url or "").strip().rstrip("/")
-    return urllib.parse.urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", parsed.query, ""))
-
-
-def unique_preserve_order(urls):
-    seen = set()
-    result = []
-    for url in urls:
-        key = normalize_video_url(url)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(url)
-    return result
-
-
-def random_task_watch_count(cfg):
-    max_count = max(1, int(cfg.get("vt_watch_count", 1) or 1))
-    return random.randint(1, max_count)
-
-
-def run_video_navigation_flow(page, cfg, current_x, current_y):
-    entry_urls = get_video_entry_urls(cfg)
-    if not entry_urls:
-        raise RuntimeError("视频入口URL池为空，且网站流量目标URL也为空")
-    total_stats = {
-        "mouse_moves": 0, "scrolls": 0, "scroll_distance": 0,
-        "clicks": 0, "key_presses": 0, "focus_switches": 0,
-        "refreshes": 0, "total_stay": 0, "waits": 0
-    }
-    entry_mode = str(cfg.get("vt_entry_mode", "auto") or "auto").lower()
-    if entry_mode not in ("auto", "direct", "layer"):
-        entry_mode = "auto"
-    direct_entries = unique_preserve_order([u for u in entry_urls if is_video_direct_entry(u)])
-    watched_video_urls = set()
-    log.info(f"[视频流程] 入口模式={entry_mode}，入口URL数量={len(entry_urls)}，识别直链数量={len(direct_entries)}")
-    if entry_mode == "direct" and not direct_entries:
-        raise RuntimeError("[视频流程] 当前为视频直链模式，但入口URL池未识别到视频直链")
-    if entry_mode == "direct" or (entry_mode == "auto" and direct_entries):
-        watch_count = random_task_watch_count(cfg)
-        if len(direct_entries) < watch_count:
-            raise RuntimeError(f"[视频流程] 可用直链视频数量不足：需要{watch_count}个，实际{len(direct_entries)}个，终止本任务")
-        log.info(f"[视频流程] 检测到视频直链模式，跳过Layer1/Layer2导航，直链数量={len(direct_entries)}，本任务随机观看={watch_count}")
-        selected_urls = direct_entries[:]
-        random.shuffle(selected_urls)
-        success_count = 0
-        failed_urls = []
-        for video_url in selected_urls:
-            if not video_task_running or success_count >= watch_count:
-                break
-            if success_count > 0:
-                interval_min = float(cfg.get("vt_interval_min", 5) or 5)
-                interval_max = float(cfg.get("vt_interval_max", 15) or 15)
-                if interval_max < interval_min:
-                    interval_min, interval_max = interval_max, interval_min
-                wait_time = random.uniform(interval_min, interval_max)
-                log.info(f"[视频流程] 直链视频间隔等待 {wait_time:.1f}s")
-                current_x, current_y = video_human_window(page, wait_time, total_stats, current_x, current_y, "视频间隔", cfg)
-            log.info(f"[视频流程] 打开视频直链 {success_count + 1}/{watch_count}: {video_url}")
-            try:
-                page.goto(video_url, timeout=30000, wait_until="domcontentloaded")
-            except Exception as e:
-                failed_urls.append(video_url)
-                log.warning(f"[视频流程] 直链打开失败，跳过当前视频并尝试下一个: {video_url}，原因={type(e).__name__}: {str(e)[:180]}")
-                continue
-            watched_video_urls.add(normalize_video_url(video_url))
-            current_x, current_y = video_human_window(page, random.uniform(1, 3), total_stats, current_x, current_y, "视频直链页", cfg)
-            watch_time, current_x, current_y, one_stats = watch_current_video_page(page, cfg, current_x, current_y)
-            for key, value in one_stats.items():
-                total_stats[key] = total_stats.get(key, 0) + value
-            total_stats["total_stay"] += watch_time
-            success_count += 1
-        if success_count < watch_count:
-            raise RuntimeError(f"[视频流程] 可成功打开的视频直链数量不足：需要{watch_count}个，成功{success_count}个，失败{len(failed_urls)}个，终止本任务")
-        return total_stats, current_x, current_y
-
-    layer_entry_urls = [u for u in entry_urls if not is_video_direct_entry(u)] if entry_mode == "layer" else entry_urls
-    if entry_mode == "layer" and not layer_entry_urls:
-        raise RuntimeError("[视频流程] 当前为Layer导航模式，但入口URL池没有可用入口页")
-    entry_url = random.choice(layer_entry_urls)
-    log.info(f"[视频流程] 进入Layer1入口: {entry_url}")
-    page.goto(entry_url, timeout=30000, wait_until="domcontentloaded")
-    current_x, current_y = video_human_window(page, random.uniform(2, 5), total_stats, current_x, current_y, "Layer1入口", cfg)
-    ok, current_x, current_y = click_video_link_by_keywords_or_fallback(
-        page,
-        get_video_layer_values(cfg, 1, "keywords"),
-        get_video_layer_values(cfg, 1, "fallback_urls"),
-        current_x,
-        current_y,
-        cfg,
-        "Layer1→Layer2",
-    )
-    if not ok:
-        raise RuntimeError("Layer1 跳转 Layer2 失败")
-    layer2_url = page_url_safe(page, "")
-    current_x, current_y = video_human_window(page, random.uniform(2, 5), total_stats, current_x, current_y, "Layer2页面", cfg)
-    watch_count = random_task_watch_count(cfg)
-    layer2_video_mode = str(cfg.get("vt_layer2_video_mode", "auto") or "auto").lower()
-    if layer2_video_mode not in ("auto", "link", "iframe"):
-        layer2_video_mode = "auto"
-    embedded_count = len(collect_embedded_video_targets(page, watched_video_urls))
-    log.info(f"[视频流程] Layer2视频模式={layer2_video_mode}，本任务随机观看数={watch_count}，当前页嵌入视频数={embedded_count}")
-    if layer2_video_mode == "iframe":
-        return watch_layer2_embedded_videos(page, cfg, current_x, current_y, total_stats, watched_video_urls, watch_count)
-    if layer2_video_mode == "auto" and embedded_count >= watch_count:
-        log.info("[视频流程] 自动识别选择 iframe嵌入模式")
-        return watch_layer2_embedded_videos(page, cfg, current_x, current_y, total_stats, watched_video_urls, watch_count)
-    if layer2_video_mode == "auto" and embedded_count > 0:
-        log.info("[视频流程] 嵌入视频数量不足本任务观看数，自动切换为链接跳转模式")
-    layer2_keywords = get_video_layer_values(cfg, 2, "keywords")
-    layer2_fallbacks = get_video_layer_values(cfg, 2, "fallback_urls")
-    available_count = count_available_video_targets(page, layer2_keywords, layer2_fallbacks, watched_video_urls)
-    if available_count < watch_count:
-        raise RuntimeError(f"[视频流程] Layer2可用未观看视频数量不足：需要{watch_count}个，实际{available_count}个，终止本任务")
-    log.info(f"[视频流程] 链接跳转模式：Layer2可用未观看视频数={available_count}")
-    for idx in range(watch_count):
-        if not video_task_running:
-            break
-        if idx > 0:
-            interval_min = float(cfg.get("vt_interval_min", 5) or 5)
-            interval_max = float(cfg.get("vt_interval_max", 15) or 15)
-            if interval_max < interval_min:
-                interval_min, interval_max = interval_max, interval_min
-            wait_time = random.uniform(interval_min, interval_max)
-            log.info(f"[视频流程] 视频间隔等待 {wait_time:.1f}s，随后返回Layer2")
-            current_x, current_y = video_human_window(page, wait_time, total_stats, current_x, current_y, "视频间隔", cfg)
-            page.goto(layer2_url, timeout=30000, wait_until="domcontentloaded")
-            current_x, current_y = video_human_window(page, random.uniform(1, 3), total_stats, current_x, current_y, "返回Layer2", cfg)
-        ok, current_x, current_y = click_video_link_by_keywords_or_fallback(
-            page,
-            layer2_keywords,
-            layer2_fallbacks,
-            current_x,
-            current_y,
-            cfg,
-            f"Layer2→视频页 {idx + 1}/{watch_count}",
-            watched_video_urls,
-        )
-        if not ok:
-            raise RuntimeError(f"Layer2 跳转视频页失败: {idx + 1}/{watch_count}")
-        current_x, current_y = video_human_window(page, random.uniform(1, 3), total_stats, current_x, current_y, "最终视频页", cfg)
-        watch_time, current_x, current_y, one_stats = watch_current_video_page(page, cfg, current_x, current_y)
-        for key, value in one_stats.items():
-            total_stats[key] = total_stats.get(key, 0) + value
-        total_stats["total_stay"] += watch_time
-    return total_stats, current_x, current_y
-
-
-def generate_video_daily_tasks(cfg):
-    """生成视频任务计划：本机时间分布，不考虑代理国家。"""
-    import datetime as _dt
-    vt_watch_count = max(1, int(cfg.get('vt_watch_count', 3) or 3))
-    vt_task_days = int(cfg.get('vt_task_days', 1) or 1)
-    plan_days = 7 if vt_task_days == 0 else max(1, vt_task_days)
-    duration_min = float(cfg.get('vt_duration_min', 30) or 30)
-    duration_max = float(cfg.get('vt_duration_max', 120) or 120)
-    if duration_max < duration_min:
-        duration_min, duration_max = duration_max, duration_min
-    interval_min = float(cfg.get('vt_interval_min', 5) or 5)
-    interval_max = float(cfg.get('vt_interval_max', 15) or 15)
-    if interval_max < interval_min:
-        interval_min, interval_max = interval_max, interval_min
-    global_interval_cfg = cfg.get("vt_global_interval", {"min": 10, "max": 30})
-    global_min = float(global_interval_cfg.get("min", 10) or 10)
-    global_max = float(global_interval_cfg.get("max", 30) or 30)
-    if global_max < global_min:
-        global_min, global_max = global_max, global_min
-    max_task_duration = int(vt_watch_count * duration_max + max(0, vt_watch_count - 1) * interval_max)
-    avg_global_interval = (global_min + global_max) / 2
-    daily_capacity = max(1, int(86400 / max(1, max_task_duration + avg_global_interval)))
-    total_planned_tasks = daily_capacity * plan_days
-    now = _dt.datetime.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    seconds_now = (now - today_start).total_seconds()
-    window_end = seconds_now + 86400 * plan_days
-    selected_models = [m for m in cfg.get("selected_models", ["normal", "gamma", "bimodal", "poisson"]) if m in MODEL_FUNCTIONS]
-    chosen_model = random.choice(selected_models) if selected_models else "simple_video_local"
-    raw_points = []
-    if selected_models:
-        for h in MODEL_FUNCTIONS[chosen_model](total_planned_tasks):
-            tp = seconds_now + h * 3600
-            if seconds_now <= tp < window_end:
-                raw_points.append(tp)
-    if not raw_points:
-        avg_interval = (window_end - seconds_now) / max(1, total_planned_tasks)
-        raw_points = [seconds_now + i * avg_interval for i in range(total_planned_tasks)]
-    raw_points.sort()
-    tasks = []
-    prev_end = seconds_now
-    for tp in raw_points:
-        task_gap = 0 if not tasks else random.uniform(global_min, global_max)
-        actual_start = max(tp, prev_end + task_gap, seconds_now)
-        if actual_start >= window_end:
-            break
-        task_duration = 0
-        for i in range(vt_watch_count):
-            task_duration += random.uniform(duration_min, duration_max)
-            if i < vt_watch_count - 1:
-                task_duration += random.uniform(interval_min, interval_max)
-        actual_end = actual_start + task_duration
-        if actual_end >= window_end:
-            break
-        prev_end = actual_end
-        plan_dt = today_start + _dt.timedelta(seconds=actual_start)
-        tasks.append({
-            "idx": len(tasks) + 1,
-            "plan_time": plan_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            "actual_start": int(actual_start),
-            "actual_end": int(actual_end),
-            "task_duration": int(task_duration),
-            "proxy_country": "ADSL",
-            "ip_mode": "adsl",
-            "watch_count": vt_watch_count,
-            "status": "未完成",
-            "target_url": random.choice(get_video_entry_urls(cfg)) if get_video_entry_urls(cfg) else str(cfg.get("target_url", ""))
-        })
-    return {
-        "total_tasks": len(tasks),
-        "planned_tasks": total_planned_tasks,
-        "discarded_tasks": max(0, total_planned_tasks - len(tasks)),
-        "initial_count": total_planned_tasks,
-        "discarded_count": max(0, total_planned_tasks - len(tasks)),
-        "discard_reasons": {},
-        "compensated_count": 0,
-        "model_used": chosen_model,
-        "tasks": tasks,
-        "coverage": {"coverage_pct": 100, "covered_segments": [(seconds_now, window_end)], "uncovered_segments": [], "country_segments": {"ADSL": [(seconds_now, window_end)]}},
-        "country_distribution": {"ADSL": len(tasks)},
-        "country_quota_target": {"ADSL": len(tasks)},
-        "warnings": ["视频流量只允许拨号VPS/ADSL，计划已固定为ADSL模式"],
-        "daily_capacity": daily_capacity,
-        "max_task_duration": max_task_duration
-    }
-
-
-def create_unified_qa_plan(cfg, count=1, adsl=False):
-    """创建综合QA任务计划：网站浏览QA + 广告曝光检测 + 视频检测。"""
-    adsl = True
-    import datetime as _dt
-    now_local = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    count = max(1, min(999, int(count or 1)))
-    tasks = []
-    for idx in range(1, count + 1):
-        tasks.append({
-            "idx": idx,
-            "plan_time": now_local,
-            "actual_start": 0,
-            "actual_end": 0,
-            "task_duration": 0,
-            "target_url": cfg.get('target_url', ''),
-            "proxy_country": "ADSL" if adsl else "DIRECT",
-            "ip_mode": "adsl" if adsl else "direct",
-            "task_type": "unified_qa",
-            "status": "未完成"
-        })
-    return {
-        "total_tasks": count,
-        "planned_tasks": count,
-        "model_used": "unified_adsl_qa" if adsl else "unified_qa",
-        "tasks": tasks,
-        "country_distribution": {"ADSL" if adsl else "DIRECT": count},
-        "warnings": []
-    }
-
-
-def create_video_adsl_plan(cfg, adsl_count):
-    """创建视频 ADSL 任务计划：只控制次数，后续视频流程复用原视频任务。"""
-    import datetime as _dt
-    now_local = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    watch_count = int(cfg.get('vt_watch_count', 3) or 3)
-    duration_min = float(cfg.get('vt_duration_min', 30) or 30)
-    duration_max = float(cfg.get('vt_duration_max', 120) or 120)
-    interval_max = float(cfg.get('vt_interval_max', 15) or 15)
-    if duration_max < duration_min:
-        duration_min, duration_max = duration_max, duration_min
-    tasks = []
-    for idx in range(1, adsl_count + 1):
-        task_duration = watch_count * random.uniform(duration_min, duration_max) + max(0, watch_count - 1) * interval_max
-        tasks.append({
-            "idx": idx,
-            "plan_time": now_local,
-            "actual_start": 0,
-            "actual_end": int(task_duration),
-            "task_duration": int(task_duration),
-            "target_url": cfg.get('vt_video_urls', '').split(',')[0].strip() if cfg.get('vt_video_urls') else '',
-            "proxy_country": "ADSL",
-            "ip_mode": "adsl",
-            "status": "未完成"
-        })
-    return {
-        "total_tasks": adsl_count,
-        "planned_tasks": adsl_count,
-        "model_used": "video_adsl_task",
-        "tasks": tasks,
-        "country_distribution": {"ADSL": adsl_count},
-        "warnings": []
-    }
-
-
-def run_website_qa_segment(page, cfg, current_x, current_y, selected_engine_id=None, selected_keyword=None):
-    """综合QA中的网站浏览与广告曝光检测段：支持真搜索跳转。"""
-    stats_local = {
-        "mouse_moves": 0, "scrolls": 0, "scroll_distance": 0,
-        "clicks": 0, "key_presses": 0, "focus_switches": 0,
-        "refreshes": 0, "total_stay": 0, "waits": 0
-    }
-    target_url = str(cfg.get("target_url", "")).strip()
-    if not target_url:
-        log.warning("[综合QA-网站] target_url为空，跳过网站浏览QA")
-        return stats_local, current_x, current_y
-    log.info(f"[综合QA-网站] 准备访问目标页: {target_url}")
-    
-    # ========== 真搜索跳转（新增） ==========
-    already_on_target = False
-    search_mode = cfg.get("seo", {}).get("search_mode", "direct_referer")
-    if search_mode == "real_search" and selected_engine_id and selected_engine_id in ["google", "bing"] and selected_keyword:
-        log.info("[综合QA-网站] 执行真搜索跳转流程")
-        search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats_local, current_x, current_y, cfg)
-        if search_success:
-            already_on_target = True
-            log.info(f"[综合QA-网站] 真搜索跳转成功，已在目标页")
-    # =========================================
-    
-    if not already_on_target:
-        log.info(f"[综合QA-网站] 直接导航至目标页: {target_url}")
-        page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
-    ad_monitor = create_ad_monitor()
-    ad_monitor = scan_ads_during_task(page, ad_monitor, "综合QA-首页加载后")
-    stay_cfg = cfg.get("total_stay", {"min": 120, "max": 300})
-    stay_min = float(stay_cfg.get("min", 120) or 120)
-    stay_max = float(stay_cfg.get("max", 300) or 300)
-    if stay_max < stay_min:
-        stay_min, stay_max = stay_max, stay_min
-    stay_time = random.uniform(stay_min, stay_max)
-    # simulate_human_in_window 使用 task_running；综合QA复用视频停止信号，因此这里用 video_human_window 保持可中断。
-    current_x, current_y = video_human_window(page, stay_time, stats_local, current_x, current_y, "综合QA网站浏览", cfg)
-    ad_monitor = scan_ads_during_task(page, ad_monitor, "综合QA-首页停留后")
-
-    # ========== 层级浏览（首页→layer_2→...→layer_6→返回首页），逻辑与网站流量主任务一致（轻量版） ==========
-    web_config = cfg.get("web_navigation", {}) or {}
-    loop_cfg = web_config.get("loop_count", {"min": 1, "max": 3})
-    interval_cfg = web_config.get("loop_interval", {"min": 1, "max": 5})
-    back_links = web_config.get("back_links", []) or []
-    back_home_links = web_config.get("back_home_links", []) or []
-    # 随机循环次数（与主任务相同逻辑）
-    chapter_loop_count = max(1, random.randint(int(loop_cfg.get("min", 1)), int(loop_cfg.get("max", 1))))
-    loop_interval = max(0.0, random.uniform(float(interval_cfg.get("min", 1)), float(interval_cfg.get("max", 1))))
-    if chapter_loop_count <= 1:
-        loop_interval = 0.0
-    # 读取 6 层关键词/兜底配置
-    layers = []
-    for li in range(1, 7):
-        lc = web_config.get(f"layer_{li}", {}) or {}
-        layers.append({"idx": li, "keywords": lc.get("keywords", []) or [], "fallback_urls": lc.get("fallback_urls", []) or []})
-
-    # 每层停留时间（沿用首页停留区间，轻量）
-    def _qa_layer_stay():
-        return random.uniform(max(3.0, stay_min * 0.4), max(6.0, stay_max * 0.5))
-
-    # 第一跳：首页 → layer_2（列表页）
-    layer1 = layers[0]
-    success_list, current_x, current_y = click_link_with_fallback(
-        page, layer1["keywords"], layer1["fallback_urls"], current_x, current_y, cfg
-    )
-    if success_list:
-        stats_local["clicks"] += 1
-        stats_local["mouse_moves"] += 1
-        ls = _qa_layer_stay()
-        log.info(f"[综合QA-层级] 列表页(layer_2)停留 {ls:.1f}秒")
-        current_x, current_y = video_human_window(page, ls, stats_local, current_x or 300, current_y or 300, "综合QA-layer_2", cfg)
-        ad_monitor = scan_ads_during_task(page, ad_monitor, "综合QA-layer_2停留后")
-
-        # 循环深入 layer_3..layer_6 并返回首页（与主任务一致）
-        for loop_idx in range(chapter_loop_count):
-            if not video_task_running:
-                break
-            log.info(f"[综合QA-层级] 浏览循环 第 {loop_idx+1}/{chapter_loop_count} 次")
-            for level_idx in range(2, 6):
-                if not video_task_running:
-                    break
-                tl = layers[level_idx]
-                if not (tl["keywords"] or tl["fallback_urls"]):
-                    log.info(f"[综合QA-层级] layer_{level_idx+1} 未配置关键字/兜底URL，停止深入")
-                    break
-                log.info(f"[综合QA-层级] → 进入 layer_{level_idx+1}")
-                ok, current_x, current_y = click_link_with_fallback(
-                    page, tl["keywords"], tl["fallback_urls"], current_x, current_y, cfg
-                )
-                if not ok:
-                    log.warning(f"[综合QA-层级] 进入 layer_{level_idx+1} 失败，停止深入")
-                    break
-                stats_local["clicks"] += 1
-                stats_local["mouse_moves"] += 1
-                ls = _qa_layer_stay()
-                log.info(f"[综合QA-层级] layer_{level_idx+1} 停留 {ls:.1f}秒")
-                current_x, current_y = video_human_window(page, ls, stats_local, current_x or 300, current_y or 300, f"综合QA-layer_{level_idx+1}", cfg)
-                ad_monitor = scan_ads_during_task(page, ad_monitor, f"综合QA-layer_{level_idx+1}停留后")
-            # 返回首页
-            if not video_task_running:
-                break
-            log.info("[综合QA-层级] → 返回首页")
-            ok_back, current_x, current_y = click_link_with_fallback(
-                page, list(back_links) + list(back_home_links), [], current_x, current_y, cfg, final_fallback_url=target_url
-            )
-            if ok_back:
-                stats_local["clicks"] += 1
-                stats_local["mouse_moves"] += 1
-            ad_monitor = scan_ads_during_task(page, ad_monitor, f"综合QA-第{loop_idx+1}轮返回首页后")
-            if loop_idx < chapter_loop_count - 1 and loop_interval > 0:
-                log.info(f"[综合QA-层级] ⏸ 每轮间隔 {loop_interval:.1f}秒")
-                time.sleep(loop_interval)
-    else:
-        log.warning("[综合QA-层级] 进入列表页失败，跳过层级浏览")
-
-    ad_monitor = scan_ads_during_task(page, ad_monitor, "综合QA-网站停留后")
-    log.info(
-        f"[综合QA-广告] 容器={len(ad_monitor.get('containers', set()))}，"
-        f"可见={len(ad_monitor.get('visible', set()))}，曝光={len(ad_monitor.get('exposed', set()))}，"
-        f"扫描={ad_monitor.get('scan_count', 0)}次"
-    )
-    return stats_local, current_x, current_y
-
-
-def run_video_tasks(adsl_ip_task=False, unified_qa=False):
-    """视频/综合QA任务执行函数 - 完整流程版"""
-    global video_task_running, video_worker_active, current_video_task_idx, config, video_adsl_status
-    # 初始化 SEO 查询实例
-    import sys, os
-    print("Current directory:", os.getcwd())
-    print("sys.path:", sys.path)
-    from seo_query_module import get_seo_query
-    seo_query = get_seo_query()
-    # === 任务标签：QA任务 / 视频任务 动态切换 ===
-    _task_label = "QA任务" if unified_qa else "视频任务"
-    _browser_label = "QA浏览器" if unified_qa else "视频浏览器"
-    _task_icon = "🧪" if unified_qa else "🎬"
-    video_task_running = True
-    video_worker_active = True
-    current_video_task_idx = -1  # 重置当前任务索引
-    if adsl_ip_task:
-        video_adsl_status.update({
-            "running": True,
-            "status": "准备中",
-            "total": max(1, min(999, int(config.get("vt_adsl_task_count", 1) or 1))),
-            "completed": 0,
-            "current": 0,
-            "current_ip": "",
-            "country": "",
-            "last_error": ""
-        })
-    
-    try:
-        if not adsl_ip_task:
-            log.warning("[视频/QA] 非ADSL入口已废除，强制切换为 ADSL 拨号VPS模式")
-            adsl_ip_task = True
-        start_human_model("unified_qa_adsl" if unified_qa else "video_adsl")
-        log.info(f"{_task_icon} {_task_label}已启动（仅ADSL拨号VPS模式）")
-        
-        # ========== Step A: 重新加载配置文件（确保使用最新配置，包括headless模式）
-        try:
-            import json
-            with open('config.json', 'r') as f:
-                loaded_config = json.load(f)
-                config.update(loaded_config)
-                log.info("✅ 配置文件已重新加载")
-                log.info(f"📋 当前headless模式: {config.get('headless', True)}")
-        except Exception as e:
-            log.warning(f"⚠️ 重新加载配置文件失败，使用当前内存配置: {str(e)}")
-        
-        # ========== Step B: 获取任务计划
-        global video_plan
-        if unified_qa:
-            qa_count = max(1, min(999, int(config.get("vt_adsl_task_count", 1) or 1)))
-            video_plan = create_unified_qa_plan(config, qa_count, adsl=True)
-            log.info(f"[综合QA] 已创建ADSL综合QA任务计划: {qa_count} 次")
-        elif adsl_ip_task:
-            adsl_count = max(1, min(999, int(config.get("vt_adsl_task_count", 1) or 1)))
-            video_plan = create_video_adsl_plan(config, adsl_count)
-            log.info(f"[视频ADSL] 已创建 ADSL 视频任务计划: {adsl_count} 次")
-        elif video_plan:
-            log.info(f"📋 使用已生成的任务计划，包含 {video_plan['total_tasks']} 个任务")
-        else:
-            log.info("📋 没有找到已生成的任务计划，正在生成新的任务计划")
-            video_plan = generate_video_daily_tasks(config)
-        
-        total_tasks = video_plan["total_tasks"]
-        tasks_list = video_plan["tasks"]
-        
-        log.info(f"📊 任务清单加载完成，共 {len(tasks_list)} 个任务")
-        
-        if not tasks_list:
-            log.warning("⚠️ 任务清单为空，无法执行任务")
-            return
-        
-        log.info("📍 视频/QA流量只允许拨号VPS/ADSL，不走普通直连、IPDeep或代理API")
-        
-        # ========== Step B: 使用 Selenium 浏览器执行任务 ==========
-        log.info("🔧 初始化 Selenium Chrome 环境...")
-        with sync_playwright() as p:
-            log.info("✅ Selenium Chrome 环境初始化成功")
-            
-            for task_idx, task in enumerate(tasks_list):
-                if not video_task_running:
-                    log.warning(f"⛔ {_task_label}已停止（任务清单遍历中）")
-                    break
-                
-                # 更新当前任务索引（用于前端实时显示）
-                current_video_task_idx = task_idx
-                task['status'] = "执行中"
-                task['start_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                
-                # 任务分隔线 —— 清晰区分不同任务
-                log.task_separator(task_idx + 1, len(tasks_list))
-                log.info(f"{_task_icon} {_task_label}#{task_idx+1}/{len(tasks_list)} 开始")
-                
-                # ========== Step B1: 确认视频IP模式 ==========
-                current_task = dict(task)
-                is_adsl_task = True
-                current_task["ip_mode"] = "adsl"
-                current_task['proxy_api_url'] = ""
-                current_task['proxy_user'] = ""
-                current_task['proxy_pwd'] = ""
-                current_task['proxy_country'] = "ADSL"
-                log.info("\n🎯 视频IP模式: ADSL重拨后本机直连，不走IPDeep/代理池/6666/1666/普通直连")
-                
-                # ========== Step B2: 计算等待时间（严格按照计划时间执行） ==========
-                import datetime as _dt
-                import pytz
-                
-                # 获取本地时区
-                local_tz = pytz.timezone('Asia/Shanghai')
-                
-                # 获取当前本地时间
-                _now_local = _dt.datetime.now(local_tz)
-                _today_local_start = _now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-                _now_sec_local = (_now_local - _today_local_start).total_seconds()
-                
-                _actual_start_sec = current_task.get("actual_start", 0)
-                _hh = int(_actual_start_sec // 3600)
-                _mm = int((_actual_start_sec % 3600) // 60)
-                _ss = int(_actual_start_sec % 60)
-                _start_str = f"{_hh:02d}:{_mm:02d}:{_ss:02d}"
-                
-                log.info(
-                    f"📌 当前任务: {current_task['idx']}/{total_tasks}, "
-                    f"计划开始时间={_start_str}, "
-                    f"预估时长={current_task.get('task_duration', 0):.1f}s, "
-                    f"代理国家={current_task['proxy_country']}"
-                )
-                
-                wait_sec = 0
-                if task_idx == 0:
-                    wait_sec = max(0, _actual_start_sec - _now_sec_local)
-                else:
-                    interval_min = config.get("vt_global_interval", {}).get("min", 10)
-                    interval_max = config.get("vt_global_interval", {}).get("max", 30)
-                    wait_sec = random.uniform(interval_min, interval_max)
-                
-                # 将当前本地秒数转换为可读时间
-                _now_hh = int(_now_sec_local // 3600)
-                _now_mm = int((_now_sec_local % 3600) // 60)
-                _now_ss = int(_now_sec_local % 60)
-                _now_str = f"{_now_hh:02d}:{_now_mm:02d}:{_now_ss:02d}"
-                
-                log.info(f"⏰ 当前本地时间: {_now_str}, 计划开始时间: {_start_str}, 需要等待: {wait_sec:.1f}秒")
-                
-                if wait_sec > 0:
-                    log.info(f"⏳ 等待 {wait_sec:.1f} 秒后开始任务...")
-                    if not video_interruptible_sleep(wait_sec):
-                        log.warning("⛔ 任务已停止（等待中）")
-                        break
-                
-                # ========== Step B3: 获取动态IP并验证 ==========
-                log.info("🔌 开始前置流程：获取动态IP并验证...")
-                browser = None
-                try:
-                    proxy_info = None
-                    exit_ip = "未知"
-                    country = "未知"
-                    timezone = "Etc/UTC"
-                    language = "en-US"
-                    cc_upper = ""
-                    
-                    ip_retry_max = 3
-                    fingerprint_retry_max = max(1, int(config.get("adsl_ip_redial_max_attempts", 10) or 10))
-                    resolved_ip_info = None
-                    for ip_attempt in range(ip_retry_max):
-                        if not video_task_running:
-                            log.warning("⛔ 任务已停止（IP获取中）")
-                            break
-                        try:
-                            video_adsl_status["current"] = task_idx + 1
-                            video_adsl_status["status"] = "重拨取IP"
-                            exit_ip, resolved_ip_info = redial_adsl_and_get_ip(sleep_func=video_interruptible_sleep, status_obj=video_adsl_status)
-
-                            if not isinstance(resolved_ip_info, dict):
-                                resolved_ip_info = {}
-                            resolved_ip_info["ip"] = exit_ip
-                            valid_ip_info, invalid_reason = _validate_resolved_ip_info(exit_ip, resolved_ip_info)
-                            if not valid_ip_info:
-                                log.warning(f"视频出口IP {exit_ip} 三要素硬校验失败: {invalid_reason}，废弃本次IP")
-                                continue
-                            sync_process_timezone_to_ip(resolved_ip_info)
-
-                            ip_info = dict(resolved_ip_info)
-                            proxy_info = {
-                                "success": True,
-                                "proxy_host": "DIRECT",
-                                "proxy_port": "DIRECT",
-                                "ip_info": ip_info,
-                                "direct": True,
-                                "adsl_direct": bool(is_adsl_task),
-                            }
-                            country = resolved_ip_info.get("country_name") or resolved_ip_info.get("country_code") or "DIRECT"
-                            timezone = resolved_ip_info.get("timezone") or "Etc/UTC"
-                            language = resolved_ip_info.get("language") or "en-US"
-                            cc_upper = (resolved_ip_info.get("country_code") or "DIRECT").upper()
-                            current_task['proxy_country'] = cc_upper or country or ("ADSL" if is_adsl_task else "DIRECT")
-                            if is_adsl_task:
-                                video_adsl_status["country"] = current_task['proxy_country']
-                                video_adsl_status["current_ip"] = exit_ip
-                            log.info(f"✅ 视频出口IP就绪: {exit_ip}, 国家={country}, 模式={'ADSL直连' if is_adsl_task else '本机直连'}")
-                            break
-                        except Exception as e:
-                            if not video_task_running:
-                                log.warning(f"⛔ 任务已停止（IP获取中）: {type(e).__name__}: {e}")
-                                break
-                            log.error(f"视频直连IP获取异常: {type(e).__name__}: {e}")
-                            continue
-
-                    if not video_task_running:
-                        task['status'] = "已停止"
-                        task['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                        log.warning(f"⛔ {_task_label}已停止，跳出当前任务")
-                        break
-
-                    if not proxy_info or not proxy_info.get("success") or not resolved_ip_info:
-                        log.error("❌ 视频直连IP获取失败，跳过本任务")
-                        task['status'] = "失败"
-                        task['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                        continue
-                    
-                    # ========== Step B4: 生成与IP匹配的指纹 ==========
-                    ua_repeat_max_rate = float(config.get("ua_repeat_max_rate", 0.2) or 0.2)
-                    fingerprint = None
-                    for fp_attempt in range(fingerprint_retry_max):
-                        log.info(f"🔧 生成与IP匹配的指纹...（第 {fp_attempt + 1}/{fingerprint_retry_max} 次）")
-                        log.debug(f"用于生成指纹的IP信息: {resolved_ip_info}")
-                        fingerprint = generate_fingerprint(resolved_ip_info)
-                        user_agent = fingerprint["user_agent"]
-                        current_repeat_rate = 0
-                        if fingerprint_stats["ua_usage"]:
-                            total_used = sum(fingerprint_stats["ua_usage"].values())
-                            if total_used > 0:
-                                current_repeat_rate = fingerprint_stats["ua_usage"].get(user_agent, 0) / total_used
-                        log.info(f"📈 当前UA重复率: {current_repeat_rate:.2%}, 阈值={ua_repeat_max_rate:.2%}, 当前UA使用次数: {fingerprint_stats['ua_usage'].get(user_agent, 0)}")
-                        if current_repeat_rate <= ua_repeat_max_rate:
-                            break
-                        log.warning(f"⚠️ UA重复率超过阈值，废弃本次指纹/IP并重试")
-                        fingerprint = None
-                        if fp_attempt < fingerprint_retry_max - 1:
-                            video_adsl_status["status"] = "UA重复率超阈值，重拨重试"
-                            exit_ip, resolved_ip_info = redial_adsl_and_get_ip(sleep_func=video_interruptible_sleep, status_obj=video_adsl_status)
-                    if not fingerprint:
-                        raise RuntimeError(f"UA重复率连续超过阈值 {ua_repeat_max_rate:.2%}，本条{_task_label}失败")
-                    log.debug(f"🔍 生成的完整指纹信息: {fingerprint}")
-                    fingerprint_id = fingerprint["fingerprint_id"]
-                    user_agent = fingerprint["user_agent"]
-                    resolution = fingerprint["resolution"]
-                    canvas = fingerprint["canvas"]
-                    webgl = fingerprint["webgl"]
-                    webrtc = "disabled"
-                    log.info(f"✅ 指纹生成成功: ID={fingerprint_id[:8]}...")
-                    
-                    # 记录指纹使用统计
-                    record_fingerprint_usage(fingerprint_id, user_agent, current_task['proxy_country'])
-
-                    # ========== SEO 准备步骤（新增） ==========
-                    selected_engine_id = None
-                    selected_keyword = None
-                    generated_referer = None
-                    ip_region = None
-                    try:
-                        if not config.get("enable_seo", True):
-                            log.warning("⚠️ enable_seo=False，但QA任务仍可继续（SEO跳过）")
-                        else:
-                            # Step 1: 根据语言/国家判断 IP 区域
-                            lang_lower = (language or "").lower()
-                            if lang_lower.startswith("zh") and cc_upper == "CN":
-                                ip_region = "中国"
-                            elif lang_lower.startswith("en"):
-                                ip_region = "美国"
-                            elif lang_lower.startswith(("de","fr","it","es","nl","sv","no","da","fi","pl","pt","el","ja","ko")):
-                                ip_region = "美国"
-                            else:
-                                log.warning(f"⚠️ 语言{language}无对应SEO区域，尝试美国")
-                                ip_region = "美国"
-
-                            if ip_region:
-                                log.info(f"✅ SEO 区域判定: {ip_region}")
-                                # Step 2: 获取搜索引擎
-                                selected_engine_id = seo_query.get_random_engine_for_region(ip_region)
-                                if selected_engine_id:
-                                    # Step3: 获取关键词
-                                    selected_keyword = seo_query.get_random_keyword_for_engine(selected_engine_id)
-                                    if selected_keyword:
-                                        # Step4: 生成 Referer
-                                        generated_referer = seo_query.generate_referer(selected_engine_id, selected_keyword)
-                                        log.info(f"✅ SEO 准备完成：引擎={selected_engine_id}, 关键词={selected_keyword}")
-                    except Exception as seo_e:
-                        log.warning(f"⚠️ SEO 准备过程异常：{str(seo_e)}，不影响任务继续（SEO跳过）")
-                    # =========================================
-                    
-                    # ========== Step B6: 构建代理配置（关键修正） ==========
-                    # 重要：浏览器必须通过VPS代理服务器访问，这样才能确保使用获取到的动态出口IP
-                    # VPS代理服务器会转发流量到正确的出口IP
-                    
-                    # ========== Step B7: 启动浏览器（带防检测配置） ==========
-                    log.info("🔍 启动浏览器...")
-                    _headless_mode = bool(config.get("headless", True))
-                    ensure_xvfb_for_headed_mode(_headless_mode)
-                    _use_real_chrome = bool(config.get("use_real_chrome", True))
-                    log.info(f"浏览器模式: {'无头' if _headless_mode else '有界面'}，内核: {'本地Chrome' if _use_real_chrome else '系统Chrome'}")
-                    log.debug(f"代理信息详细: proxy_host={proxy_info.get('proxy_host')}, proxy_port={proxy_info.get('proxy_port')}")
-                    log.info(f"🌐 浏览器出口IP: {exit_ip}（通过代理访问: {proxy_info['proxy_host']}:{proxy_info['proxy_port']}）")
-                    
-                    proxy_config = None
-                    log.info(f"[视频直连] ✅ 浏览器数据面使用本机出口，不设置 SOCKS5/HTTP 代理（模式={'ADSL' if is_adsl_task else 'DIRECT'}）")
-                    log.debug(f"最终代理配置: {proxy_config}")
-                    
-                    # 检查参数类型
-                    if proxy_config is not None:
-                        assert isinstance(proxy_config, dict), "proxy_config must be a dict"
-                    assert isinstance(_headless_mode, bool), "headless must be a bool"
-                    
-                    _launch_args = []
-                    if proxy_config is not None:
-                        _launch_args.extend([
-                            f"--proxy-server={proxy_config['server']}",
-                            "--proxy-bypass-list=*.google.com;*.googleapis.com;*.gstatic.com;*.gvt1.com;accounts.google.com;clients2.google.com;safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;httpbin.org;api.ipify.org;icanhazip.com;ifconfig.me;checkip.amazonaws.com;ident.me",
-                        ])
-                    _launch_args.extend([
-                            "--autoplay-policy=no-user-gesture-required",
-                            "--mute-audio",
-                            "--disable-features=AutoplayIgnoreWebAudio,MediaRouter,Translate,TranslateUI,LanguageDetection,OptimizationHints,VizDisplayCompositor",
-                            "--no-sandbox",
-                            "--disable-dev-shm-usage",
-                            "--disable-infobars",
-                            "--disable-blink-features=AutomationControlled",
-                            "--no-first-run",
-                            "--no-default-browser-check",
-                            "--disable-extensions",
-                            "--disable-background-networking",
-                            "--safebrowsing-disable-auto-update",
-                            "--disable-domain-reliability",
-                            "--disable-popup-blocking",
-                            "--disable-translate",
-                            "--translate-ranker-model-url=0.0.0.0",
-                            "--translate-security-origin=0.0.0.0",
-                            "--disable-browser-side-navigation",
-                            "--disable-gpu",
-                            "--start-maximized",
-                            f"--lang={fingerprint['language']},{fingerprint['language'].split('-')[0]};q=0.9",
-                            "--disable-bundled-ppapi-flash",
-                            "--disable-component-update",
-                            "--disable-component-extensions-with-background-pages",
-                    ])
-                    _launch_kwargs = {
-                        "headless": _headless_mode,
-                        "args": _launch_args
-                    }
-                    
-                    # ✅ 启动浏览器（改为主线程，SIGALRM 超时保护，避免 Task was destroyed）
-                    def _vt_launch(_pw, _use_chrome_channel, _kwargs, _max_wait_sec=60):
-                        import signal as _vsig
-                        class _VTimeout(Exception):
-                            pass
-                        def _on_timeout(_signum, _frame):
-                            raise _VTimeout(f"浏览器启动超时（>{_max_wait_sec}s）")
-                        _vprev = None
-                        try:
-                            try:
-                                _vprev = _vsig.signal(_vsig.SIGALRM, _on_timeout)
-                                _vsig.alarm(_max_wait_sec)
-                            except (ValueError, AttributeError, OSError):
-                                _vprev = "no-sig"
-                            try:
-                                if _use_chrome_channel:
-                                    _browser = _pw.chromium.launch(channel="chrome", **_kwargs)
-                                else:
-                                    _browser = _pw.chromium.launch(**_kwargs)
-                                return _browser, None
-                            except _VTimeout as _te:
-                                return None, str(_te)
-                            except Exception as _e:
-                                return None, f"{type(_e).__name__}: {str(_e)[:200]}"
-                        finally:
-                            try:
-                                _vsig.alarm(0)
-                            except Exception:
-                                pass
-                            try:
-                                if _vprev not in (None, "no-sig"):
-                                    _vsig.signal(_vsig.SIGALRM, _vprev)
-                            except Exception:
-                                pass
-
-                    def _vt_minimal_launch_kwargs():
-                        return {
-                            "headless": True,
-                            "args": [
-                                "--no-sandbox",
-                                "--disable-dev-shm-usage",
-                                "--disable-gpu",
-                                "--disable-blink-features=AutomationControlled",
-                                "--autoplay-policy=no-user-gesture-required",
-                                "--mute-audio",
-                                f"--lang={fingerprint['language']},{fingerprint['language'].split('-')[0]};q=0.9",
-                                f"--window-size={width},{height}",
-                            ]
-                        }
-
-                    browser = None
-                    launch_errors = []
-                    if _use_real_chrome:
-                        browser, _vt_err = _vt_launch(p, True, _launch_kwargs, 60)
-                        if browser is not None:
-                            log.info("✅ 使用本地 Chrome 启动成功（支持 H.264/AAC）")
-                        else:
-                            launch_errors.append(f"chrome-full={_vt_err or '超时'}")
-                            log.warning(f"⚠️ 本地 Chrome 启动失败/超时，回退: {_vt_err or '超时'}")
-                    if browser is None:
-                        browser, _vt_err2 = _vt_launch(p, False, _launch_kwargs, 60)
-                        if browser is None:
-                            launch_errors.append(f"chromium-full={_vt_err2 or '未知错误'}")
-                            log.warning(f"⚠️ Chrome 完整参数启动失败，尝试极简参数: {_vt_err2 or '未知错误'}")
-                            browser, _vt_err3 = _vt_launch(p, False, _vt_minimal_launch_kwargs(), 60)
-                            if browser is None:
-                                launch_errors.append(f"chromium-minimal={_vt_err3 or '未知错误'}")
-                                raise RuntimeError(f"{_browser_label}启动失败: " + " | ".join(launch_errors))
-                            log.info("✅ 使用 Chrome 极简参数启动成功")
-                        else:
-                            log.info("使用系统 Chrome 启动")
-                    
-                    # ========== Step B8: 创建浏览器上下文（应用指纹） ==========
-                    log.info("🎨 创建浏览器上下文并应用指纹...")
-                    width, height = map(int, resolution.split("x"))
-                    
-                    # 获取视频Referer配置：支持逗号分隔列表，按任务序号轮询选择（QA可观测，不随机伪装）
-                    udis_referer, udis_referer_origin = select_video_referer_for_task(config, task_idx)
-                    config["current_video_referer"] = udis_referer
-                    config["current_video_referer_origin"] = udis_referer_origin
-                    log.info(f"[视频Referer] 列表数量={len(get_video_referer_list(config))}，当前任务#{task_idx + 1}使用: Referer={udis_referer}, Origin={udis_referer_origin}")
-                    
-                    # 添加 Accept-Language 请求头，确保与指纹语言一致
-                    lang_prefix = fingerprint["language"].split("-")[0]
-                    accept_language = f"{fingerprint['language']},{lang_prefix};q=0.9,en-US;q=0.8,en;q=0.7"
-                    extra_http_headers = {
-                        "Referer": udis_referer,
-                        "Accept-Language": accept_language
-                    }
-                    
-                    context = browser.new_context(
-                        user_agent=user_agent,
-                        viewport={"width": width, "height": height},
-                        locale=fingerprint["language"],
-                        timezone_id=fingerprint["timezone"],
-                        permissions=[],
-                        geolocation=None,
-                        device_scale_factor=1,
-                        is_mobile=False,
-                        has_touch=False,
-                        color_scheme="light",
-                        extra_http_headers=extra_http_headers
-                    )
-                    
-                    # ========== Step B9: 添加请求拦截器（处理视频反盗链） ==========
-                    log.info("🛡️ 配置请求拦截器...")
-                    
-                    # QA请求拦截：仅按本任务配置补齐业务需要的 Referer/Origin，不随机UA、不使用爬虫UA
-                    def handle_video_request(route, request):
-                        url = request.url
-                        if is_udis_video_url(url):
-                            custom_headers = {
-                                "Referer": udis_referer,
-                                "Origin": udis_referer_origin,
-                                "Accept": "video/mp4,video/webm,video/ogg,video/*;q=0.9,application/octet-stream;q=0.8,audio/*;q=0.7,*/*;q=0.5",
-                                "Accept-Language": fingerprint["language"],
-                                "Accept-Encoding": "identity;q=1, *;q=0",
-                                "Connection": "keep-alive"
-                            }
-                            log.debug(f"🎬 视频请求headers: Referer={udis_referer}, Origin={udis_referer_origin}, url={url}")
-                            route.continue_(headers={**request.headers, **custom_headers})
-                        else:
-                            route.continue_()
-                    
-                    # 拦截所有视频格式
-                    context.route("**/*.mp4", handle_video_request)
-                    context.route("**/*.m3u8", handle_video_request)
-                    context.route("**/*.ts", handle_video_request)
-                    context.route("**/*.flv", handle_video_request)
-                    context.route("**/*.mov", handle_video_request)
-                    context.route("**/*.webm", handle_video_request)
-                    context.route("**/*.ogg", handle_video_request)
-                    
-                    # ========== Step B11: 注入防检测脚本（隐藏自动化特征） ==========
-                    log.info("🎭 注入防检测脚本...")
-                    context.add_init_script(r"""
-                        // ========== 0. 彻底禁用WebRTC（防止IP泄漏） ==========
-                        (function() {
-                            // 1. 删除构造函数
-                            delete window.RTCPeerConnection;
-                            delete window.webkitRTCPeerConnection;
-                            
-                            // 2. 覆盖为undefined
-                            Object.defineProperty(window, 'RTCPeerConnection', {
-                                value: undefined,
-                                configurable: false,
-                                writable: false
-                            });
-                            Object.defineProperty(window, 'webkitRTCPeerConnection', {
-                                value: undefined,
-                                configurable: false,
-                                writable: false
-                            });
-                            
-                            // 3. 删除navigator上的相关属性
-                            Object.defineProperty(navigator, 'getUserMedia', {
-                                value: undefined,
-                                configurable: false,
-                                writable: false
-                            });
-                            Object.defineProperty(navigator, 'webkitGetUserMedia', {
-                                value: undefined,
-                                configurable: false,
-                                writable: false
-                            });
-                        })();
-                        
-                        // ========== 1. 隐藏自动化特征 ==========
-                        // 隐藏navigator.webdriver
-                        Object.defineProperty(navigator, 'webdriver', {
-                            value: undefined,
-                            writable: false,
-                            configurable: false
-                        });
-                        
-                        // 删除chrome的自动化属性
-                        delete window.__playwright;
-                        delete window.__pw_manual__;
-                        delete window.__PW_inspect;
-                        delete window.__selenium_unwrapped;
-                        delete window.__webdriver_evaluate;
-                        delete window.__driver_evaluate;
-                        delete window.__webdriver_script_fn;
-                        delete window.__fxdriver_evaluate;
-                        delete window.__driver_unwrapped;
-                        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-                        delete window.$cdc_asdjflasutopfhvcZLmcfl_;
-                        
-                        // 隐藏CDP特征
-                        const originalQuery = window.navigator.permissions.query;
-                        window.navigator.permissions.query = (parameters) => (
-                            parameters.name === 'notifications' ?
-                                Promise.resolve({ state: Notification.permission }) :
-                                originalQuery(parameters)
-                        );
-                        
-                        // ========== 2. Cookie和LocalStorage初始化 ==========
-                    (function() {
-                        var cookies = [
-                            {name: "NID", value: "511=" + Math.random().toString(36).substring(2, 20), domain: ".google.com", path: "/"},
-                            {name: "PHPSESSID", value: Math.random().toString(36).substring(2, 26), path: "/"},
-                            {name: "_ga", value: "GA1.2." + Math.floor(Math.random() * 1000000000) + "." + Math.floor(Date.now() / 1000), path: "/"},
-                            {name: "_gid", value: "GA1.2." + Math.floor(Math.random() * 1000000000) + "." + Math.floor(Date.now() / 1000), path: "/"},
-                            {name: "session", value: Math.random().toString(36).substring(2, 40), path: "/"}];
-                        cookies.forEach(function(c) {
-                            try {
-                                document.cookie = c.name + "=" + c.value + "; path=" + c.path + "; expires=" + new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toUTCString();
-                            } catch(e) {}
-                        });
-                        var localStorageData = {
-                            "visitedSites": JSON.stringify(["https://www.google.com", "https://www.youtube.com"]),
-                            "preferences": JSON.stringify({"theme": "light", "language": "zh-CN"}),
-                            "lastVisit": Date.now().toString(),
-                            "visitCount": Math.floor(Math.random() * 100).toString()
-                        };
-                        Object.keys(localStorageData).forEach(function(key) {
-                            try {
-                                localStorage.setItem(key, localStorageData[key]);
-                            } catch(e) {}
-                        });
-                    })();
-
-                    // ========== 2. 补充真实浏览器属性 ==========
-                        // 模拟plugins
-                        if (!navigator.plugins.length) {
-                            const pluginClasses = [
-                                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                                { name: 'Native Client', filename: 'internal-nacl-plugin' }
-                            ];
-                            
-                            const createPlugin = (info) => {
-                                const plugin = document.createElement('embed');
-                                plugin.setAttribute('name', info.name);
-                                plugin.setAttribute('src', '');
-                                plugin.setAttribute('type', 'application/x-google-chrome-pdf');
-                                plugin.style.display = 'none';
-                                document.body.appendChild(plugin);
-                                return plugin;
-                            };
-                            
-                            Object.defineProperty(navigator, 'plugins', {
-                                value: pluginClasses.map(createPlugin),
-                                writable: false,
-                                configurable: false
-                            });
-                        }
-                        
-                        // 模拟mimeTypes
-                        if (!navigator.mimeTypes.length) {
-                            const mimeTypes = [
-                                { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
-                                { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
-                                { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }
-                            ];
-                            
-                            Object.defineProperty(navigator, 'mimeTypes', {
-                                value: mimeTypes,
-                                writable: false,
-                                configurable: false
-                            });
-                        }
-                        
-                        // ========== 3. Canvas和WebGL指纹伪装（合规化：噪声+真实GPU字符串） ==========
-                        (function() {
-                            let _s = (__CANVAS_SEED__) >>> 0 || 1;
-                            const _rnd = function() { _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; };
-                            const _origGID = CanvasRenderingContext2D.prototype.getImageData;
-                            CanvasRenderingContext2D.prototype.getImageData = function() {
-                                const data = _origGID.apply(this, arguments);
-                                try {
-                                    const d = data.data;
-                                    for (let i = 0; i < d.length; i += 4) {
-                                        if (_rnd() < 0.02) {
-                                            const n = (_rnd() * 3 | 0) - 1;
-                                            d[i]=Math.max(0,Math.min(255,d[i]+n));
-                                            d[i+1]=Math.max(0,Math.min(255,d[i+1]+n));
-                                            d[i+2]=Math.max(0,Math.min(255,d[i+2]+n));
-                                        }
-                                    }
-                                } catch(e) {}
-                                return data;
-                            };
-                            const _origTDU = HTMLCanvasElement.prototype.toDataURL;
-                            HTMLCanvasElement.prototype.toDataURL = function() {
-                                try { const c=this.getContext('2d'); if(c){c.getImageData(0,0,Math.max(1,this.width),Math.max(1,this.height));} } catch(e){}
-                                return _origTDU.apply(this, arguments);
-                            };
-                        })();
-                        (function() {
-                            const _patch = function(proto) {
-                                if (!proto || !proto.getParameter) return;
-                                const _orig = proto.getParameter;
-                                proto.getParameter = function(param) {
-                                    if (param === 37445) return '__WEBGL_VENDOR__';
-                                    if (param === 37446) return '__WEBGL_RENDERER__';
-                                    return _orig.call(this, param);
-                                };
-                            };
-                            try { _patch(WebGLRenderingContext.prototype); } catch(e) {}
-                            try { _patch(WebGL2RenderingContext.prototype); } catch(e) {}
-                        })();
-                        try { Object.defineProperty(navigator,'hardwareConcurrency',{get:function(){return __HW_CONC__;},configurable:true}); } catch(e){}
-                        try { Object.defineProperty(navigator,'deviceMemory',{get:function(){return __DEV_MEM__;},configurable:true}); } catch(e){}
-                        
-                        // ========== 4. 语言设置 ==========
-                        Object.defineProperty(navigator, 'language', {
-                            value: '__LANGUAGE__',
-                            writable: false,
-                            configurable: false
-                        });
-                        
-                        Object.defineProperty(navigator, 'languages', {
-                            value: ['__LANGUAGE__', '__PREFIX__', 'en-US', 'en'],
-                            writable: false,
-                            configurable: false
-                        });
-                        
-                        // ========== 5. 其他指纹伪装 ==========
-                        // 隐藏chrome.runtime
-                        if (window.chrome) {
-                            delete window.chrome.runtime;
-                        }
-                        
-                        // 覆盖Object.prototype.toString，隐藏真实构造器
-                        const originalToString = Object.prototype.toString;
-                        Object.prototype.toString = function() {
-                            if (this === window.navigator) return '[object Navigator]';
-                            if (this === window.screen) return '[object Screen]';
-                            return originalToString.call(this);
-                        };
-                    """.replace('__CANVAS_SEED__', str(int(fingerprint.get('canvas_noise_seed', 12345)))).replace('__WEBGL_VENDOR__', fingerprint.get('webgl_vendor', 'Google Inc. (Intel)')).replace('__WEBGL_RENDERER__', fingerprint.get('webgl_renderer', 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)')).replace('__HW_CONC__', str(int(fingerprint.get('hardware_concurrency', 8)))).replace('__DEV_MEM__', str(int(fingerprint.get('device_memory', 8)))).replace('__CANVAS__', canvas).replace('__WEBGL__', webgl).replace('__LANGUAGE__', fingerprint['language']).replace('__PREFIX__', fingerprint['language'].split('-')[0]))
-                    log.info("✅ 防检测脚本注入完成")
-                    
-                    # ========== Step B11: 创建页面并进行一致性检查 ==========
-                    log.info("🧪 创建页面并进行一致性检查...")
-                    page = context.new_page()
-
-                    # 检查语言一致性（安全读取）
-                    actual_language = page_eval(page, "() => navigator.language || 'en-US'", default=fingerprint['language'])
-                    if not isinstance(actual_language, str) or not actual_language:
-                        actual_language = fingerprint['language']
-                    log.info(f"🌐 语言检查: 预期={fingerprint['language']}, 实际={actual_language}")
-
-                    # ❌ 已按需求删除"浏览器出口IP泄漏一致性检测"(check_ip_leak_robust)。
-                    # 出口IP 由 ADSL 本机直连 / SOCKS5 链路保证，浏览器再比对 ipify 冗余且常超时。
-                    _webrtc_local = page_eval(page, """() => {
-                        try {
-                            if (typeof window.RTCPeerConnection === 'undefined' &&
-                                typeof window.webkitRTCPeerConnection === 'undefined') {
-                                return 'disabled';
-                            }
-                            return 'enabled';
-                        } catch(e) { return 'disabled'; }
-                    }""", default="disabled")
-                    actual_webrtc_status = _webrtc_local if isinstance(_webrtc_local, str) else "disabled"
-                    leak_status, real_ip = "skip", exit_ip
-                    leak_ok = True
-
-                    # 检查时区一致性（安全读取）
-                    actual_timezone = page_eval(
-                        page,
-                        "() => Intl.DateTimeFormat().resolvedOptions().timeZone",
-                        default=fingerprint.get("timezone", "UTC"),
-                    )
-                    if not isinstance(actual_timezone, str) or not actual_timezone:
-                        actual_timezone = fingerprint.get("timezone", "UTC")
-                    log.info(f"⏰ 时区检查: 预期={fingerprint['timezone']}, 实际={actual_timezone}")
-
-                    # 检查 webdriver 是否被正确隐藏（安全读取，缺省视为隐藏）
-                    webdriver_hidden = page_eval(page, "() => navigator.webdriver === undefined", default=True)
-                    if not isinstance(webdriver_hidden, bool):
-                        webdriver_hidden = True
-                    log.info(f"🕵️ webdriver隐藏检查: {'✅ 已隐藏' if webdriver_hidden else '❌ 未隐藏'}")
-
-                    # 检查 plugins 是否正确模拟（安全读取）
-                    plugins_ok = page_eval(page, "() => (navigator.plugins && navigator.plugins.length > 0) || true", default=True)
-                    if not isinstance(plugins_ok, bool):
-                        plugins_ok = True
-                    log.info(f"🧩 plugins模拟检查: {'✅ 已模拟' if plugins_ok else '❌ 未模拟'}")
-
-                    # 最终一致性检查：pass/skip/unreachable 都算通过；时区/语言严格匹配；webdriver 必须隐藏
-                    # skip = 配置明确跳过检测，unreachable = 检测站无法访问，不算IP泄漏
-                    leak_ok = leak_status in ("pass", "skip", "unreachable")
-                    consistency = (
-                        leak_ok and
-                        actual_timezone == fingerprint["timezone"] and
-                        _bcp47_prefix_equal(actual_language, fingerprint["language"]) and
-                        webdriver_hidden
-                    )
-
-                    if consistency:
-                        log.info("✅ 一致性检查全部通过")
-                    else:
-                        details = []
-                        if not leak_ok:
-                            details.append(f"IP泄漏: 预期={exit_ip}, 实际={real_ip} (leak_status={leak_status})")
-                        if actual_timezone != fingerprint["timezone"]:
-                            details.append(f"时区不匹配: 预期={fingerprint['timezone']}, 实际={actual_timezone}")
-                        if not _bcp47_prefix_equal(actual_language, fingerprint["language"]):
-                            details.append(f"语言不匹配: 预期={fingerprint['language']}, 实际={actual_language}")
-                        if not webdriver_hidden:
-                            details.append("webdriver未隐藏")
-                        task['status'] = "失败"
-                        task['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                        log.error(f"❌ 指纹/IP一致性检查失败，当前{_task_label}退出: " + "; ".join(details))
-                        continue
-                    
-                    log.info("✅ 浏览器初始化完成，前置流程全部通过")
-                    
-                    # ========== Step B5: 执行任务主体 ==========
-                    task['start_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    # 初始化行为统计
-                    current_x, current_y = 100, 100
-                    behavior_stats = {
-                        "mouse_moves": 0, "scrolls": 0, "scroll_distance": 0,
-                        "clicks": 0, "key_presses": 0, "focus_switches": 0,
-                        "refreshes": 0, "total_stay": 0
-                    }
-                    
-                    task_config = dict(config)
-                    log.info(f"[QA会话] 全局session策略: {get_global_session_mode()}，视频/QA本轮使用 {'country_host_7d' if get_global_session_mode() == 'country_host_7d' else 'new_each_task'}")
-                    # 根据用户勾选决定执行哪些阶段
-                    run_website = bool(config.get('qa_run_phases', {}).get('website', True))
-                    run_video = bool(config.get('qa_run_phases', {}).get('video', True))
-                    
-                    if unified_qa and run_website:
-                        log.web_round_separator(1, 3 if run_video else 1)
-                        log.info("[综合QA] 阶段：网站浏览QA + 广告曝光检测开始")
-                        website_behavior, current_x, current_y = run_website_qa_segment(page, task_config, current_x, current_y, selected_engine_id, selected_keyword)
-                        for key in behavior_stats:
-                            behavior_stats[key] += website_behavior.get(key, 0)
-                        if not video_task_running:
-                            raise RuntimeError("综合QA已停止（网站/广告阶段后）")
-                        if run_video:
-                            log.info("[综合QA] 网站/广告QA完成，进入视频QA")
-                            log.video_round_separator(2, 3)
-                    
-                    if not unified_qa or run_video:
-                        if not unified_qa:
-                            log.video_round_separator(1, 1)
-                        log.info(f"[视频流程] 开始入口→Layer1→Layer2→视频页导航观看流程，本任务Referer={config.get('current_video_referer', '')}")
-                        video_behavior, current_x, current_y = run_video_navigation_flow(page, task_config, current_x, current_y)
-                        for key in behavior_stats:
-                            behavior_stats[key] += video_behavior.get(key, 0)
-                    
-                    if unified_qa and run_website and run_video:
-                        log.info("[综合QA] 阶段3/3：视频QA完成")
-                    elif unified_qa and run_video:
-                        log.info("[综合QA] 视频QA完成")
-                    elif unified_qa and run_website:
-                        log.info("[综合QA] 仅网站浏览QA，已完成（未勾选视频，跳过视频QA）")
-                    
-                    # 记录行为统计
-                    log.behavior_module(
-                        behavior_stats["mouse_moves"], behavior_stats["scrolls"],
-                        behavior_stats["scroll_distance"], behavior_stats["clicks"],
-                        behavior_stats["total_stay"], behavior_stats["focus_switches"],
-                        behavior_stats["refreshes"], 0, behavior_stats["total_stay"],
-                        behavior_stats["key_presses"]
-                    )
-                    
-                    # 记录视频观看统计
-                    increment_video_view_count(task['proxy_country'])
-                    increment_video_item_success()
-                    
-                    task['status'] = "已完成"
-                    if is_adsl_task:
-                        video_adsl_status["completed"] += 1
-                        video_adsl_status["status"] = "单轮完成"
-                    log.info(f"✅ {_task_label}执行成功")
-                    
-                except Exception as e:
-                    if not video_task_running:
-                        log.warning(f"⛔ {_task_label}已停止，当前任务不计失败: {str(e)[:160]}")
-                        task['status'] = "已停止"
-                        if is_adsl_task:
-                            video_adsl_status["status"] = "已停止"
-                            video_adsl_status["last_error"] = "用户停止任务"
-                    else:
-                        log.error(f"❌ {_task_label}执行失败: {str(e)}")
-                        task['status'] = "失败"
-                        increment_video_item_fail()
-                        if is_adsl_task:
-                            video_adsl_status["status"] = "单轮失败"
-                            video_adsl_status["last_error"] = str(e)[:200]
-                finally:
-                    # video_task: 带 timeout 保护的 browser close
-                    if browser:
-                        try:
-                            import threading as _vth
-                            _vresult = {"ok": False}
-
-                            def _vclose():
-                                try:
-                                    browser.close(timeout=15000)
-                                    _vresult["ok"] = True
-                                except Exception:
-                                    try:
-                                        browser.close()
-                                        _vresult["ok"] = True
-                                    except Exception:
-                                        pass
-
-                            _vt = _vth.Thread(target=_vclose, daemon=True)
-                            _vt.start()
-                            _vt.join(18)  # 最多等 18 秒
-                            if not _vresult["ok"]:
-                                log.warning(f"⚠️ {_browser_label}关闭超时，已跳过强制杀进程，等待系统自然回收")
-                            try:
-                                import random as _vrandom_cleanup
-                                _vwait = _vrandom_cleanup.uniform(5, 10)
-                                log.debug(f"🧹 {_browser_label}关闭流程完成，等待 {_vwait:.1f}s 后进入下一任务")
-                                video_interruptible_sleep(_vwait)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-
-                    task['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        
-        log.info(f"{_task_icon} {_task_label}全部执行完成")
-
-        # 将完成的任务计划保存到历史记录
-        if video_plan:
-            add_to_historical_tasks(video_plan)
-            log.info(f"{_task_label}计划已保存到历史记录")
-
-    except Exception as e:
-        log.error(f"{_task_label}执行失败: {str(e)}")
-    finally:
-        video_task_running = False
-        video_worker_active = False
-        if adsl_ip_task:
-            video_adsl_status["running"] = False
-            video_adsl_status["status"] = "完成" if video_adsl_status.get("completed", 0) >= video_adsl_status.get("total", 0) else "已停止"
-        stop_human_model()
-
-
-def increment_video_view_count(country):
-    """增加视频观看计数"""
-    global stats
-    stats['video_view_count'] += 1
-    if country not in stats['country_video_views']:
-        stats['country_video_views'][country] = 0
-    stats['country_video_views'][country] += 1
-
-
-def increment_video_item_success():
-    global stats
-    stats["video_item_success"] = stats.get("video_item_success", 0) + 1
-
-
-def increment_video_item_fail():
-    global stats
-    stats["video_item_fail"] = stats.get("video_item_fail", 0) + 1
-
-
-def get_total_video_views():
-    """获取总视频观看次数"""
-    global stats
-    return stats['video_view_count']
-
-
-def get_country_video_views():
-    """获取国家视频观看次数"""
-    global stats
-    return stats['country_video_views']
-
-
 def get_current_ip_context():
-    ip = video_adsl_status.get("current_ip") or adsl_status.get("current_ip") or ""
-    country = video_adsl_status.get("country") or adsl_status.get("country") or ""
+    ip = adsl_status.get("current_ip") or ""
+    country = adsl_status.get("country") or ""
     language = ""
     timezone_name = os.environ.get("TZ") or ""
     local_time = ""
     if ip:
         try:
-            resolved = resolve_ip_info(ip)
-            if isinstance(resolved, dict):
-                country = country or resolved.get("country_code") or resolved.get("country_name") or ""
-                language = resolved.get("language") or ""
-                timezone_name = resolved.get("timezone") or timezone_name
-        except Exception as e:
-            log.debug(f"[全局状态] 当前IP信息解析失败: {str(e)[:120]}")
-    try:
-        tz = pytz.timezone(timezone_name) if timezone_name else None
-        local_time = datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S') if tz else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    except Exception:
-        local_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    return {
-        "ip": ip,
-        "country": country,
-        "language": language,
-        "timezone": timezone_name,
-        "local_time": local_time
-    }
+            from datetime import datetime
+            local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return {"ip": ip, "country": country, "language": language, "timezone": timezone_name, "local_time": local_time}
 
 @app.route('/')
 def index():
@@ -13891,151 +11448,6 @@ def index():
                                   planned_total=planned_total_tasks)
 
 
-# ==================== 视频任务API接口 ====================
-@app.route('/generate_video_plan', methods=['POST'])
-def generate_video_plan():
-    try:
-        # 生成视频任务计划（类似generate_plan，但专门为视频流量优化）
-        plan = generate_video_daily_tasks(config)
-        global video_plan
-        video_plan = plan
-        return jsonify({"status": "ok", "plan": plan})
-    except Exception as e:
-        log.error(f"生成视频任务计划失败: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/get_video_plan', methods=['GET'])
-def get_video_plan():
-    global video_plan
-    return jsonify({"plan": video_plan})
-
-
-@app.route('/clear_video_plan', methods=['POST'])
-def clear_video_plan():
-    global video_plan
-    video_plan = None
-    return jsonify({"success": True, "message": "视频计划已清除"})
-
-
-@app.route('/start_unified_adsl_qa_task', methods=['POST'])
-def start_unified_adsl_qa_task():
-    try:
-        global video_task_running, video_worker_active
-        if video_worker_active:
-            return jsonify({"status": "error", "success": False, "message": "已有视频/综合QA任务正在运行或停止中"}), 409
-        video_task_running = True
-        video_worker_active = True
-        from threading import Thread
-        thread = Thread(target=run_video_tasks, kwargs={"adsl_ip_task": True, "unified_qa": True})
-        thread.start()
-        log.info("✅ ADSL综合QA任务线程已启动")
-        return jsonify({"status": "ok", "success": True, "message": "ADSL综合QA任务已启动"})
-    except Exception as e:
-        video_worker_active = False
-        video_task_running = False
-        log.error(f"启动ADSL综合QA任务失败: {str(e)}")
-        return jsonify({"status": "error", "success": False, "message": str(e)}), 500
-
-
-@app.route('/start_unified_qa_task', methods=['POST'])
-def start_unified_qa_task():
-    try:
-        global video_task_running, video_worker_active
-        if video_worker_active:
-            return jsonify({"status": "error", "success": False, "message": "已有视频/综合QA任务正在运行或停止中"}), 409
-        video_task_running = True
-        video_worker_active = True
-        from threading import Thread
-        thread = Thread(target=run_video_tasks, kwargs={"adsl_ip_task": True, "unified_qa": True})
-        thread.start()
-        log.info("✅ ADSL综合QA任务线程已启动（原综合QA入口已转为ADSL）")
-        return jsonify({"status": "ok", "success": True, "message": "ADSL综合QA任务已启动"})
-    except Exception as e:
-        video_worker_active = False
-        video_task_running = False
-        log.error(f"启动综合QA任务失败: {str(e)}")
-        return jsonify({"status": "error", "success": False, "message": str(e)}), 500
-
-
-@app.route('/start_video_adsl_ip_task', methods=['POST'])
-def start_video_adsl_ip_task():
-    try:
-        global video_task_running, video_worker_active
-        if video_worker_active:
-            return jsonify({"status": "error", "message": "已有视频任务正在运行或停止中"}), 409
-        video_task_running = True
-        video_worker_active = True
-        from threading import Thread
-        thread = Thread(target=run_video_tasks, kwargs={"adsl_ip_task": True})
-        thread.start()
-        log.info("✅ 视频 ADSL IP任务线程已启动")
-        return jsonify({"status": "ok", "success": True, "message": "视频 ADSL IP任务已启动"})
-    except Exception as e:
-        log.error(f"启动视频 ADSL IP任务失败: {str(e)}")
-        return jsonify({"status": "error", "success": False, "message": str(e)}), 500
-
-@app.route('/start_video_tasks', methods=['POST'])
-def start_video_tasks():
-    try:
-        log.info("🔴 收到启动视频任务请求")
-        # 启动视频任务执行线程
-        global video_task_running, video_worker_active
-        if video_worker_active:
-            return jsonify({"success": False, "message": "已有视频任务正在运行或停止中"}), 409
-        video_task_running = True
-        video_worker_active = True
-        from threading import Thread
-        thread = Thread(target=run_video_tasks, kwargs={"adsl_ip_task": True})
-        thread.start()
-        log.info("✅ 视频ADSL任务线程已启动")
-        return jsonify({"success": True, "message": "视频ADSL任务已启动"})
-    except Exception as e:
-        log.error(f"启动视频任务失败: {str(e)}")
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/stop_video_tasks', methods=['POST'])
-def stop_video_tasks():
-    global video_task_running, video_worker_active, current_video_task_idx, video_adsl_status, video_plan
-    video_task_running = False
-    stop_human_model()
-    if video_plan and current_video_task_idx >= 0 and current_video_task_idx < len(video_plan.get('tasks', [])):
-        cur = video_plan['tasks'][current_video_task_idx]
-        if cur.get('status') == '执行中':
-            cur['status'] = '已停止'
-            cur['end_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    current_video_task_idx = -1
-    video_adsl_status["running"] = False
-    video_adsl_status["status"] = "停止中"
-    video_adsl_status["last_error"] = "用户点击停止任务"
-    _is_qa = bool(video_plan and str(video_plan.get("model_used", "")).startswith("unified_qa"))
-    _stop_label = "QA任务" if _is_qa else "视频任务"
-    log.warning(f"⛔ 已收到{_stop_label}停止请求，正在中断当前等待/重拨/浏览器流程")
-    # 强制关闭所有活跃浏览器（确保点击停止后浏览器一定关闭）
-    try:
-        import selenium_bridge
-        closed = selenium_bridge.force_quit_all()
-        if closed:
-            log.info(f"🛑 停止{_stop_label}：已强制关闭 {closed} 个浏览器实例")
-    except Exception as e:
-        log.warning(f"强制关闭浏览器异常: {e}")
-    return jsonify({"success": True, "status": "ok", "message": f"✅ 已发送停止信号（{_stop_label}），当前重拨/浏览器清理会尽快中断"})
-
-
-@app.route('/get_video_task_status', methods=['GET'])
-def get_video_task_status():
-    global video_task_running, video_worker_active, current_video_task_idx, video_plan, video_adsl_status
-    current_task = None
-    if video_plan and current_video_task_idx >= 0 and current_video_task_idx < len(video_plan.get('tasks', [])):
-        current_task = video_plan['tasks'][current_video_task_idx]
-    return jsonify({
-        "running": video_worker_active,
-        "current_task_idx": current_video_task_idx,
-        "current_task": current_task,
-        "total_tasks": video_plan['total_tasks'] if video_plan else 0,
-        "adsl": video_adsl_status
-    })
 
 
 @app.route('/get_global_task_status', methods=['GET'])
@@ -14043,10 +11455,7 @@ def get_global_task_status():
     current_website_task = None
     if current_plan and current_task_idx >= 0 and current_task_idx < len(current_plan.get('tasks', [])):
         current_website_task = current_plan['tasks'][current_task_idx]
-    current_video_task = None
-    if video_plan and current_video_task_idx >= 0 and current_video_task_idx < len(video_plan.get('tasks', [])):
-        current_video_task = video_plan['tasks'][current_video_task_idx]
-    qa_running = bool(video_worker_active and video_plan and str(video_plan.get("model_used", "")).startswith("unified_qa"))
+    qa_running = False
     with human_model_lock:
         human_model = dict(human_model_state)
     return jsonify({
@@ -14056,18 +11465,7 @@ def get_global_task_status():
             "current_task": current_website_task,
             "total_tasks": current_plan['total_tasks'] if current_plan else 0
         },
-        "video": {
-            "running": bool(video_worker_active or qa_running),
-            "current_task_idx": current_video_task_idx,
-            "current_task": current_video_task,
-            "total_tasks": video_plan['total_tasks'] if video_plan else 0,
-            "adsl": video_adsl_status
-        },
-        "qa": {
-            "running": qa_running,
-            "session_mode": get_global_session_mode(),
-            "adsl": video_adsl_status if qa_running else {}
-        },
+
         "ip": get_current_ip_context(),
         "human_model": human_model,
         "stats": stats
@@ -14092,13 +11490,13 @@ def get_website_task_status():
 @app.route('/get_video_stats', methods=['GET'])
 def get_video_stats():
     try:
-        stats = {
+        video_stats = {
             "total_views": get_total_video_views(),
             "country_views": get_country_video_views(),
             "video_item_success": stats.get("video_item_success", 0),
             "video_item_fail": stats.get("video_item_fail", 0)
         }
-        return jsonify({"stats": stats})
+        return jsonify({"stats": video_stats})
     except Exception as e:
         log.error(f"获取视频任务统计失败: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
@@ -14167,7 +11565,7 @@ def save_config():
     global config, pending_plan
     data = request.get_json()
     
-    # ⭐ 修复：识别"仅同步视频广告启用开关"的特殊字段，避免覆盖整个 video_ad 子配置
+    # ⭐ 修复：识别“仅同步视频广告启用开关”的特殊字段，避免覆盖整个 video_ad 子配置
     if 'video_ad_enabled_only' in data:
         if 'video_ad' not in config or not isinstance(config.get('video_ad'), dict):
             config['video_ad'] = {}
@@ -14204,6 +11602,14 @@ def save_config():
         config['daily_traffic_range'] = data['daily_traffic_range']
     if 'proxy_pool' in data:
         config['proxy_pool'] = data['proxy_pool']
+    
+    # 明确处理网络配置字段
+    if 'ip_proxy_api' in data:
+        config['ip_proxy_api'] = data['ip_proxy_api']
+    if 'ip_proxy_user' in data:
+        config['ip_proxy_user'] = data['ip_proxy_user']
+    if 'ip_proxy_pwd' in data:
+        config['ip_proxy_pwd'] = data['ip_proxy_pwd']
     
     # 配置变更时清除待执行计划
     pending_plan = None
@@ -14243,24 +11649,36 @@ def save_config():
     with open('config.json', 'w') as f:
         json.dump(config, f, indent=4)
     
+    # 记录配置审计日志
+    changed_keys = list(data.keys())[:20]  # 最多记录20个字段
+    record_config_audit("save_config", changed_keys=changed_keys, source="web_ui")
+    
     log.info("配置已保存")
     return jsonify({"success": True, "status": "ok"})
+
+@app.route('/get_config', methods=['GET'])
+def get_config():
+    """获取当前配置，用于页面加载时恢复代理池等配置"""
+    return jsonify({
+        "status": "ok",
+        "config": config
+    })
 
 
 @app.route('/reset_config_defaults', methods=['POST'])
 def reset_config_defaults():
     global config, pending_plan, video_plan, planned_total_tasks
     data = request.get_json(silent=True) or {}
-    if task_running or video_worker_active:
+    if task_running:
         return jsonify({"success": False, "status": "error", "message": "任务运行中，请先停止任务再恢复默认"}), 409
     config.clear()
     config.update(copy.deepcopy(DEFAULT_CONFIG))
     ensure_config_defaults()
     pending_plan = None
-    video_plan = None
     planned_total_tasks = 0
     with open('config.json', 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
+    record_config_audit("reset_config_defaults", changed_keys=["all"], source="web_ui")
     log.info(f"配置已恢复默认: scope={data.get('scope', 'all')}")
     return jsonify({"success": True, "status": "ok", "message": "配置已恢复默认"})
 
@@ -14299,10 +11717,29 @@ def clear_plan():
     log.info("✅ 计划已清除")
     return jsonify({"status": "ok"})
 
+
+def clean_logs():
+    """清空日志（包括前端显示和文件日志）"""
+    import os
+    # 1. 清空前端显示的内存日志列表
+    log.messages = []
+    
+    # 2. 清空 logs/ 目录下的 .log 文件（VPS终端日志）
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    if os.path.exists(logs_dir):
+        for filename in os.listdir(logs_dir):
+            if filename.endswith('.log'):
+                try:
+                    with open(os.path.join(logs_dir, filename), 'w') as f:
+                        f.write('')
+                except Exception:
+                    pass
 @app.route('/start_task', methods=['POST'])
 def start_task():
     global task_running
     if not task_running:
+        # 清除以往日志
+        clean_logs()
         threading.Thread(target=worker_task, daemon=True).start()
     return jsonify({"status": "ok"})
 
@@ -14311,15 +11748,9 @@ def start_single_task():
     global task_running
     if task_running:
         return jsonify({"status": "error", "message": "已有任务正在运行"}), 409
+    # 清除历史日志
+    clean_logs()
     threading.Thread(target=worker_task, kwargs={"single_task": True}, daemon=True).start()
-    return jsonify({"status": "ok"})
-
-@app.route('/start_adsl_ip_task', methods=['POST'])
-def start_adsl_ip_task():
-    global task_running
-    if task_running:
-        return jsonify({"status": "error", "message": "已有任务正在运行"}), 409
-    threading.Thread(target=worker_task, kwargs={"single_task": True, "adsl_ip_task": True}, daemon=True).start()
     return jsonify({"status": "ok"})
 
 @app.route('/stop_task', methods=['POST'])
@@ -14382,15 +11813,29 @@ def _run_drill_thread(target_url, headless):
     global _drill_state
     try:
         import risk_check
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
         def _log_fn(msg):
             log.info(f"[攻防演练] {msg}")
         def _progress_fn(pct, stage):
             _drill_state["progress"] = int(pct)
             _drill_state["stage"] = stage
-        report, json_path, html_path = risk_check.run_drill(
-            target_url, headless=headless, log_fn=_log_fn, progress_fn=_progress_fn, with_stealth=True
-        )
+        def _do_drill():
+            return risk_check.run_drill(
+                target_url, headless=headless, log_fn=_log_fn, progress_fn=_progress_fn, with_stealth=True
+            )
+        # 整体超时保护：120秒
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_drill)
+            try:
+                report, json_path, html_path = future.result(timeout=120)
+            except FuturesTimeout:
+                log.error("[攻防演练] 超时（120秒），强制结束")
+                _drill_state["stage"] = "超时结束"
+                _drill_state["progress"] = 100
+                return
+        # 保存完整报告用于前端展示
         _drill_state["report"] = (report or {}).get("risk_calc", {})
+        _drill_state["full_report"] = report or {}
         _drill_state["json_path"] = json_path
         _drill_state["html_path"] = html_path
     except Exception as e:
@@ -14438,9 +11883,433 @@ def get_security_drill_status():
         "progress": _drill_state["progress"],
         "stage": _drill_state["stage"],
         "report": _drill_state["report"],
+        "full_report": _drill_state.get("full_report"),  # 新增：返回完整报告
         "json_path": _drill_state["json_path"],
         "html_path": _drill_state["html_path"],
     })
+
+
+# ==================== 关键词探索功能 ====================
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+import re
+
+KEYWORD_EXPLORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'keyword_explore')
+os.makedirs(KEYWORD_EXPLORE_DIR, exist_ok=True)
+
+keyword_explore_manager = {
+    'is_running': False,
+    'progress': '',
+    'current_layer': 0,
+    'max_layer': 6,
+    'result': None,
+    'error': None
+}
+
+
+# -------- 关键词提取：从<a>标签提取可点击链接文本 --------
+# 需要过滤的导航/功能性链接文本
+_NAV_FILTER = {
+    'home', '首页', 'back', '返回', 'top', '顶部', 'up', 'next', 'prev',
+    'previous', 'last', 'first', 'newer', 'older', 'more', 'load more',
+    'read more', 'view all', 'see all', 'show more', 'show less',
+    'menu', '导航', '搜索', 'search', 'login', '登录', 'register', '注册',
+    'sign in', 'sign up', 'logout', '退出', 'account', 'my account',
+    'cart', '购物车', 'checkout', '结算', 'wishlist', '收藏',
+    'share', '分享', 'print', '打印', 'email', '邮件', 'contact', '联系',
+    'about', '关于', 'privacy', '隐私', 'terms', '条款', 'cookie',
+    'facebook', 'twitter', 'instagram', 'youtube', 'tiktok', 'weibo',
+    'weixin', 'wechat', 'whatsapp', 'telegram', 'linkedin',
+    'rss', 'sitemap', 'archive', '归档', 'tag', '标签', 'category', '分类',
+    'subscribe', '订阅', 'unsubscribe', '取消订阅', 'follow', '关注',
+    'download', '下载', 'upload', '上传', 'submit', '提交', 'cancel', '取消',
+    'ok', 'yes', 'no', 'close', '关闭', 'skip', '跳过', 'continue', '继续',
+    # 常见英文停用词（可能出现在锚文本中）
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+    'would', 'could', 'should', 'may', 'might', 'can', 'shall', 'it',
+    'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she',
+    'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+    'our', 'their', 'what', 'which', 'who', 'whom', 'when', 'where', 'why',
+    'how', 'all', 'each', 'every', 'both', 'few', 'many', 'some', 'any',
+    'most', 'other', 'such', 'only', 'own', 'same', 'so', 'than', 'too',
+    'very', 'just', 'because', 'if', 'then', 'else', 'not', 'no', 'nor',
+    'into', 'over', 'after', 'before', 'between', 'under', 'again',
+    'there', 'here', 'once', 'during', 'while', 'through', 'above', 'below',
+    'until', 'against', 'further', 'down', 'off', 'out', 'up', 'about',
+}
+
+# 常见英文停用词（用于过滤锚文本中的无意义短词）
+_STOP_WORDS = {
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+    'been', 'it', 'this', 'that', 'i', 'you', 'he', 'she', 'we', 'they',
+    'me', 'my', 'your', 'his', 'our', 'their', 'what', 'which', 'who',
+    'how', 'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other',
+    'some', 'any', 'no', 'not', 'so', 'if', 'then', 'than', 'too', 'very',
+    'can', 'will', 'just', 'do', 'did', 'does', 'had', 'have', 'has',
+    'would', 'could', 'should', 'may', 'might', 'shall', 'need', 'must',
+}
+
+def _extract_anchor_texts_from_html(html, url):
+    """从HTML页面中提取所有<a>标签的可点击链接文本作为关键词"""
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html, 'html.parser')
+
+    keywords = set()
+    for a in soup.find_all('a', href=True):
+        text = a.get_text(strip=True)
+        if not text:
+            # 尝试从 title 或 aria-label 获取
+            text = a.get('title', '') or a.get('aria-label', '') or ''
+            text = text.strip()
+        if not text:
+            continue
+        # 过滤：太短、纯数字、导航/功能性文本
+        if len(text) < 2:
+            continue
+        if text.isdigit() or text.isnumeric():
+            continue
+        text_lower = text.lower()
+        if text_lower in _NAV_FILTER:
+            continue
+        # 过滤停用词
+        if text_lower in _STOP_WORDS:
+            continue
+        # 过滤纯标点
+        if all(not c.isalnum() for c in text):
+            continue
+        keywords.add(text)
+    return keywords
+
+
+def _extract_page_links(html, base_url, target_domain):
+    """从HTML中提取同域 outgoing 链接（用于兜底链接池）"""
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html, 'html.parser')
+
+    links = set()
+    for a in soup.find_all('a', href=True):
+        href = a['href'].strip()
+        if not href or href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:') or href.startswith('tel:'):
+            continue
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
+        if parsed.scheme not in ['http', 'https']:
+            continue
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        # 同域检查（允许子域名）
+        if parsed.netloc and (target_domain in parsed.netloc or parsed.netloc.endswith('.' + target_domain)):
+            if not _is_forbidden_url(parsed.path):
+                links.add(clean_url)
+    return links
+
+
+# -------- 辅助函数 --------
+FORBIDDEN_PATTERNS = [
+    '/login', '/logout', '/admin', '/wp-admin', '/wp-login',
+    '/register', '/signup', '/cart', '/checkout', '/account'
+]
+
+def _is_forbidden_url(url_path):
+    """检查 URL 路径是否匹配 FORBIDDEN_PATTERNS"""
+    path_lower = url_path.lower()
+    for pattern in FORBIDDEN_PATTERNS:
+        if pattern.lower() in path_lower:
+            return True
+    return False
+
+
+def _is_same_origin(url, target_domain):
+    """检查 URL 是否同域"""
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc.split(':')[0] == target_domain
+    except Exception:
+        return False
+
+
+def _fetch_page(url, session=None, timeout=10):
+    """获取单个页面 HTML"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    }
+    try:
+        if session:
+            r = session.get(url, headers=headers, timeout=timeout)
+        else:
+            r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return None
+
+
+
+# -------- 爬取主逻辑 --------
+def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
+    """执行关键词探索爬取：
+    - 关键词 = 每层页面上<a>标签的可点击链接文本
+    - 兜底链接 = 该层页面中，没有匹配到关键词池的页面的 outgoing 链接
+    """
+    parsed = urlparse(target_url)
+    target_domain = parsed.netloc.split(':')[0]
+
+    mgr = keyword_explore_manager
+    mgr['is_running'] = True
+    mgr['progress'] = '准备开始爬取...'
+    mgr['current_layer'] = 0
+    mgr['result'] = None
+    mgr['error'] = None
+
+    session = requests.Session()
+    session.verify = False
+
+    visited = set()
+    layer_anchor_texts = {}   # {layer_num: set(anchor_text)} 每层的关键词（可点击链接文本）
+    layer_fallback_links = {} # {layer_num: set(url)} 每层的兜底链接
+    all_urls = set()          # 所有层级的去重URL汇总
+
+    current_urls = {target_url.rstrip('/')}
+
+    try:
+        log.info(f'[关键词探索] 开始 | 目标: {target_url} | 最大层数: {max_layer}')
+
+        for layer in range(max_layer + 1):
+            mgr['current_layer'] = layer
+            mgr['progress'] = f'正在探索第 {layer} 层（共 {len(current_urls)} 个页面）...'
+            log.info(f'[关键词探索] === 第 {layer}/{max_layer} 层 | {len(current_urls)} 个页面 ===')
+
+            if not current_urls:
+                log.warning(f'[关键词探索] 第 {layer} 层无新页面，提前结束')
+                break
+
+            urls_to_fetch = [
+                u for u in current_urls
+                if _is_same_origin(u, target_domain)
+                and not _is_forbidden_url(urlparse(u).path)
+            ]
+            current_urls = set()
+
+            # 每层最多50个页面
+            if len(urls_to_fetch) > 50:
+                log.warning(f'[关键词探索] 第 {layer} 层页面过多，截断为50个')
+                urls_to_fetch = urls_to_fetch[:50]
+
+            log.info(f'[关键词探索] 第 {layer} 层实际待抓取: {len(urls_to_fetch)} 个页面')
+
+            # 存储每个页面的 (anchor_texts, outgoing_links)
+            page_data = []  # [(url, anchor_texts_set, outgoing_links_set), ...]
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {}
+                for url in urls_to_fetch:
+                    visited.add(url)
+                    time.sleep(random.uniform(0.1, 0.3))
+                    futures[executor.submit(_fetch_page, url, session)] = url
+
+                for future in as_completed(futures):
+                    url = futures[future]
+                    try:
+                        html = future.result(timeout=15)
+                        if not html:
+                            log.warning(f'[关键词探索] 获取失败: {url}')
+                            continue
+
+                        # 提取锚文本（作为关键词）
+                        anchor_texts = _extract_anchor_texts_from_html(html, url)
+                        # 提取 outgoing 链接
+                        outgoing_links = _extract_page_links(html, url, target_domain)
+
+                        page_data.append((url, anchor_texts, outgoing_links))
+                        log.info(f'[关键词探索] ✅ {url} | 锚文本: {len(anchor_texts)} | 出站链接: {len(outgoing_links)}')
+
+                    except Exception as e:
+                        log.warning(f'[关键词探索] 页面异常 {url}: {e}')
+
+            # ---- 构建本层关键词池和兜底链接 ----
+            # 本层关键词 = 所有页面的锚文本并集（可点击链接文本）
+            layer_kw_pool = set()
+            for _, ats, _ in page_data:
+                layer_kw_pool.update(ats)
+
+            # 本层兜底链接 = 该层所有页面的出站链接合并去重
+            layer_fb = set()
+            for _, _, out_links in page_data:
+                layer_fb.update(out_links)
+            # 兜底链接去除已经作为关键词来源的页面URL
+            layer_fb -= {u for u, _, _ in page_data}
+
+            layer_anchor_texts[layer] = layer_kw_pool
+            layer_fallback_links[layer] = layer_fb
+            log.info(f'[关键词探索] 第 {layer} 层完成 | 关键词(锚文本): {len(layer_kw_pool)} | 兜底链接: {len(layer_fb)}')
+
+            # 下一层的URL = 本层所有页面的 outgoing 链接（去重后未访问的）
+            next_layer_urls = set()
+            for _, _, out_links in page_data:
+                for link in out_links:
+                    if link not in visited:
+                        next_layer_urls.add(link)
+                        all_urls.add(link)
+            current_urls = next_layer_urls
+
+        # 构建报告数据
+        total_keywords = sum(len(v) for v in layer_anchor_texts.values())
+        total_fallback = sum(len(v) for v in layer_fallback_links.values())
+        mgr['progress'] = '生成报告文件...'
+
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        domain_clean = re.sub(r'[^\w.]', '_', target_domain)
+        ts_file = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'keywords_{domain_clean}_{ts_file}.txt'
+        filepath = os.path.join(KEYWORD_EXPLORE_DIR, filename)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write('# 关键词探索报告\n')
+            f.write(f'# 目标网站: {target_url}\n')
+            f.write(f'# 生成时间: {timestamp}\n')
+            f.write(f'# 总关键词数: {total_keywords}\n')
+            f.write(f'# 总兜底链接数: {total_fallback}\n\n')
+
+            for layer_num in sorted(layer_anchor_texts.keys()):
+                kws = layer_anchor_texts[layer_num]
+                fbs = layer_fallback_links.get(layer_num, set())
+                f.write(f'## Layer {layer_num} 关键词 (共{len(kws)}个，可点击链接文本)\n')
+                for kw in sorted(kws):
+                    f.write(f'{kw}\n')
+                f.write(f'\n## Layer {layer_num} 兜底链接 (共{len(fbs)}个)\n')
+                for url in sorted(fbs):
+                    f.write(f'{url}\n')
+                f.write('\n')
+
+            # 合并所有层的关键词和兜底链接
+            all_merged_kws = set()
+            all_merged_fbs = set()
+            for kws in layer_anchor_texts.values():
+                all_merged_kws.update(kws)
+            for fbs in layer_fallback_links.values():
+                all_merged_fbs.update(fbs)
+
+            f.write(f'## 合并关键词池 (共{len(all_merged_kws)}个)\n')
+            for kw in sorted(all_merged_kws):
+                f.write(f'{kw}\n')
+            f.write(f'\n## 合并兜底链接池 (共{len(all_merged_fbs)}个，去重)\n')
+            for url in sorted(all_merged_fbs):
+                f.write(f'{url}\n')
+
+        # 构建返回给前端的数据
+        layer_summary = {str(k): len(v) for k, v in layer_anchor_texts.items()}
+        fb_summary = {str(k): len(v) for k, v in layer_fallback_links.items()}
+
+        # 按层整理数据供前端自动填写配置
+        # 后端层号是 0-based (0,1,2...)，前端UI层号是 1-based (1,2,3...)
+        # 所以后端 layer 0 → 前端 layer_1，后端 layer 1 → 前端 layer_2 ...
+        layer_data_for_frontend = {}
+        for backend_layer in range(0, max_layer + 1):
+            frontend_layer = backend_layer + 1  # 0→1, 1→2, ...
+            if frontend_layer > 5:
+                break
+            kws_list = sorted(layer_anchor_texts.get(backend_layer, set()))
+            fbs_list = sorted(layer_fallback_links.get(backend_layer, set()))
+            layer_data_for_frontend[f'layer_{frontend_layer}'] = {
+                'keywords': kws_list,
+                'fallback_urls': fbs_list
+            }
+
+        mgr['result'] = {
+            'file_path': filepath,
+            'filename': filename,
+            'total_keywords': total_keywords,
+            'total_fallback_links': total_fallback,
+            'total_links': len(all_urls),
+            'layer_summary': layer_summary,
+            'fb_summary': fb_summary,
+            'layers_crawled': len(layer_anchor_texts),
+            'layer_data': layer_data_for_frontend,
+            'merged_keywords': sorted(all_merged_kws),
+            'merged_fallback_urls': sorted(all_merged_fbs)
+        }
+        mgr['progress'] = f'探索完成！共 {total_keywords} 个关键词，{total_fallback} 个兜底链接'
+        log.info(f'[关键词探索] ✅ 完成！关键词: {total_keywords} | 兜底链接: {total_fallback} | 文件: {filename}')
+
+    except Exception as e:
+        mgr['error'] = str(e)
+        mgr['progress'] = f'探索失败: {str(e)}'
+        log.error(f'[关键词探索] 异常: {str(e)}')
+    finally:
+        mgr['is_running'] = False
+
+
+# -------- 路由 --------
+@app.route('/api/keyword_explore', methods=['POST'])
+def start_keyword_explore():
+    if keyword_explore_manager['is_running']:
+        return jsonify({'success': False, 'message': '关键词探索正在进行中，请等待完成'})
+
+    data = request.json or {}
+    target_url = data.get('target_url', '').strip()
+    if not target_url:
+        return jsonify({'success': False, 'message': '请填写目标网址'})
+
+    try:
+        parsed = urlparse(target_url)
+        if not parsed.scheme or not parsed.netloc:
+            return jsonify({'success': False, 'message': '目标网址格式无效'})
+    except Exception:
+        return jsonify({'success': False, 'message': '目标网址格式无效'})
+
+    max_layer = int(data.get('max_layer', 5))
+    concurrency = int(data.get('concurrency', 4))
+
+    thread = threading.Thread(
+        target=_crawl_keyword_explore,
+        args=(target_url, max_layer, concurrency)
+    )
+    thread.daemon = True
+    thread.start()
+
+    log.info(f'用户启动关键词探索 | 目标: {target_url}')
+    return jsonify({'success': True, 'message': '关键词探索已启动'})
+
+
+@app.route('/api/keyword_explore/status', methods=['GET'])
+def get_keyword_explore_status():
+    return jsonify({
+        'success': True,
+        'data': {
+            'is_running': keyword_explore_manager['is_running'],
+            'progress': keyword_explore_manager['progress'],
+            'current_layer': keyword_explore_manager['current_layer'],
+            'max_layer': keyword_explore_manager['max_layer'],
+            'result': keyword_explore_manager['result'],
+            'error': keyword_explore_manager['error']
+        }
+    })
+
+
+@app.route('/api/keyword_explore/download/<filename>', methods=['GET'])
+def download_keyword_explore(filename):
+    try:
+        safe_name = os.path.basename(filename)
+        if not safe_name or '..' in filename:
+            return jsonify({'success': False, 'message': '无效的文件名'}), 400
+        
+        file_path = os.path.join(KEYWORD_EXPLORE_DIR, safe_name)
+        if not os.path.exists(file_path):
+            log.error(f'[关键词探索] 文件不存在: {file_path}')
+            return jsonify({'success': False, 'message': f'文件不存在: {safe_name}'}), 404
+        
+        return send_from_directory(KEYWORD_EXPLORE_DIR, safe_name, as_attachment=True)
+    except Exception as e:
+        log.error(f'[关键词探索] 下载失败: {str(e)}')
+        return jsonify({'success': False, 'message': f'下载失败: {str(e)}'}), 500
 
 
 @app.route('/get_logs')
@@ -14489,12 +12358,13 @@ def save_seo_config():
     global config
     data = request.get_json()
     
-    # 更新搜索引擎列表
+    # 更新搜索引擎 & 社媒平台列表（含type字段）
     config['seo']['search_engines'] = data.get('search_engines', [])
     
-    # 更新地域-搜索引擎映射
-    config['seo']['region_engine_map']['中国'] = [s.strip() for s in data.get('seo_region_china', '').split(',') if s.strip()]
-    config['seo']['region_engine_map']['美国'] = [s.strip() for s in data.get('seo_region_usa', '').split(',') if s.strip()]
+    # 更新国别-平台映射（前端直接传递完整map）
+    region_map = data.get('region_engine_map', {})
+    if region_map:
+        config['seo']['region_engine_map'] = region_map
     
     # 更新关键词池
     config['seo']['keyword_pools']['zh'] = [s.strip() for s in data.get('seo_keywords_zh', '').split(',') if s.strip()]
@@ -14505,11 +12375,288 @@ def save_seo_config():
     
     # 保存到配置文件
     with open('config.json', 'w') as f:
-        json.dump(config, f, indent=4)
+        json.dump(config, f, indent=4, ensure_ascii=False)
+    
+    # 重置SEO查询模块实例，使新配置生效
+    try:
+        import seo_query_module
+        seo_query_module.reset_seo_query_instance()
+    except Exception:
+        pass
     
     log.info("SEO配置已保存")
     return jsonify({"status": "ok"})
 
+
+# ==================== KPI 仪表盘 ====================
+KPI_DASHBOARD_FILE = "kpi_dashboard.json"
+_kpi_lock = threading.Lock()
+
+
+def _load_kpi_data():
+    """加载 KPI 仪表盘数据"""
+    try:
+        if os.path.exists(KPI_DASHBOARD_FILE):
+            with open(KPI_DASHBOARD_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"加载 KPI 数据失败: {e}")
+    return {"daily": {}}
+
+
+def _save_kpi_data(data):
+    """保存 KPI 仪表盘数据"""
+    try:
+        with open(KPI_DASHBOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"保存 KPI 数据失败: {e}")
+
+
+def record_kpi_snapshot():
+    """记录当前 KPI 快照到仪表盘数据（每次任务完成时调用）"""
+    import datetime as _dt
+    today = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    with _kpi_lock:
+        data = _load_kpi_data()
+        daily = data.setdefault("daily", {})
+        entry = daily.setdefault(today, {
+            "tasks_total": 0, "tasks_success": 0, "tasks_fail": 0,
+            "video_views": 0, "ad_clicks": 0, "unique_ips": 0
+        })
+        entry["tasks_total"] = stats.get("total", 0)
+        entry["tasks_success"] = stats.get("success", 0)
+        entry["tasks_fail"] = stats.get("fail", 0)
+        entry["video_views"] = stats.get("video_view_count", 0)
+        entry["ad_clicks"] = get_daily_ad_clicks()
+        # 保留最近 30 天
+        keys = sorted(daily.keys())
+        for k in keys[:-30]:
+            daily.pop(k, None)
+        _save_kpi_data(data)
+
+
+@app.route("/api/kpi_dashboard", methods=["GET"])
+def api_kpi_dashboard():
+    """KPI 仪表盘数据 API"""
+    with _kpi_lock:
+        data = _load_kpi_data()
+    return jsonify(data)
+
+
+@app.route("/kpi_dashboard", methods=["GET"])
+def kpi_dashboard_page():
+    """KPI 仪表盘页面"""
+    return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KPI 仪表盘</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background:#f5f7fa; color:#333; }
+        .header { background:#1a73e8; color:#fff; padding:20px 30px; }
+        .header h1 { font-size:22px; }
+        .container { max-width:1200px; margin:20px auto; padding:0 20px; }
+        .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }
+        .card { background:#fff; border-radius:10px; padding:20px; box-shadow:0 2px 8px rgba(0,0,0,0.08); text-align:center; }
+        .card .value { font-size:32px; font-weight:700; color:#1a73e8; }
+        .card .label { font-size:13px; color:#666; margin-top:6px; }
+        .chart-container { background:#fff; border-radius:10px; padding:20px; box-shadow:0 2px 8px rgba(0,0,0,0.08); margin-bottom:20px; }
+        .chart-container h3 { margin-bottom:12px; font-size:16px; }
+        .nav { display:flex; gap:12px; margin-bottom:20px; }
+        .nav a { color:#1a73e8; text-decoration:none; padding:8px 16px; border:1px solid #1a73e8; border-radius:6px; }
+        .nav a:hover { background:#1a73e8; color:#fff; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>KPI 仪表盘</h1>
+    </div>
+    <div class="container">
+        <div class="nav">
+            <a href="/">← 返回主页</a>
+            <a href="/config_audit_log">配置审计日志</a>
+        </div>
+        <div class="cards" id="cards"></div>
+        <div class="chart-container">
+            <h3>近 7 天任务趋势</h3>
+            <canvas id="taskChart"></canvas>
+        </div>
+        <div class="chart-container">
+            <h3>近 7 天视频播放 & 广告点击</h3>
+            <canvas id="engagementChart"></canvas>
+        </div>
+    </div>
+    <script>
+        fetch('/api/kpi_dashboard')
+            .then(r => r.json())
+            .then(data => {
+                const daily = data.daily || {};
+                const dates = Object.keys(daily).sort().slice(-7);
+                if (dates.length === 0) {
+                    document.getElementById('cards').innerHTML = '<div class="card"><div class="value">—</div><div class="label">暂无数据</div></div>';
+                    return;
+                }
+                const latest = daily[dates[dates.length - 1]];
+                const cardsHtml = [
+                    {v: latest.tasks_total || 0, l: '今日任务总数'},
+                    {v: latest.tasks_success || 0, l: '成功'},
+                    {v: latest.tasks_fail || 0, l: '失败'},
+                    {v: latest.video_views || 0, l: '视频播放'},
+                    {v: latest.ad_clicks || 0, l: '广告点击'},
+                ].map(c => `<div class="card"><div class="value">${c.v}</div><div class="label">${c.l}</div></div>`).join('');
+                document.getElementById('cards').innerHTML = cardsHtml;
+
+                const taskCtx = document.getElementById('taskChart').getContext('2d');
+                new Chart(taskCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: dates,
+                        datasets: [
+                            {label:'成功', data:dates.map(d=>daily[d].tasks_success||0), backgroundColor:'#34a853'},
+                            {label:'失败', data:dates.map(d=>daily[d].tasks_fail||0), backgroundColor:'#ea4335'},
+                        ]
+                    },
+                    options: {responsive:true, scales:{x:{stacked:true}, y:{stacked:true, beginAtZero:true}}}
+                });
+
+                const engCtx = document.getElementById('engagementChart').getContext('2d');
+                new Chart(engCtx, {
+                    type: 'line',
+                    data: {
+                        labels: dates,
+                        datasets: [
+                            {label:'视频播放', data:dates.map(d=>daily[d].video_views||0), borderColor:'#1a73e8', tension:0.3},
+                            {label:'广告点击', data:dates.map(d=>daily[d].ad_clicks||0), borderColor:'#fbbc04', tension:0.3},
+                        ]
+                    },
+                    options: {responsive:true, scales:{y:{beginAtZero:true}}}
+                });
+            });
+    </script>
+</body>
+</html>
+''')
+
+
+# ==================== 配置审计日志 ====================
+CONFIG_AUDIT_LOG_FILE = "config_audit_log.json"
+_config_audit_lock = threading.Lock()
+
+
+def _load_config_audit_log():
+    """加载配置审计日志"""
+    try:
+        if os.path.exists(CONFIG_AUDIT_LOG_FILE):
+            with open(CONFIG_AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"加载配置审计日志失败: {e}")
+    return []
+
+
+def _save_config_audit_log(data):
+    """保存配置审计日志"""
+    try:
+        with open(CONFIG_AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"保存配置审计日志失败: {e}")
+
+
+def record_config_audit(action, changed_keys=None, source="web_ui"):
+    """记录配置变更审计日志"""
+    import datetime as _dt
+    entry = {
+        "timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+        "timestamp_local": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        "changed_keys": changed_keys or [],
+        "source": source,
+    }
+    with _config_audit_lock:
+        log_data = _load_config_audit_log()
+        log_data.append(entry)
+        # 保留最近 200 条记录
+        log_data = log_data[-200:]
+        _save_config_audit_log(log_data)
+    log.info(f"[配置审计] {action}: {changed_keys}")
+
+
+@app.route("/api/config_audit_log", methods=["GET"])
+def api_config_audit_log():
+    """配置审计日志 API"""
+    with _config_audit_lock:
+        log_data = _load_config_audit_log()
+    return jsonify({"entries": log_data[-100:]})
+
+
+@app.route("/config_audit_log", methods=["GET"])
+def config_audit_log_page():
+    """配置审计日志页面"""
+    return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置审计日志</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background:#f5f7fa; color:#333; }
+        .header { background:#34a853; color:#fff; padding:20px 30px; }
+        .header h1 { font-size:22px; }
+        .container { max-width:1200px; margin:20px auto; padding:0 20px; }
+        .nav { display:flex; gap:12px; margin-bottom:20px; }
+        .nav a { color:#1a73e8; text-decoration:none; padding:8px 16px; border:1px solid #1a73e8; border-radius:6px; }
+        .nav a:hover { background:#1a73e8; color:#fff; }
+        table { width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
+        th { background:#34a853; color:#fff; text-align:left; padding:12px 16px; font-size:13px; }
+        td { padding:10px 16px; border-bottom:1px solid #eee; font-size:13px; }
+        tr:hover { background:#f0f8f0; }
+        .action-badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; }
+        .action-save { background:#e8f5e9; color:#2e7d32; }
+        .action-reset { background:#fff3e0; color:#e65100; }
+        .empty { text-align:center; padding:40px; color:#999; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>配置审计日志</h1>
+    </div>
+    <div class="container">
+        <div class="nav">
+            <a href="/">← 返回主页</a>
+            <a href="/kpi_dashboard">KPI 仪表盘</a>
+        </div>
+        <div id="logTable"></div>
+    </div>
+    <script>
+        fetch('/api/config_audit_log')
+            .then(r => r.json())
+            .then(data => {
+                const entries = (data.entries || []).reverse();
+                if (entries.length === 0) {
+                    document.getElementById('logTable').innerHTML = '<div class="empty">暂无配置变更记录</div>';
+                    return;
+                }
+                let html = '<table><thead><tr><th>时间</th><th>操作</th><th>变更字段</th><th>来源</th></tr></thead><tbody>';
+                entries.forEach(e => {
+                    const cls = e.action.includes('reset') ? 'action-reset' : 'action-save';
+                    const keys = (e.changed_keys || []).join(', ') || '—';
+                    html += `<tr><td>${e.timestamp_local || e.timestamp}</td><td><span class="action-badge ${cls}">${e.action}</span></td><td>${keys}</td><td>${e.source}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                document.getElementById('logTable').innerHTML = html;
+            });
+    </script>
+</body>
+</html>
+''')
 
 
 if __name__ == "__main__":
@@ -14539,6 +12686,16 @@ if __name__ == "__main__":
             config.clear()
             config.update(deep_merge_defaults(DEFAULT_CONFIG, loaded_config))
         ensure_config_defaults()
+        # === 安全：环境变量覆盖敏感配置（优先级：.env > config.json） ===
+        _env_overrides = {
+            "ip_proxy_api": "IP_PROXY_API",
+            "ip_proxy_user": "IP_PROXY_USER",
+            "ip_proxy_pwd": "IP_PROXY_PWD",
+        }
+        for cfg_key, env_key in _env_overrides.items():
+            env_val = os.environ.get(env_key)
+            if env_val:  # 环境变量存在且非空时覆盖
+                config[cfg_key] = env_val
         with open('config.json', 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
         log.info("配置已加载")
@@ -14562,4 +12719,5 @@ if __name__ == "__main__":
     import os
     # 优先读取环境变量，无参数默认5001
     port = int(os.getenv("RUN_PORT",5001))
-    app.run(host="0.0.0.0",port=port)
+    host = os.getenv("RUN_HOST","127.0.0.1")
+    app.run(host=host,port=port)
