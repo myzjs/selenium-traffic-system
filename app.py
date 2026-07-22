@@ -9764,6 +9764,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     canvas_noise_seed = int(fingerprint.get("canvas_noise_seed", 12345))
                     hardware_concurrency = int(fingerprint.get("hardware_concurrency", 8))
                     device_memory = int(fingerprint.get("device_memory", 8))
+                    color_depth = int(fingerprint.get("color_depth", 24))
                     fonts_json = json.dumps(fingerprint.get("fonts", []))
                     # 会话存储随机化种子（仅 new_each_task 模式注入，避免覆盖 country_host_7d 持久化会话）
                     storage_randomize_js = "true" if (get_global_session_mode() != "country_host_7d") else "false"
@@ -10059,7 +10060,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 extra_http_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
                 extra_http_headers.setdefault("Accept-Encoding", "gzip, deflate, br, zstd")
                 extra_http_headers.setdefault("Upgrade-Insecure-Requests", "1")
-                extra_http_headers.setdefault("Sec-Fetch-Site", "none")
+                extra_http_headers.setdefault("Sec-Fetch-Site", "cross-site")
                 extra_http_headers.setdefault("Sec-Fetch-Mode", "navigate")
                 extra_http_headers.setdefault("Sec-Fetch-User", "?1")
                 extra_http_headers.setdefault("Sec-Fetch-Dest", "document")
@@ -10125,42 +10126,42 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 
                 # ========== 覆盖Canvas和WebGL指纹，添加完整反检测 ==========
                 context.add_init_script(rf"""
-                    // ========== 0. 彻底禁用WebRTC ==========
+                    // ========== 0. WebRTC IP泄露防护（保留API但过滤内网IP，完全禁用会被风控识别） ==========
                     (function() {{
-                        // 1. 删除WebRTC构造函数
-                        delete window.RTCPeerConnection;
-                        delete window.webkitRTCPeerConnection;
-                        delete window.RTCSessionDescription;
-                        delete window.RTCIceCandidate;
-                        delete window.MediaStream;
-                        delete window.MediaStreamTrack;
-                        delete window.webkitMediaStream;
-                        delete window.webkitMediaStreamTrack;
-                        delete window.navigator.mediaDevices;
-                        
-                        // 2. 覆盖为undefined
-                        Object.defineProperty(window, 'RTCPeerConnection', {{
-                            value: undefined,
-                            configurable: false,
-                            writable: false
+                        const _OrigRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+                        if (!_OrigRTC) return;
+                        const _SafeRTC = function(config) {{
+                            // 清除ICE服务器，阻止STUN/TURN探测
+                            if (config && config.iceServers) {{ config.iceServers = []; }}
+                            const pc = new _OrigRTC(config);
+                            const _origAddIce = pc.addIceCandidate.bind(pc);
+                            pc.addIceCandidate = function(candidate) {{
+                                if (candidate && candidate.candidate) {{
+                                    const c = candidate.candidate;
+                                    // 过滤内网IP泄露
+                                    if (/((10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0))/.test(c)) {{
+                                        return Promise.resolve();
+                                    }}
+                                }}
+                                return _origAddIce(candidate);
+                            }};
+                            // 监听icecandidate事件，过滤内网IP
+                            pc.addEventListener('icecandidate', function(e) {{
+                                if (e.candidate && e.candidate.candidate) {{
+                                    const c = e.candidate.candidate;
+                                    if (/((10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0))/.test(c)) {{
+                                        e.stopImmediatePropagation && e.stopImmediatePropagation();
+                                    }}
+                                }}
+                            }});
+                            return pc;
+                        }};
+                        _SafeRTC.prototype = _OrigRTC.prototype;
+                        Object.defineProperty(_SafeRTC, 'toString', {{
+                            value: function() {{ return 'function RTCPeerConnection() {{ [native code] }}'; }}
                         }});
-                        Object.defineProperty(window, 'webkitRTCPeerConnection', {{
-                            value: undefined,
-                            configurable: false,
-                            writable: false
-                        }});
-                        
-                        // 3. 删除navigator上的相关属性
-                        Object.defineProperty(navigator, 'getUserMedia', {{
-                            value: undefined,
-                            configurable: false,
-                            writable: false
-                        }});
-                        Object.defineProperty(navigator, 'webkitGetUserMedia', {{
-                            value: undefined,
-                            configurable: false,
-                            writable: false
-                        }});
+                        window.RTCPeerConnection = _SafeRTC;
+                        if (window.webkitRTCPeerConnection) {{ window.webkitRTCPeerConnection = _SafeRTC; }}
                     }})();
                     
                     // ========== 1. 隐藏自动化特征 ==========
@@ -10170,6 +10171,26 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         writable: false,
                         configurable: false
                     }});
+                    
+                    // 修复 headless 模式下 document.visibilityState="hidden" 的致命检测点
+                    // 真实用户的当前标签页始终是 "visible"
+                    Object.defineProperty(document, 'visibilityState', {{
+                        get: function() {{ return 'visible'; }},
+                        configurable: true
+                    }});
+                    Object.defineProperty(document, 'hidden', {{
+                        get: function() {{ return false; }},
+                        configurable: true
+                    }});
+                    // 拦截 visibilitychange 事件派发，确保永不触发“页面不可见”回调
+                    // （允许注册监听器，但事件永远不会被派发，因为 visibilityState 始终为 visible）
+                    const _origDispatchEvent = document.dispatchEvent.bind(document);
+                    document.dispatchEvent = function(event) {{
+                        if (event && event.type === 'visibilitychange') {{
+                            return true;  // 吞掉事件，不派发给监听器
+                        }}
+                        return _origDispatchEvent(event);
+                    }};
                     
                     // 删除chrome的自动化属性
                     delete window.__playwright;
@@ -10201,53 +10222,57 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         }}
                     }} catch(e) {{}}
                     
-                    // 隐藏CDP特征
-                    const originalQuery = window.navigator.permissions.query;
-                    window.navigator.permissions.query = (parameters) => (
-                        parameters.name === 'notifications' ?
-                            Promise.resolve({{ state: Notification.permission }}) :
-                            originalQuery(parameters)
-                    );
+                    // 隐藏CDP特征（permissions.query 保护）
+                    try {{
+                        const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+                        window.navigator.permissions.query = function(parameters) {{
+                            if (parameters && parameters.name === 'notifications') {{
+                                const _perm = (typeof Notification !== 'undefined') ? Notification.permission : 'denied';
+                                return Promise.resolve({{ state: _perm }});
+                            }}
+                            return originalQuery(parameters);
+                        }};
+                        Object.defineProperty(window.navigator.permissions.query, 'toString', {{
+                            value: function() {{ return 'function query() {{ [native code] }}'; }},
+                            configurable: true
+                        }});
+                    }} catch(e) {{}}
                     
 
                     // ========== 2. 补充真实浏览器属性 ==========
-                    // 模拟plugins
+                    // 模拟plugins（不使用DOM创建，init_script时document.body为null）
                     if (!navigator.plugins.length) {{
-                        const pluginClasses = [
-                            {{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' }},
-                            {{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' }},
-                            {{ name: 'Native Client', filename: 'internal-nacl-plugin' }}
-                        ];
-                        
-                        const createPlugin = (info) => {{
-                            const plugin = document.createElement('embed');
-                            plugin.setAttribute('name', info.name);
-                            plugin.setAttribute('src', '');
-                            plugin.setAttribute('type', 'application/x-google-chrome-pdf');
-                            plugin.style.display = 'none';
-                            document.body.appendChild(plugin);
-                            return plugin;
+                        const _makePlugin = (name, filename, desc) => {{
+                            const p = Object.create(Plugin.prototype);
+                            Object.defineProperties(p, {{
+                                name: {{ value: name, enumerable: true }},
+                                filename: {{ value: filename, enumerable: true }},
+                                description: {{ value: desc || '', enumerable: true }},
+                                length: {{ value: 1, enumerable: true }}
+                            }});
+                            return p;
                         }};
-                        
+                        const _plugins = [
+                            _makePlugin('Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'),
+                            _makePlugin('Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', 'Portable Document Format'),
+                            _makePlugin('Native Client', 'internal-nacl-plugin', 'Native Client Executable')
+                        ];
                         Object.defineProperty(navigator, 'plugins', {{
-                            value: pluginClasses.map(createPlugin),
-                            writable: false,
-                            configurable: false
+                            get: function() {{ return _plugins; }},
+                            configurable: true
                         }});
                     }}
                     
                     // 模拟mimeTypes
                     if (!navigator.mimeTypes.length) {{
-                        const mimeTypes = [
+                        const _mimes = [
                             {{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }},
                             {{ type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' }},
                             {{ type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }}
                         ];
-                        
                         Object.defineProperty(navigator, 'mimeTypes', {{
-                            value: mimeTypes,
-                            writable: false,
-                            configurable: false
+                            get: function() {{ return _mimes; }},
+                            configurable: true
                         }});
                     }}
                     
@@ -10280,23 +10305,52 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         }});
                         CanvasRenderingContext2D.prototype.getImageData = _hookedGetImageData;
                         const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                        HTMLCanvasElement.prototype.toDataURL = function() {{
+                        const _hookedToDataURL = function() {{
                             try {{
                                 const ctx = this.getContext('2d');
                                 if (ctx) {{ ctx.getImageData(0, 0, Math.max(1,this.width), Math.max(1,this.height)); }}
                             }} catch(e) {{}}
                             return _origToDataURL.apply(this, arguments);
                         }};
+                        Object.defineProperty(_hookedToDataURL, 'toString', {{
+                            value: function() {{ return 'function toDataURL() {{ [native code] }}'; }},
+                            configurable: true
+                        }});
+                        HTMLCanvasElement.prototype.toDataURL = _hookedToDataURL;
                         const _origToBlob = HTMLCanvasElement.prototype.toBlob;
                         if (_origToBlob) {{
-                            HTMLCanvasElement.prototype.toBlob = function() {{
+                            const _hookedToBlob = function() {{
                                 try {{
                                     const ctx = this.getContext('2d');
                                     if (ctx) {{ ctx.getImageData(0, 0, Math.max(1,this.width), Math.max(1,this.height)); }}
                                 }} catch(e) {{}}
                                 return _origToBlob.apply(this, arguments);
                             }};
+                            Object.defineProperty(_hookedToBlob, 'toString', {{
+                                value: function() {{ return 'function toBlob() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                            HTMLCanvasElement.prototype.toBlob = _hookedToBlob;
                         }}
+                        // measureText 噪声（防止通过字体宽度测量生成指纹）
+                        const _origMeasureText = CanvasRenderingContext2D.prototype.measureText;
+                        const _hookedMeasureText = function(text) {{
+                            const metrics = _origMeasureText.call(this, text);
+                            // 对宽度添加微小噪声（±0.1-0.5px，基于种子稳定）
+                            try {{
+                                const _noise = ((_rnd() - 0.5) * 0.8);
+                                Object.defineProperty(metrics, 'width', {{
+                                    value: metrics.width + _noise,
+                                    writable: false
+                                }});
+                            }} catch(e) {{}}
+                            return metrics;
+                        }};
+                        Object.defineProperty(_hookedMeasureText, 'toString', {{
+                            value: function() {{ return 'function measureText() {{ [native code] }}'; }},
+                            configurable: true
+                        }});
+                        CanvasRenderingContext2D.prototype.measureText = _hookedMeasureText;
                     }})();
                     
                     // WebGL：UNMASKED_VENDOR(37445)/UNMASKED_RENDERER(37446) 返回真实GPU字符串，覆盖 WebGL1+WebGL2
@@ -10322,7 +10376,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         try {{ _patch(WebGL2RenderingContext.prototype); }} catch(e) {{}}
                     }})();
                     
-                    // ========== 3.1 硬件信息注入（hardwareConcurrency / deviceMemory） ==========
+                    // ========== 3.1 硬件信息注入（hardwareConcurrency / deviceMemory / connection） ==========
                     try {{
                         Object.defineProperty(navigator, 'hardwareConcurrency', {{
                             get: function() {{ return {hardware_concurrency}; }}, configurable: true
@@ -10332,6 +10386,25 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         Object.defineProperty(navigator, 'deviceMemory', {{
                             get: function() {{ return {device_memory}; }}, configurable: true
                         }});
+                    }} catch(e) {{}}
+                    // Network Information API（headless模式可能缺失或异常，补充真实值）
+                    try {{
+                        if (!navigator.connection) {{
+                            Object.defineProperty(navigator, 'connection', {{
+                                get: function() {{
+                                    return {{
+                                        effectiveType: '4g',
+                                        rtt: 50,
+                                        downlink: 10,
+                                        saveData: false,
+                                        onchange: null,
+                                        addEventListener: function() {{}},
+                                        removeEventListener: function() {{}}
+                                    }};
+                                }},
+                                configurable: true
+                            }});
+                        }}
                     }} catch(e) {{}}
                     
                     // ========== 3.2 媒体设备伪造（替代粗暴删除，返回合理设备列表） ==========
@@ -10389,11 +10462,31 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         configurable: false
                     }});
                     
-                    Object.defineProperty(navigator, 'languages', {{
-                        value: ["{browser_locale}", "en-US", "en"],
-                        writable: false,
-                        configurable: false
-                    }});
+                    // 语言列表：根据实际locale生成合理的回退链（不同语言环境不应总是en-US回退）
+                    (function() {{
+                        const _loc = "{browser_locale}";
+                        const _langPrefix = _loc.split('-')[0];
+                        let _langs = [_loc];
+                        // 根据语言前缀生成合理的回退链
+                        const _fallbacks = {{
+                            'zh': ['zh-CN', 'zh', 'en-US', 'en'],
+                            'ja': ['ja-JP', 'ja', 'en-US', 'en'],
+                            'ko': ['ko-KR', 'ko', 'en-US', 'en'],
+                            'de': ['de-DE', 'de', 'en-US', 'en'],
+                            'fr': ['fr-FR', 'fr', 'en-US', 'en'],
+                            'es': ['es-ES', 'es', 'en-US', 'en'],
+                            'pt': ['pt-BR', 'pt', 'en-US', 'en'],
+                            'ru': ['ru-RU', 'ru', 'en-US', 'en'],
+                            'en': ['en-US', 'en']
+                        }};
+                        _langs = _fallbacks[_langPrefix] || [_loc, _langPrefix, 'en-US', 'en'];
+                        // 确保当前locale在第一位
+                        if (_langs[0] !== _loc) {{ _langs = [_loc].concat(_langs.filter(function(l){{ return l !== _loc; }})); }}
+                        Object.defineProperty(navigator, 'languages', {{
+                            get: function() {{ return Object.freeze(_langs.slice()); }},
+                            configurable: true
+                        }});
+                    }})();
                     
                     // ========== 4.1 时区覆盖（与 context timezone_id 双保险）==========
                     // - 用自定义 Intl.DateTimeFormat.resolvedOptions() 返回目标时区
@@ -10413,12 +10506,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             for (const part of parts) {{
                                 if (part.type === "timeZoneName") {{
                                     // 例如 "GMT+5" / "GMT-8" / "UTC"
-                                    const m = part.value.match(/GMT([+-]?)(\d+)?(?::(\d+))?/);
+                                    const m = part.value.match(/GMT([+-]?)([\d]+)?(?::([\d]+))?/);
                                     if (m) {{
                                         const sign = m[1] === "-" ? -1 : 1;
                                         const h = parseInt(m[2] || "0", 10);
                                         const mi = parseInt(m[3] || "0", 10);
-                                        _offsetMin = sign * (h * 60 + mi);  // getTimezoneOffset 的约定：UTC-西为正
+                                        // getTimezoneOffset 约定：UTC+8 返回 -480，UTC-5 返回 +300
+                                        _offsetMin = -(sign * (h * 60 + mi));
                                     }}
                                 }}
                             }}
@@ -10437,48 +10531,63 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     }})();
                     
                     // ========== 5. 其他指纹伪装 ==========
-                    // 隐藏chrome.runtime
+                    // chrome.runtime 保留对象但限制敏感API（完全删除会被检测）
                     if (window.chrome) {{
-                        delete window.chrome.runtime;
+                        if (!window.chrome.runtime) {{
+                            window.chrome.runtime = {{}};
+                        }}
+                        // 删除可能暴露自动化的属性，保留基本结构
+                        delete window.chrome.runtime.connectNative;
+                        delete window.chrome.runtime.sendNativeMessage;
+                    }} else {{
+                        // 非 Chrome 环境补充 chrome 对象
+                        window.chrome = {{ runtime: {{}}, loadTimes: function(){{}}, csi: function(){{}} }};
                     }}
                     
-                    // 模拟真实的窗口属性
-                    Object.defineProperty(window, 'outerWidth', {{
-                        value: {width},
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    Object.defineProperty(window, 'outerHeight', {{
-                        value: {height},
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    // 模拟真实的屏幕属性
-                    Object.defineProperty(screen, 'width', {{
-                        value: {width},
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    Object.defineProperty(screen, 'height', {{
-                        value: {height},
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    Object.defineProperty(screen, 'availWidth', {{
-                        value: {width},
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    Object.defineProperty(screen, 'availHeight', {{
-                        value: {height},
-                        writable: false,
-                        configurable: false
-                    }});
+                    // 模拟真实的窗口属性（outerWidth/Height 必须大于 innerWidth/Height，因为浏览器UI框架占用空间）
+                    (function() {{
+                        const _vw = {width};
+                        const _vh = {height};
+                        // 真实浏览器：outerWidth = innerWidth + 左右滚动条/边框(0-16px)
+                        // outerHeight = innerHeight + 工具栏+标签栏+地址栏(85-120px)
+                        const _chromeBarH = 85 + Math.floor(Math.random() * 30);  // 85-115px
+                        const _scrollbarW = Math.random() > 0.5 ? 15 : 0;  // 部分系统有滚动条
+                        Object.defineProperty(window, 'outerWidth', {{
+                            get: function() {{ return _vw + _scrollbarW; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(window, 'outerHeight', {{
+                            get: function() {{ return _vh + _chromeBarH; }},
+                            configurable: true
+                        }});
+                        // screen 属性：屏幕分辨率 >= 视口，availHeight < height（任务栏/Dock占用）
+                        const _taskbarH = Math.random() > 0.5 ? 40 : 48;  // Windows任务栏40px / macOS Dock 48px
+                        Object.defineProperty(screen, 'width', {{
+                            get: function() {{ return _vw; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(screen, 'height', {{
+                            get: function() {{ return _vh; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(screen, 'availWidth', {{
+                            get: function() {{ return _vw; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(screen, 'availHeight', {{
+                            get: function() {{ return _vh - _taskbarH; }},
+                            configurable: true
+                        }});
+                        // colorDepth / pixelDepth
+                        Object.defineProperty(screen, 'colorDepth', {{
+                            get: function() {{ return {color_depth}; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(screen, 'pixelDepth', {{
+                            get: function() {{ return {color_depth}; }},
+                            configurable: true
+                        }});
+                    }})();
                 """)
                 
                 # ========== 安装隐私保护扩展 ==========
@@ -10802,8 +10911,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         )
                         for _ridx in range(chapter_loop_count):
                             log.info(
-                                f"📊 第{_ridx+1}轮每层停留(L1-L6): "
-                                + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(6))
+                                f"📊 第{_ridx+1}轮每层停留(L1-L5): "
+                                + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(min(5, len(round_layer_stays[_ridx]))))
                             )
     
                         # ========== 第 1 步：访问首页（layer_1） ==========

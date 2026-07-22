@@ -1710,6 +1710,13 @@ class Chromium:
 
         # 禁用自动化控制特征
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        # 防止 headless 模式下页面被后台节流（定时器/网络请求被降速）
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        # 禁用信息栏和默认浏览器检查（避免额外UI干扰）
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-default-browser-check")
 
         # 终极修复：Selenium 4.45+ 会自动调用 Selenium Manager
         # 已移除系统中的旧版 chromedriver v108，Selenium Manager 将自动下载 v149
