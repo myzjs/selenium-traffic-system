@@ -9360,7 +9360,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
     # ========== Step A: 获取任务清单
     if single_task:
-        import random
         log.info("🧪 单独任务模式：不使用/不生成计划，仅立即执行网站任务")
         try:
             task_count = max(1, min(999, int(config.get("adsl_task_count", 1) or 1))) if adsl_ip_task else 1
@@ -12998,10 +12997,32 @@ if __name__ == "__main__":
     try:
         with open('config.json', 'r') as f:
             loaded_config = json.load(f)
-            # 确保 proxy_pool 存在且有所有国家
+            # 确保 proxy_pool 存在且有所有国家（补全缺失国家，但保留用户已配置的 api_url/user/pwd/enabled）
             if 'proxy_pool' not in loaded_config or len(loaded_config['proxy_pool']) < 10:
-                log.info("配置文件中的 proxy_pool 不完整，使用默认配置")
-                loaded_config['proxy_pool'] = config['proxy_pool']
+                log.info("配置文件中的 proxy_pool 不完整，补全国家并保留已配置的代理凭据")
+                # 按国家代码索引用户已配置的代理
+                loaded_by_country = {
+                    p.get('country_code'): p
+                    for p in loaded_config.get('proxy_pool', [])
+                    if isinstance(p, dict)
+                }
+                merged_pool = []
+                default_countries = set()
+                # 以默认池(全部国家)为骨架，命中用户配置则合并保留其凭据
+                for default_proxy in config.get('proxy_pool', []):
+                    cc = default_proxy.get('country_code')
+                    default_countries.add(cc)
+                    if cc in loaded_by_country:
+                        merged_proxy = copy.deepcopy(default_proxy)
+                        merged_proxy.update(copy.deepcopy(loaded_by_country[cc]))
+                        merged_pool.append(merged_proxy)
+                    else:
+                        merged_pool.append(copy.deepcopy(default_proxy))
+                # 追加默认池中没有、但用户额外配置的代理国家
+                for cc, p in loaded_by_country.items():
+                    if cc not in default_countries:
+                        merged_pool.append(copy.deepcopy(p))
+                loaded_config['proxy_pool'] = merged_pool
             # 对 web_navigation 做深合并，保留默认值中的新字段（loop_count/loop_interval/min_stay）
             def _merge_web_navigation(default_wn, loaded_wn):
                 if not isinstance(loaded_wn, dict):
