@@ -1591,6 +1591,7 @@ def ensure_config_defaults():
 
 
 task_running = False
+_single_task_mode = False  # 单独任务模式标志：不影响网站任务状态显示
 pending_plan = None
 current_task_idx = -1  # 当前正在执行的任务索引（-1表示无）
 current_plan = None    # 当前执行的计划
@@ -3235,10 +3236,7 @@ HTML_TEMPLATE = r"""
                         {{ '运行中' if runningtask else '已停止' }}
                     </span>
                 </div>
-                <div class="status-item">
-                    <span class="status-label">视频任务:</span>
-                    <span id="videoTopStatus" class="status stopped">已停止</span>
-                </div>
+
                 <div class="status-item">
                     <span class="status-label">总任务:</span>
                     <span class="stat-number">{{ planned_total if planned_total > 0 else 0 }}</span>
@@ -9325,13 +9323,14 @@ def check_ip_leak_robust(page, expected_ip):
         return "unreachable", expected_ip or "unreachable", "disabled"
 
 def worker_task(single_task=False, adsl_ip_task=False):
-    global task_running, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status
+    global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status
     stats["total"] = 0
     stats["success"] = 0
     stats["fail"] = 0
 
     log.info("任务已启动")
     task_running = True
+    _single_task_mode = single_task
     start_human_model("website_adsl" if adsl_ip_task else "website")
     if adsl_ip_task:
         adsl_status.update({
@@ -9352,10 +9351,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
             log.error(f"❌ 网页浏览模式配置错误，任务终止: {'; '.join(errors)}")
             stats["fail"] += 0
             task_running = False
+            _single_task_mode = False
             return
     except Exception as e:
         log.error(f"❌ 网页浏览模式配置校验出错: {str(e)}")
         task_running = False
+        _single_task_mode = False
         return
 
     # ========== Step A: 获取任务清单
@@ -9433,6 +9434,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
             log.error(f"❌ 单独任务创建堆栈: {_tb.format_exc()[:800]}")
             stats["fail"] += 1
             task_running = False
+            _single_task_mode = False
             current_task_idx = -1
             current_plan = None
             return
@@ -9452,6 +9454,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
             log.error(f"❌ 堆栈: {_tb.format_exc()[:800]}")
             stats["fail"] += 1
             task_running = False
+            _single_task_mode = False
             return
         current_plan = daily_plan  # 确保current_plan被正确设置
     total_tasks = daily_plan["total_tasks"]
@@ -10189,7 +10192,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.info(f"设置Referer头部: {generated_referer}")
                 else:
                     default_referers = ["https://www.google.com/", "https://www.bing.com/", "https://www.baidu.com/"]
-                    import random
                     default_referer = random.choice(default_referers)
                     extra_http_headers["Referer"] = default_referer
                     log.info(f"设置默认Referer头部: {default_referer}")
@@ -11023,7 +11025,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                         # ★ 修正逻辑：配置时长优先，保险绳保底
                         #   每轮独立随机，但总时长不超过7-9分钟保险绳
-                        import random
                         if enter_site_time is None:
                             enter_site_time = time.time()
                         task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机保险绳
@@ -11212,7 +11213,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "首页加载后")
 
                         # ========== 任务总时长保险绳（防止任务无限延长） ==========
-                        import random
                         task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机时长
                         
                         def _check_rope(stage_desc=""):
@@ -11668,6 +11668,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
     record_kpi_snapshot()
     
     task_running = False
+    _single_task_mode = False
     if adsl_ip_task:
         adsl_status["running"] = False
         adsl_status["status"] = "已停止" if adsl_status.get("completed", 0) < adsl_status.get("total", 0) else "完成"
@@ -11697,7 +11698,7 @@ def index():
     return render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
-                                  stats=stats, runningtask=task_running,
+                                  stats=stats, runningtask=(task_running and not _single_task_mode),
                                   planned_total=planned_total_tasks)
 
 
@@ -11713,7 +11714,7 @@ def get_global_task_status():
         human_model = dict(human_model_state)
     return jsonify({
         "website": {
-            "running": bool(task_running or qa_running),
+            "running": bool((task_running and not _single_task_mode) or qa_running),
             "current_task_idx": current_task_idx,
             "current_task": current_website_task,
             "total_tasks": current_plan['total_tasks'] if current_plan else 0
@@ -11728,12 +11729,12 @@ def get_global_task_status():
 @app.route('/get_website_task_status', methods=['GET'])
 def get_website_task_status():
     """获取网站流量任务状态"""
-    global task_running, current_task_idx, current_plan
+    global task_running, _single_task_mode, current_task_idx, current_plan
     current_task = None
     if current_plan and current_task_idx >= 0 and current_task_idx < len(current_plan.get('tasks', [])):
         current_task = current_plan['tasks'][current_task_idx]
     return jsonify({
-        "running": task_running,
+        "running": task_running and not _single_task_mode,
         "current_task_idx": current_task_idx,
         "current_task": current_task,
         "total_tasks": current_plan['total_tasks'] if current_plan else 0
@@ -12008,8 +12009,9 @@ def start_single_task():
 
 @app.route('/stop_task', methods=['POST'])
 def stop_task():
-    global task_running, adsl_status
+    global task_running, _single_task_mode, adsl_status
     task_running = False
+    _single_task_mode = False
     stop_human_model()
     if adsl_status.get("running"):
         adsl_status["status"] = "已停止"
@@ -12670,7 +12672,7 @@ def get_logs():
 @app.route('/api/status')
 def api_status():
     return jsonify({
-        "running": task_running,
+        "running": task_running and not _single_task_mode,
         "total": stats["total"],
         "success": stats["success"],
         "fail": stats["fail"],
