@@ -12999,8 +12999,8 @@ if __name__ == "__main__":
     try:
         with open('config.json', 'r') as f:
             loaded_config = json.load(f)
-            # 确保 proxy_pool 存在且有所有国家（补全缺失国家，但保留用户已配置的 api_url/user/pwd/enabled）
-            if 'proxy_pool' not in loaded_config or len(loaded_config['proxy_pool']) < 10:
+            # 确保 proxy_pool 存在（仅在完全缺失或为空时补全默认国家，尊重用户显式保存的配置）
+            if 'proxy_pool' not in loaded_config or not loaded_config.get('proxy_pool'):
                 log.info("配置文件中的 proxy_pool 不完整，补全国家并保留已配置的代理凭据")
                 # 按国家代码索引用户已配置的代理
                 loaded_by_country = {
