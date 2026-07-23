@@ -984,11 +984,14 @@ class Page:
             return script
         # 多行脚本
         if ";" in s or "\n" in s or s.startswith("("):
-            if s.startswith("(") and "=>" not in s[:100]:
-                return f"return {script};"
+            # 已调用的 IIFE（以 () 结尾）或括号表达式 => 直接 return
+            # 裸箭头函数（含 => 但未调用）=> 原样返回由上层处理
+            # 注：用 strip 后的 s 拼接，避免 return 后紧跟换行触发 JS 自动分号插入(ASI)
+            if s.startswith("(") and (s.endswith("()") or "=>" not in s[:100]):
+                return f"return {s};"
             return script
         # 单表达式
-        return f"return {script};"
+        return f"return {s};"
 
     def query_selector(self, selector: str) -> Optional[ElementHandle]:
         """查询单个元素"""

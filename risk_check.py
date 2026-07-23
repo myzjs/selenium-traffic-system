@@ -171,11 +171,12 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     auto_probe = {}
     auto_probe["nav_webdriver"] = page.evaluate("""
         (() => {
-            // 多重检测：直接属性 + prototype链
-            if (navigator.webdriver !== undefined) return true;
+            // 仅当自动化标志位为 true 时判定泄漏（真实浏览器返回 false，隐身返回 undefined）
+            if (navigator.webdriver === true) return true;
             try {
+                // 检测 prototype getter 是否被粗暴覆盖为非原生（劣质隐身）
                 const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
-                if (desc && desc.get) return true;
+                if (desc && desc.get && !Function.prototype.toString.call(desc.get).includes('native code')) return true;
             } catch(e) {}
             return false;
         })()
@@ -459,16 +460,20 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
         net["webrtc_leak_ip"] = page.evaluate("""
             (() => {
                 return new Promise(res => {
-                    const timer = setTimeout(() => res(false), 5000);
+                    let leaked = false;
+                    const timer = setTimeout(() => res(leaked), 5000);
                     try {
+                        if (typeof RTCPeerConnection === 'undefined') { clearTimeout(timer); res(false); return; }
                         const pc = new RTCPeerConnection({iceServers: []});
                         pc.createDataChannel('test');
                         pc.createOffer().then(o => pc.setLocalDescription(o));
                         pc.onicecandidate = e => {
-                            clearTimeout(timer);
-                            if (e.candidate) res(true);
-                            else res(false);
-                        }
+                            // 收集结束（null candidate）时判定
+                            if (!e.candidate) { clearTimeout(timer); res(leaked); return; }
+                            const c = e.candidate.candidate || '';
+                            // 仅内网/私有 IP 暴露才算泄漏（公网 host candidate 属正常）
+                            if (/(10\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|0\\.0\\.0\\.0)/.test(c)) leaked = true;
+                        };
                     }catch{clearTimeout(timer);res(false)}
                 })
             })()
@@ -944,20 +949,22 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
         risk_detail.append("🟠 permissions.query被覆盖（CDP特征）")
 
     # --- 指纹类 ---
-    if not canvas_data.get("has_noise_hook"):
+    # 噪声是否存在以行为一致性判定（raw!==raw2 说明有扰动），而非 toString（会被原生伪装欺骗）
+    canvas_noise_present = not canvas_data.get("consistent", True)
+    canvas_hook_detectable = canvas_data.get("has_noise_hook", False)
+    if not canvas_noise_present:
         score += RISK_WEIGHT["canvas_finger_no_noise"]
         risk_detail.append("🟠 Canvas指纹无噪声扰动")
-    if canvas_data.get("has_noise_hook"):
+    elif canvas_hook_detectable:
         score += RISK_WEIGHT["canvas_hook_detectable"]
         risk_detail.append("🟡 Canvas噪声hook可被检测（toString非native）")
-    if not webgl_info.get("has_hook"):
+    # WebGL 是否伪装以 renderer 是否为 headless/SwiftShader 判定，而非 toString
+    if webgl_info.get("renderer_suspicious"):
         score += RISK_WEIGHT["webgl_finger_no_noise"]
-        risk_detail.append("🟠 WebGL指纹未伪装")
-    if webgl_info.get("has_hook"):
+        risk_detail.append("🟠 WebGL指纹未伪装（headless/SwiftShader渲染器）")
+    elif webgl_info.get("has_hook"):
         score += RISK_WEIGHT["webgl_hook_detectable"]
         risk_detail.append("🟡 WebGL hook可被检测（getParameter toString非native）")
-    if webgl_info.get("renderer_suspicious"):
-        risk_detail.append("🟡 WebGL renderer字符串疑似固定伪造值")
 
     # --- 设备一致性 ---
     dev_con = device_cons.get("screen_vs_viewport", {})
@@ -1144,6 +1151,21 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
 
 _STEALTH_INIT_SCRIPT = r"""
 (function() {
+    // ===== 中心 toString 原生伪装：防御 Function.prototype.toString.call(fn) 检测（CreepJS/AdSense 核心检测点）=====
+    const _nativeMask = new Map();
+    try {
+        const _origToString = Function.prototype.toString;
+        const _maskedToString = function toString() {
+            if (_nativeMask.has(this)) return _nativeMask.get(this);
+            return _origToString.call(this);
+        };
+        _nativeMask.set(_maskedToString, 'function toString() { [native code] }');
+        Function.prototype.toString = _maskedToString;
+    } catch(e) {}
+    // 注册被hook函数为“原生样”，使其 toString 返回 native code 格式
+    const _maskNative = function(fn, name) {
+        try { _nativeMask.set(fn, 'function ' + name + '() { [native code] }'); } catch(e) {}
+    };
     try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true}); } catch(e) {}
     // 清除 cdc_ / 自动化残留
     try {
@@ -1166,8 +1188,8 @@ _STEALTH_INIT_SCRIPT = r"""
             try { const a=d.data; for (let i=0;i<a.length;i+=4){ if(_rnd()<0.02){ const n=(_rnd()*3|0)-1; a[i]=Math.max(0,Math.min(255,a[i]+n)); a[i+1]=Math.max(0,Math.min(255,a[i+1]+n)); a[i+2]=Math.max(0,Math.min(255,a[i+2]+n)); } } } catch(e) {}
             return d;
         };
-        // 让hooked函数的toString返回native code格式
-        Object.defineProperty(_hooked, 'toString', {value: function(){ return 'function getImageData() { [native code] }'; }});
+        // 注册到中心 toString 伪装（同时防御 fn.toString() 与 Function.prototype.toString.call(fn)）
+        _maskNative(_hooked, 'getImageData');
         CanvasRenderingContext2D.prototype.getImageData = _hooked;
     })();
     // WebGL hook（同样保护toString）- GPU指纹从真实设备池随机选择
@@ -1192,12 +1214,21 @@ _STEALTH_INIT_SCRIPT = r"""
                 if(p===37446) return _gpu.renderer;
                 return o.call(this,p);
             };
-            Object.defineProperty(hooked, 'toString', {value: function(){ return 'function getParameter() { [native code] }'; }});
+            _maskNative(hooked, 'getParameter');
             proto.getParameter = hooked;
         };
         try { patch(WebGLRenderingContext.prototype); } catch(e) {}
         try { patch(WebGL2RenderingContext.prototype); } catch(e) {}
     })();
+    // 屏幕尺寸伪造（headless 默认 800x600 小于视口，视口>屏幕是典型机器人指纹）
+    try {
+        const _sw = 1920, _sh = 1080;
+        Object.defineProperty(screen, 'width', {get: () => _sw, configurable: true});
+        Object.defineProperty(screen, 'height', {get: () => _sh, configurable: true});
+        Object.defineProperty(screen, 'availWidth', {get: () => _sw, configurable: true});
+        Object.defineProperty(screen, 'availHeight', {get: () => (_sh - 40), configurable: true});
+        Object.defineProperty(screen, 'colorDepth', {get: () => 24, configurable: true});
+    } catch(e) {}
     // plugins 伪造
     try {
         if (!navigator.plugins || navigator.plugins.length === 0) {
@@ -1207,9 +1238,11 @@ _STEALTH_INIT_SCRIPT = r"""
     // mediaDevices 伪造枚举
     try {
         if (navigator.mediaDevices) {
-            navigator.mediaDevices.enumerateDevices = function() {
+            const _enumDev = function enumerateDevices() {
                 return Promise.resolve([{deviceId:'default',kind:'audioinput',label:'',groupId:'g1'},{deviceId:'cam01',kind:'videoinput',label:'',groupId:'g2'}]);
             };
+            _maskNative(_enumDev, 'enumerateDevices');
+            navigator.mediaDevices.enumerateDevices = _enumDev;
         }
     } catch(e) {}
     // localStorage 随机化
@@ -1221,12 +1254,14 @@ _STEALTH_INIT_SCRIPT = r"""
     // permissions.query 保护（减少CDP检测面）
     try {
         const origQuery = navigator.permissions.query;
-        navigator.permissions.query = function(params) {
+        const _hookedQuery = function query(params) {
             if (params && params.name === 'notifications') {
                 return Promise.resolve({state: Notification.permission});
             }
             return origQuery.call(this, params);
         };
+        _maskNative(_hookedQuery, 'query');
+        navigator.permissions.query = _hookedQuery;
     } catch(e) {}
 })();
 """

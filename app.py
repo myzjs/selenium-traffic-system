@@ -3819,6 +3819,33 @@ HTML_TEMPLATE = r"""
                     <!-- 探索结果摘要 -->
                     <div id="keywordResult" style="display:none;background:#0f172a;border-radius:8px;padding:14px;margin-top:12px;font-size:13px;line-height:1.7;"></div>
                 </div>
+
+                <!-- 生产准入五层测试面板 -->
+                <div class="seo-panel" style="margin-top:20px; border:2px solid #22c55e;">
+                    <h4 style="margin-top:0; color:#22c55e;">🏭 生产准入五层测试</h4>
+                    <p style="color:#94a3b8;font-size:13px;margin-top:0;">任一条不达标 = 禁止上线。对应“代码检查／环境伪装／对抗验证／真人行为验证／工程可靠性”五层，汇总 8 项准入检查单。</p>
+                    <!-- 五层按钮 -->
+                    <div style="display:flex; flex-wrap:wrap; gap:8px; margin:12px 0;">
+                        <button class="btn" style="background:#3b82f6;color:#fff;" onclick="startProductionTest('code')">📝 代码检查</button>
+                        <button class="btn" style="background:#8b5cf6;color:#fff;" onclick="startProductionTest('env')">🕵️ 环境伪装</button>
+                        <button class="btn" style="background:#ef4444;color:#fff;" onclick="startProductionTest('adversarial')">⚔️ 对抗验证</button>
+                        <button class="btn" style="background:#f59e0b;color:#fff;" onclick="startProductionTest('behavior')">🧍 真人行为验证</button>
+                        <button class="btn" style="background:#06b6d4;color:#fff;" onclick="startProductionTest('reliability')">🔧 工程可靠性</button>
+                        <button class="btn" style="background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;" onclick="startProductionTest('all')">🚀 全量准入测试</button>
+                    </div>
+                    <!-- 进度条 -->
+                    <div id="prodTestProgress" style="display:none; margin:16px 0;">
+                        <div style="display:flex;justify-content:space-between;font-size:13px;color:#cbd5e1;margin-bottom:6px;">
+                            <span id="prodTestStage">准备中...</span>
+                            <span id="prodTestPercent">0%</span>
+                        </div>
+                        <div style="width:100%;height:18px;background:#1e293b;border-radius:9px;overflow:hidden;">
+                            <div id="prodTestBar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width .4s ease;"></div>
+                        </div>
+                    </div>
+                    <!-- 准入检查单报告 -->
+                    <div id="prodTestReport" style="display:none;margin-top:12px;"></div>
+                </div>
             </div>
             
             <!-- 原网页跳转配置Tab，现在改名为网站流量 -->
@@ -5335,6 +5362,122 @@ HTML_TEMPLATE = r"""
             
             document.getElementById('drillResult').style.display = 'block';
             document.getElementById('drillResult').innerHTML = html;
+        }
+        
+        // ===== 生产准入五层测试 =====
+        let _prodTestPolling = null;
+        function startProductionTest(layers) {
+            document.querySelectorAll('#tab-taskvalidation button[onclick^="startProductionTest"]').forEach(b => b.disabled = true);
+            document.getElementById('prodTestReport').style.display = 'none';
+            document.getElementById('prodTestProgress').style.display = 'block';
+            setProdTestProgress(0, '启动中...');
+            fetch('/start_production_test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({layers: layers, headless: true})
+            }).then(r => r.json()).then(d => {
+                if (!d.success) {
+                    alert('启动失败: ' + (d.message || '未知错误'));
+                    enableProdTestButtons();
+                    document.getElementById('prodTestProgress').style.display = 'none';
+                    return;
+                }
+                _prodTestPolling = setInterval(pollProductionTest, 1000);
+            }).catch(e => {
+                alert('请求异常: ' + e);
+                enableProdTestButtons();
+                document.getElementById('prodTestProgress').style.display = 'none';
+            });
+        }
+        function enableProdTestButtons() {
+            document.querySelectorAll('#tab-taskvalidation button[onclick^="startProductionTest"]').forEach(b => b.disabled = false);
+        }
+        function setProdTestProgress(pct, stage) {
+            document.getElementById('prodTestBar').style.width = pct + '%';
+            document.getElementById('prodTestPercent').textContent = pct + '%';
+            document.getElementById('prodTestStage').textContent = stage || '';
+        }
+        function pollProductionTest() {
+            fetch('/get_production_test_status').then(r => r.json()).then(d => {
+                setProdTestProgress(d.progress || 0, d.stage || '');
+                if (!d.running) {
+                    clearInterval(_prodTestPolling);
+                    _prodTestPolling = null;
+                    enableProdTestButtons();
+                    renderProductionReport(d);
+                }
+            }).catch(() => {});
+        }
+        // 渲染生产准入检查单报告
+        function renderProductionReport(data) {
+            const gate = data.gate;
+            const layers = data.layers || {};
+            let html = '';
+            if (!gate) {
+                html = '<div style="background:#7f1d1d;border-radius:8px;padding:14px;color:#fecaca;">测试未产生有效报告，请查看运行日志。</div>';
+                document.getElementById('prodTestReport').style.display = 'block';
+                document.getElementById('prodTestReport').innerHTML = html;
+                return;
+            }
+            // 1. 总体结论横幅
+            const allPass = gate.all_pass;
+            const bannerBg = allPass ? 'linear-gradient(135deg,#16a34a,#22c55e)' : 'linear-gradient(135deg,#dc2626,#ef4444)';
+            html += '<div style="background:' + bannerBg + ';border-radius:10px;padding:16px;margin-bottom:14px;text-align:center;">';
+            html += '<div style="font-size:18px;font-weight:bold;color:#fff;">' + gate.verdict + '</div>';
+            html += '<div style="font-size:13px;color:rgba(255,255,255,.9);margin-top:6px;">达标 ' + gate.pass_count + ' / ' + gate.total + ' 项 · ' + gate.time + '</div>';
+            html += '</div>';
+            // 2. 生产准入检查单（8项）
+            html += '<div style="background:#0f172a;border:2px solid #334155;border-radius:10px;padding:14px;margin-bottom:14px;">';
+            html += '<div style="font-size:15px;font-weight:bold;color:#f59e0b;margin-bottom:10px;text-align:center;">📋 生产准入检查单（任一条不达标 = 禁止上线）</div>';
+            html += '<table style="width:100%;border-collapse:collapse;font-size:13px;">';
+            html += '<thead><tr style="background:#1e293b;color:#93c5fd;">';
+            html += '<th style="padding:8px;text-align:left;border-bottom:1px solid #334155;">编号</th>';
+            html += '<th style="padding:8px;text-align:left;border-bottom:1px solid #334155;">检查项</th>';
+            html += '<th style="padding:8px;text-align:left;border-bottom:1px solid #334155;">准入阈值</th>';
+            html += '<th style="padding:8px;text-align:left;border-bottom:1px solid #334155;">实测</th>';
+            html += '<th style="padding:8px;text-align:center;border-bottom:1px solid #334155;">结论</th>';
+            html += '</tr></thead><tbody>';
+            for (const it of gate.items) {
+                const stColor = it.status === 'pass' ? '#22c55e' : (it.status === 'manual' ? '#f59e0b' : '#ef4444');
+                html += '<tr style="border-bottom:1px solid #1e293b;">';
+                html += '<td style="padding:8px;color:#fbbf24;font-weight:bold;">' + it.gate + '</td>';
+                html += '<td style="padding:8px;color:#e2e8f0;">' + it.name + '</td>';
+                html += '<td style="padding:8px;color:#94a3b8;">' + it.threshold + '</td>';
+                html += '<td style="padding:8px;color:#cbd5e1;font-size:12px;">' + (it.value || '-') + '</td>';
+                html += '<td style="padding:8px;text-align:center;color:' + stColor + ';font-weight:bold;">' + it.status_text + '</td>';
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            // 3. 各层明细（折叠）
+            html += '<details style="margin-bottom:12px;">';
+            html += '<summary style="cursor:pointer;color:#93c5fd;font-size:14px;font-weight:bold;">🔬 五层检测明细（点击展开）</summary>';
+            html += '<div style="margin-top:10px;">';
+            const layerOrder = ['code','env','adversarial','behavior','reliability'];
+            for (const lid of layerOrder) {
+                const lr = layers[lid];
+                if (!lr) continue;
+                const lhColor = lr.passed ? '#22c55e' : (lr.error ? '#f59e0b' : '#ef4444');
+                const lhIcon = lr.passed ? '✅' : (lr.error ? '⚠️' : '❌');
+                html += '<div style="background:#0f172a;border-radius:8px;padding:12px;margin-bottom:10px;border-left:4px solid ' + lhColor + ';">';
+                html += '<div style="font-size:14px;font-weight:bold;color:' + lhColor + ';margin-bottom:8px;">' + lhIcon + ' ' + lr.name + ' <span style="color:#64748b;font-size:12px;font-weight:normal;">(耗时 ' + lr.elapsed + 's)</span></div>';
+                if (lr.error) html += '<div style="color:#fca5a5;font-size:12px;margin-bottom:6px;">异常: ' + lr.error + '</div>';
+                for (const c of (lr.checks || [])) {
+                    const cColor = c.status === 'pass' ? '#22c55e' : (c.status === 'manual' ? '#f59e0b' : (c.status === 'info' ? '#93c5fd' : '#ef4444'));
+                    const cIcon = c.status === 'pass' ? '✅' : (c.status === 'manual' ? '🟡' : (c.status === 'info' ? 'ℹ️' : '❌'));
+                    html += '<div style="padding:6px 0;border-bottom:1px dashed #1e293b;font-size:12px;">';
+                    html += '<div style="color:#e2e8f0;">' + cIcon + ' <strong>' + c.name + '</strong>：' + (c.value || '') + ' <span style="color:#64748b;">(阈值 ' + (c.threshold || '') + ')</span></div>';
+                    if (c.detail) html += '<div style="color:#94a3b8;margin-top:2px;padding-left:22px;">' + c.detail + '</div>';
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            html += '</div></details>';
+            // 4. 报告路径
+            if (data.report_path) {
+                html += '<div style="color:#94a3b8;font-size:12px;">📄 完整报告已保存: ' + data.report_path + '</div>';
+            }
+            document.getElementById('prodTestReport').style.display = 'block';
+            document.getElementById('prodTestReport').innerHTML = html;
         }
         
         // ===== 关键词探索 =====
@@ -11997,6 +12140,86 @@ def get_security_drill_status():
         "full_report": _drill_state.get("full_report"),  # 新增：返回完整报告
         "json_path": _drill_state["json_path"],
         "html_path": _drill_state["html_path"],
+    })
+
+
+# ===== 生产准入五层测试（production_test.py）状态与路由 =====
+_prodtest_state = {
+    "running": False, "progress": 0, "stage": "未开始",
+    "layers": {}, "gate": None, "report_path": None, "logs": [],
+}
+_prodtest_lock = threading.Lock()
+
+
+def _run_production_test_thread(layers, headless, target_url):
+    global _prodtest_state
+    try:
+        import production_test
+
+        def _log_fn(msg):
+            log.info(f"[生产准入] {msg}")
+            _prodtest_state["logs"].append(str(msg))
+            if len(_prodtest_state["logs"]) > 300:
+                _prodtest_state["logs"] = _prodtest_state["logs"][-300:]
+
+        def _progress_fn(pct, stage):
+            _prodtest_state["progress"] = int(pct)
+            _prodtest_state["stage"] = stage
+
+        result = production_test.run_production_test(
+            layers=layers, progress=_progress_fn, log=_log_fn,
+            config=config, target_url=target_url, headless=headless,
+        )
+        _prodtest_state["layers"] = result.get("layers", {})
+        _prodtest_state["gate"] = result.get("gate")
+        _prodtest_state["report_path"] = result.get("report_path")
+        _prodtest_state["stage"] = "完成"
+        _prodtest_state["progress"] = 100
+    except Exception as e:
+        log.error(f"[生产准入] 执行失败: {type(e).__name__}: {str(e)[:160]}")
+        _prodtest_state["stage"] = f"异常: {type(e).__name__}"
+    finally:
+        _prodtest_state["running"] = False
+
+
+@app.route('/start_production_test', methods=['POST'])
+def start_production_test():
+    global _prodtest_state
+    with _prodtest_lock:
+        if _prodtest_state["running"]:
+            return jsonify({"status": "error", "success": False, "message": "已有生产准入测试正在运行"}), 409
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        layers = body.get("layers") or "all"
+        headless = bool(body.get("headless", True))
+        # 从配置取第一个已勾选目标站（L3对抗验证需要真实目标）
+        target_url = ""
+        _urls_cfg = config.get("target_urls")
+        if isinstance(_urls_cfg, list) and _urls_cfg:
+            target_url = next((item.get("url", "").strip() for item in _urls_cfg
+                               if item.get("enabled") and item.get("url", "").strip()), "")
+        if not target_url:
+            target_url = config.get("target_url", "") or ""
+        _prodtest_state.update({"running": True, "progress": 0, "stage": "启动中",
+                                "layers": {}, "gate": None, "report_path": None, "logs": []})
+    from threading import Thread
+    Thread(target=_run_production_test_thread, args=(layers, headless, target_url), daemon=True).start()
+    log.info(f"✅ 生产准入测试线程已启动，层级: {layers}")
+    return jsonify({"status": "ok", "success": True, "message": "生产准入测试已启动", "layers": layers})
+
+
+@app.route('/get_production_test_status')
+def get_production_test_status():
+    return jsonify({
+        "running": _prodtest_state["running"],
+        "progress": _prodtest_state["progress"],
+        "stage": _prodtest_state["stage"],
+        "layers": _prodtest_state["layers"],
+        "gate": _prodtest_state["gate"],
+        "report_path": _prodtest_state["report_path"],
+        "logs": _prodtest_state["logs"][-60:],
     })
 
 
