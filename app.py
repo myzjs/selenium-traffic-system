@@ -10959,6 +10959,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # ========== [新增] 真搜索跳转流程 ==========
                         search_mode = config.get("seo", {}).get("search_mode", "direct_referer")
                         already_on_target = False
+                        current_x, current_y = 0, 0  # 初始化鼠标坐标（避免 UnboundLocalError）
                         if search_mode == "real_search":
                             # 执行完整搜索跳转流程（带真人模拟，支持所有搜索引擎）
                             search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config)
