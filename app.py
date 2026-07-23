@@ -8161,14 +8161,24 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
         f"（关键词={text_list}, fallback={len(fallback_urls or [])}个, final_fallback={bool(final_fallback_url)}）"
     )
 
-    # 先尝试正常的链接点击（关键词或 href 匹配）
+    # 先尝试正常的链接点击（关键词或 href 匹配）——加30秒总超时，避免代理慢导致卡死
     try:
         _has_kw = bool(text_list and any(str(k).strip() for k in text_list))
         if _has_kw:
-            success, new_x, new_y = click_link_containing_text(page, text_list, current_x, current_y, config)
-            if success:
-                log.info("✅ 通过关键词链接跳转成功")
-                return True, new_x, new_y
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+            def _do_click():
+                return click_link_containing_text(page, text_list, current_x, current_y, config)
+            try:
+                with ThreadPoolExecutor(max_workers=1) as _ex:
+                    _fut = _ex.submit(_do_click)
+                    success, new_x, new_y = _fut.result(timeout=30)
+                if success:
+                    log.info("✅ 通过关键词链接跳转成功")
+                    return True, new_x, new_y
+            except _FutTimeout:
+                log.warning("⚠️ 关键词链接查找超时(30s)，跳过直接走兜底URL")
+            except Exception as e:
+                log.warning(f"⚠️ click_link_containing_text 异常: {str(e)[:80]}")
     except Exception as e:
         log.warning(f"⚠️ click_link_containing_text 异常: {str(e)[:80]}")
 
@@ -8184,7 +8194,7 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
         for url in _fbs:
             try:
                 log.info(f"🚀 尝试兜底URL: {url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 time.sleep(random.uniform(2, 4))
                 log.info(f"✅ 兜底URL跳转成功：{url}")
                 return True, current_x or 300, current_y or 300
@@ -8279,7 +8289,7 @@ def click_chapter_page_link(page, current_x, current_y, config, keywords=None, f
         for url in fallback_urls:
             try:
                 log.info(f"🚀 尝试兜底URL：{url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 time.sleep(random.uniform(2, 4))
                 log.info(f"✅ 兜底URL跳转成功：{url}")
                 return True, current_x or 300, current_y or 300
@@ -11699,7 +11709,7 @@ def index():
     return render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
-                                  stats=stats, runningtask=(task_running and not _single_task_mode),
+                                  stats=stats, runningtask=task_running,
                                   planned_total=planned_total_tasks)
 
 
@@ -11715,7 +11725,7 @@ def get_global_task_status():
         human_model = dict(human_model_state)
     return jsonify({
         "website": {
-            "running": bool((task_running and not _single_task_mode) or qa_running),
+            "running": bool(task_running or qa_running),
             "current_task_idx": current_task_idx,
             "current_task": current_website_task,
             "total_tasks": current_plan['total_tasks'] if current_plan else 0
@@ -11735,7 +11745,7 @@ def get_website_task_status():
     if current_plan and current_task_idx >= 0 and current_task_idx < len(current_plan.get('tasks', [])):
         current_task = current_plan['tasks'][current_task_idx]
     return jsonify({
-        "running": task_running and not _single_task_mode,
+        "running": task_running,
         "current_task_idx": current_task_idx,
         "current_task": current_task,
         "total_tasks": current_plan['total_tasks'] if current_plan else 0
@@ -12673,7 +12683,7 @@ def get_logs():
 @app.route('/api/status')
 def api_status():
     return jsonify({
-        "running": task_running and not _single_task_mode,
+        "running": task_running,
         "total": stats["total"],
         "success": stats["success"],
         "fail": stats["fail"],
