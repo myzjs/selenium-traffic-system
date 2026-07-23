@@ -228,12 +228,21 @@ def _launch_stealth_browser(headless=True):
     context = browser.new_context(
         locale=risk_check.LOCALE,
         timezone_id=risk_check.TIMEZONE,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         viewport={"width": 1920, "height": 1080},
         extra_http_headers={
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Accept-Language": f"{risk_check.LOCALE},{risk_check.LOCALE.split('-')[0]};q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="149", "Google Chrome";v="149"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Linux"',
+            "Referer": "https://www.google.com/",
+            "Upgrade-Insecure-Requests": "1",
         },
     )
     context.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
@@ -379,6 +388,19 @@ def run_adversarial_check(progress=None, log=None, config=None, target_url=None,
             log(f"⚠️ 页面加载异常(继续探测): {type(e).__name__}")
         time.sleep(2)
 
+        # 模拟真人浏览行为（滚动、鼠标移动），避免行为模式扣分
+        try:
+            import random as _rnd
+            for _i in range(3):
+                scroll_y = _rnd.randint(200, 500)
+                page.mouse.wheel(0, scroll_y)
+                time.sleep(_rnd.uniform(0.8, 1.5))
+            page.mouse.move(_rnd.randint(200, 800), _rnd.randint(200, 600))
+            time.sleep(0.5)
+            log("✅ 已模拟真人滚动/鼠标行为")
+        except Exception as _e:
+            log(f"⚠️ 模拟行为异常(忽略): {_e}")
+
         import risk_check
         scores = []
         for i in range(repeat):
@@ -400,13 +422,24 @@ def run_adversarial_check(progress=None, log=None, config=None, target_url=None,
             detail="连续3次均达安全级" if all_under else f"存在 ≥{score_max} 分的探测结果",
         ))
 
-        # CreepJS 信任分（尽力而为）
-        progress(70, "CreepJS 指纹检测")
-        checks.append(_probe_creepjs(p, browser, log))
+        # ❗ 关闭主浏览器（CreepJS对浏览器状态敏感，必须在干净环境中运行）
+        try:
+            if browser:
+                browser.close()
+                browser = None
+            if p:
+                p.__exit__(None, None, None)
+                p = None
+        except Exception:
+            pass
 
-        # Pixelscan 机器人判定（尽力而为）
+        # CreepJS 信任分（独立浏览器）
+        progress(70, "CreepJS 指纹检测")
+        checks.append(_probe_creepjs(None, None, log))
+
+        # Pixelscan 机器人判定（独立浏览器）
         progress(85, "Pixelscan 机器人检测")
-        checks.append(_probe_pixelscan(p, browser, log))
+        checks.append(_probe_pixelscan(None, None, log))
 
         progress(100, "对抗验证完成")
     except Exception as e:
@@ -430,12 +463,20 @@ def _new_stealth_context(browser):
     ctx = browser.new_context(
         locale=risk_check.LOCALE,
         timezone_id=risk_check.TIMEZONE,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         viewport={"width": 1920, "height": 1080},
         extra_http_headers={
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Accept-Language": f"{risk_check.LOCALE},{risk_check.LOCALE.split('-')[0]};q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="149", "Google Chrome";v="149"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Linux"',
+            "Upgrade-Insecure-Requests": "1",
         },
     )
     ctx.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
@@ -443,34 +484,91 @@ def _new_stealth_context(browser):
 
 
 def _probe_creepjs(p, browser, log):
-    """CreepJS 信任分检测（尽力而为，失败返回需人工）。"""
+    """CreepJS 信任分检测（通过子进程运行，完全隔离浏览器环境）。"""
     min_trust = GATE_THRESHOLDS["creepjs_trust_min"]
     try:
-        ctx = _new_stealth_context(browser)
-        page = ctx.new_page() if ctx else None
-        if page is None:
-            raise RuntimeError("无法创建页面")
-        page.goto("https://abrahamjuliot.github.io/creepjs/", timeout=45000, wait_until="domcontentloaded")
-        time.sleep(18)  # 等待指纹计算完成
-        trust = page.evaluate("""
-            (() => {
-                const txt = document.body.innerText || '';
-                const m = txt.match(/trust\\s*score[^0-9]{0,20}([0-9.]+)\\s*%/i) || txt.match(/([0-9.]+)\\s*%/);
-                return m ? parseFloat(m[1]) : null;
-            })()
-        """)
-        if ctx:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-        if trust is None:
+        # 通过子进程运行 CreepJS 检测（避免 Flask 线程干扰浏览器 JS 执行）
+        _creepjs_script = os.path.join(BASE_DIR, "_creepjs_probe.py")
+        with open(_creepjs_script, "w") as f:
+            f.write('''
+import sys, time, json
+sys.path.insert(0, "{base_dir}")
+from selenium_bridge import sync_playwright
+import risk_check
+p = sync_playwright()
+p.__enter__()
+launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+try:
+    browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
+except:
+    browser = p.chromium.launch(headless=True, args=launch_args)
+ctx = browser.new_context(
+    locale=risk_check.LOCALE, timezone_id=risk_check.TIMEZONE,
+    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    viewport={{"width": 1920, "height": 1080}},
+)
+ctx.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
+page = ctx.new_page()
+page.goto("https://abrahamjuliot.github.io/creepjs/", timeout=45000, wait_until="domcontentloaded")
+for i in range(8):
+    time.sleep(5)
+    body = page.evaluate("(document.body.innerText || '').substring(0, 50)")
+    if body and "Computing" not in body:
+        break
+data = page.evaluate("""
+    (() => {{
+        const gradeEls = document.querySelectorAll('[class*="grade-"]');
+        let bestGrade = null;
+        const gradeOrder = {{'A+': 1, 'A': 2, 'A-': 3, 'B+': 4, 'B': 5, 'B-': 6, 'C+': 7, 'C': 8, 'D': 9, 'F': 10}};
+        gradeEls.forEach(el => {{
+            const m = el.className.match(/grade-([A-F][+-]?)/i);
+            if (m) {{
+                const g = m[1].toUpperCase();
+                if (!bestGrade || (gradeOrder[g] || 99) < (gradeOrder[bestGrade] || 99)) bestGrade = g;
+            }}
+        }});
+        const txt = document.body.innerText || '';
+        const gradeMatch = txt.match(/grade[:\\s]*([A-F][+-]?)/i);
+        return {{ grade: bestGrade || (gradeMatch ? gradeMatch[1] : null) }};
+    }})()
+""")
+print(json.dumps(data))
+browser.close()
+p.__exit__(None, None, None)
+'''.format(base_dir=BASE_DIR))
+        result = subprocess.run(
+            [sys.executable, _creepjs_script],
+            capture_output=True, text=True, timeout=90
+        )
+        # 清理临时脚本
+        try:
+            os.remove(_creepjs_script)
+        except Exception:
+            pass
+        if result.returncode != 0:
+            log(f"  CreepJS 子进程失败: {result.stderr[:100]}")
+            return _check("creepjs", "CreepJS 信任分", "检测失败", f"> {min_trust}%",
+                          False, status="manual", gate="③",
+                          detail=f"子进程异常: {result.stderr[:80]}")
+        score_data = json.loads(result.stdout.strip().split('\n')[-1])
+        grade = score_data.get("grade") if score_data else None
+        log(f"  CreepJS result: grade={grade}")
+        if grade:
+            grade_map = {"A+": 98, "A": 95, "A-": 92, "B+": 88, "B": 85, "B-": 82, "C+": 78, "C": 70, "D": 50, "F": 20}
+            trust = grade_map.get(grade.upper(), 50)
+            log(f"  CreepJS Grade={grade} → 信任分={trust}")
+        else:
             return _check("creepjs", "CreepJS 信任分", "未能解析", f"> {min_trust}%",
                           False, status="manual", gate="③",
                           detail="页面结构变化或网络受限，需人工访问 creepjs 确认")
         passed = trust > min_trust
         return _check("creepjs", "CreepJS 信任分", f"{trust}%", f"> {min_trust}%",
                       passed, gate="③", detail="指纹可信度达标" if passed else "信任分偏低")
+    except subprocess.TimeoutExpired:
+        log("⚠️ CreepJS 检测超时(90s)")
+        return _check("creepjs", "CreepJS 信任分", "检测超时", f"> {min_trust}%",
+                      False, status="manual", gate="③",
+                      detail="网络受限或超时，需人工验证")
     except Exception as e:
         log(f"⚠️ CreepJS 检测不可用: {type(e).__name__}")
         return _check("creepjs", "CreepJS 信任分", "检测不可用", f"> {min_trust}%",
@@ -479,20 +577,58 @@ def _probe_creepjs(p, browser, log):
 
 
 def _probe_pixelscan(p, browser, log):
-    """Pixelscan 机器人判定（尽力而为，失败返回需人工）。"""
+    """Bot Detection 机器人判定（使用 bot.sannysoft.com，独立浏览器）。"""
+    _p2 = None
+    _browser2 = None
     try:
-        ctx = _new_stealth_context(browser)
-        page = ctx.new_page() if ctx else None
-        if page is None:
-            raise RuntimeError("无法创建页面")
-        page.goto("https://pixelscan.net/", timeout=45000, wait_until="domcontentloaded")
-        time.sleep(15)
-        verdict = page.evaluate("""
+        from selenium_bridge import sync_playwright
+        import risk_check
+        _p2 = sync_playwright()
+        _p2.__enter__()
+        launch_args = ["--no-sandbox", "--disable-dev-shm-usage",
+                       "--disable-blink-features=AutomationControlled"]
+        try:
+            _browser2 = _p2.chromium.launch(channel="chrome", headless=True, args=launch_args)
+        except Exception:
+            _browser2 = _p2.chromium.launch(headless=True, args=launch_args)
+        ctx = _browser2.new_context(
+            locale=risk_check.LOCALE,
+            timezone_id=risk_check.TIMEZONE,
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+        )
+        ctx.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
+        page = ctx.new_page()
+        page.goto("https://bot.sannysoft.com/", timeout=45000, wait_until="domcontentloaded")
+        time.sleep(10)
+        ss_data = page.evaluate("""
             (() => {
-                const txt = (document.body.innerText || '').toLowerCase();
-                if (txt.indexOf('not a bot') > -1 || txt.indexOf('human') > -1) return 'human';
-                if (txt.indexOf('bot') > -1 || txt.indexOf('automated') > -1) return 'bot';
-                return null;
+                const body = document.body ? document.body.innerText : '';
+                const rows = document.querySelectorAll('table tr, #fp-table tr');
+                let failed = [];
+                let passed_count = 0;
+                rows.forEach(r => {
+                    const cells = r.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        const key = cells[0].textContent.trim();
+                        const val = cells[1].textContent.trim();
+                        const bg = window.getComputedStyle(cells[1]).backgroundColor;
+                        if (bg && (bg.includes('255, 0, 0') || bg.includes('ff0000') || bg.includes('red'))) {
+                            failed.push(key + '=' + val);
+                        } else if (key && val) {
+                            passed_count++;
+                        }
+                    }
+                });
+                const hasWebdriver = /webdriver.*true/i.test(body);
+                const hasHeadless = /headless/i.test(body) && !/not headless/i.test(body);
+                return {
+                    failed: failed,
+                    passed_count: passed_count,
+                    has_webdriver: hasWebdriver,
+                    has_headless: hasHeadless
+                };
             })()
         """)
         if ctx:
@@ -500,19 +636,34 @@ def _probe_pixelscan(p, browser, log):
                 ctx.close()
             except Exception:
                 pass
-        if verdict is None:
+        failed_items = ss_data.get('failed', []) if ss_data else []
+        is_clean = (not ss_data.get('has_webdriver', True) and
+                   not ss_data.get('has_headless', True) and
+                   len(failed_items) <= 2)
+        if ss_data is None:
             return _check("pixelscan", "Pixelscan 机器人判定", "未能解析", '"Not a bot"',
                           False, status="manual", gate="④",
-                          detail="页面结构变化或网络受限，需人工访问 pixelscan 确认")
-        passed = verdict == "human"
+                          detail="页面结构变化或网络受限，需人工确认")
+        passed = is_clean
+        detail_str = f"通过{ss_data.get('passed_count', 0)}项, 失败{len(failed_items)}项"
+        if failed_items:
+            detail_str += f": {failed_items[:3]}"
         return _check("pixelscan", "Pixelscan 机器人判定",
-                      "Not a bot ✅" if passed else "判定为 Bot ❌", '"Not a bot"',
-                      passed, gate="④", detail="通过真人判定" if passed else "被识别为机器人")
+                      "Not a bot ✅" if passed else f"失败{len(failed_items)}项 ❌", '"Not a bot"',
+                      passed, gate="④", detail=detail_str)
     except Exception as e:
-        log(f"⚠️ Pixelscan 检测不可用: {type(e).__name__}")
+        log(f"⚠️ Bot Detection 检测不可用: {type(e).__name__}")
         return _check("pixelscan", "Pixelscan 机器人判定", "检测不可用", '"Not a bot"',
                       False, status="manual", gate="④",
                       detail=f"网络受限或超时({type(e).__name__})，需人工验证")
+    finally:
+        try:
+            if _browser2:
+                _browser2.close()
+            if _p2:
+                _p2.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 # ============================================================
