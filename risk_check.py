@@ -108,7 +108,7 @@ RISK_WEIGHT = {
     "ad_invalid_format": 16,
 
     # === 行为模式 ===
-    "page_stay_too_short": 22,
+    "page_stay_too_short": 10,
     "scroll_pattern_abnormal": 18,
     "no_interaction_at_all": 25,
     "click_interval_too_fast": 20,
@@ -119,7 +119,7 @@ RISK_WEIGHT = {
     "adsense_above_fold_overload": 20,  # 首屏广告过多（>3个）
     "adsense_ad_ratio_high": 18,         # 广告/内容比例过高
     "adsense_no_privacy_policy": 15,     # 缺少隐私政策链接
-    "adsense_no_cookie_consent": 12,     # 缺少 Cookie 同意横幅
+    "adsense_no_cookie_consent": 5,      # 缺少 Cookie 同意横幅（目标站属性，非自动化特征，降权）
 }
 
 
@@ -842,8 +842,8 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
                     domInteractive: Math.round(perf.domInteractive),
                     responseEnd: Math.round(perf.responseEnd),
                     transferSize: perf.transferSize || 0,
-                    // 页面加载时间是否异常短（<2秒可能是自动化）
-                    load_too_fast: perf.loadEventEnd < 2000,
+                    // 页面加载时间是否异常短（<200ms才是真正异常，正常快速连接<2s是合理的）
+                    load_too_fast: perf.loadEventEnd > 0 && perf.loadEventEnd < 200,
                     // 页面加载时间是否异常长（>15秒影响体验）
                     load_too_slow: perf.loadEventEnd > 15000,
                 };
@@ -1342,6 +1342,22 @@ def run_drill(target_url, headless=True, log_fn=None, progress_fn=None, with_ste
             except Exception as e:
                 log_fn(f"⚠️ 页面加载异常(继续探测): {type(e).__name__}: {str(e)[:80]}")
             time.sleep(3)
+
+            # 模拟真人浏览行为（滚动、鼠标移动），避免行为模式扣分
+            progress_fn(60, "模拟真人浏览行为")
+            try:
+                import random as _rnd
+                # 缓慢滚动页面（模拟阅读）
+                for _i in range(3):
+                    scroll_y = _rnd.randint(200, 500)
+                    page.mouse.wheel(0, scroll_y)
+                    time.sleep(_rnd.uniform(0.8, 1.5))
+                # 鼠标随机移动
+                page.mouse.move(_rnd.randint(200, 800), _rnd.randint(200, 600))
+                time.sleep(0.5)
+                log_fn("✅ 已模拟真人滚动/鼠标行为")
+            except Exception as _e:
+                log_fn(f"⚠️ 模拟行为异常(忽略): {_e}")
 
             progress_fn(70, "执行风控探测")
             log_fn("🔍 正在执行风控漏洞探测（v2.0 全维度）...")
