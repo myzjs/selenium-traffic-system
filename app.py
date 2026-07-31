@@ -537,6 +537,15 @@ def generate_daily_tasks_legacy(cfg):
         total_tasks_planned = random.randint(range_cfg["min"], range_cfg["max"])
     else:
         total_tasks_planned = cfg.get("plan_days", 1)
+    
+    # ★ 3.4 周末衰减因子：周六日流量乘以0.6-0.8（真实网站周末流量下降）
+    import datetime as _dt_wk
+    _weekday = _dt_wk.datetime.now().weekday()  # 0=Mon, 5=Sat, 6=Sun
+    if _weekday >= 5:  # 周末
+        _wk_cfg = cfg.get("weekend_factor", {"min": 0.6, "max": 0.8})
+        _wk_factor = random.uniform(float(_wk_cfg.get("min", 0.6)), float(_wk_cfg.get("max", 0.8)))
+        total_tasks_planned = max(1, int(total_tasks_planned * _wk_factor))
+        log.info(f"📅 周末衰减: 系数{_wk_factor:.2f}，任务数调整为{total_tasks_planned}")
 
     # 准备代理池
     proxy_pool_enabled = [p for p in cfg.get("proxy_pool", []) if p.get("enabled", False) and p.get("proxy_api_url")]
@@ -643,12 +652,24 @@ def generate_daily_tasks_legacy(cfg):
             "warnings": ["⚠️ 没有启用任何代理"]
         }
     
-    # 2. 国家配额分配（基础平均 + ±20% 抖动）
-    base_quota = total_tasks_planned / len(enabled_countries)
+    # 2. ★ 3.5 地域分散策略：按config权重分配国家配额（同一目标站3-5国混合访问）
+    _geo_cfg = cfg.get("geo_dispersion", {})
+    _geo_weights = _geo_cfg.get("weights", {})
     country_quota_target = {}
-    for cc in enabled_countries:
-        quota = base_quota * random.uniform(0.8, 1.2)
-        country_quota_target[cc] = max(1, int(round(quota)))
+    if _geo_cfg.get("enabled", False) and _geo_weights:
+        # 使用配置权重
+        _total_weight = sum(_geo_weights.get(cc, 0.1) for cc in enabled_countries)
+        for cc in enabled_countries:
+            _w = _geo_weights.get(cc, 0.1)
+            quota = total_tasks_planned * (_w / _total_weight) * random.uniform(0.85, 1.15)
+            country_quota_target[cc] = max(1, int(round(quota)))
+        log.info(f"🌍 地域分散策略启用: 权重={_geo_weights}, 配额={country_quota_target}")
+    else:
+        # 兜底：基础平均 + ±20% 抖动
+        base_quota = total_tasks_planned / len(enabled_countries)
+        for cc in enabled_countries:
+            quota = base_quota * random.uniform(0.8, 1.2)
+            country_quota_target[cc] = max(1, int(round(quota)))
     
     # 3. 生成全局任务时间点（从现在开始偏移）
     chosen_model = "simple"
@@ -668,14 +689,31 @@ def generate_daily_tasks_legacy(cfg):
             if tp >= seconds_now_utc and tp < end_of_window:
                 raw_time_points.append(tp)
     else:
-        # 非自动模式：从当前时间均匀排列
-        chosen_model = "simple"
-        est_task_len = (total_stay_cfg["min"] + total_stay_cfg["max"]) / 2 + (min_watch_time + max_watch_time) / 2
-        avg_gap = (interval_cfg["min"] + interval_cfg["max"]) / 2
-        cursor = seconds_now_utc
+        # 非自动模式：★ 3.1 时段权重曲线（按目标国时区的双峰分布）
+        chosen_model = "hourly_weighted"
+        _hourly_weights = cfg.get("hourly_weights", [0.2,0.1,0.1,0.1,0.2,0.3,0.5,0.8,1.0,1.0,0.9,0.8,0.7,0.7,0.8,0.9,1.0,1.0,0.9,0.8,0.7,0.5,0.4,0.3])
+        # 按权重采样小时，然后在小时内随机分钟
+        _hours_pool = list(range(24))
+        _weights_sum = sum(_hourly_weights)
+        _weights_norm = [w / _weights_sum for w in _hourly_weights]
         for i in range(total_tasks_planned):
-            raw_time_points.append(cursor)
-            cursor += est_task_len + avg_gap
+            # 按权重随机选择小时
+            _h = random.choices(_hours_pool, weights=_weights_norm, k=1)[0]
+            _m = random.randint(0, 59)
+            _s = random.randint(0, 59)
+            # 转换为UTC秒数（假设目标国时区，简化处理：直接用UTC）
+            tp = seconds_now_utc + (_h * 3600 + _m * 60 + _s)
+            # 确保在24h窗口内
+            if tp < end_of_window:
+                raw_time_points.append(tp)
+        # 补充：如果权重采样导致时间点不足，用均匀分布补齐
+        if len(raw_time_points) < total_tasks_planned:
+            est_task_len = (total_stay_cfg["min"] + total_stay_cfg["max"]) / 2
+            avg_gap = (interval_cfg["min"] + interval_cfg["max"]) / 2
+            cursor = seconds_now_utc
+            while len(raw_time_points) < total_tasks_planned:
+                raw_time_points.append(cursor)
+                cursor += est_task_len + avg_gap
     
     raw_time_points.sort()
     
@@ -1346,7 +1384,54 @@ def save_qa_storage_state(context, site_url, country, state_path, meta_path):
 
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+# ★ 5.3 日志轮转：RotatingFileHandler（maxBytes=10MB, backupCount=5，总占用≤50MB）
+from logging.handlers import RotatingFileHandler as _RFH
+_log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+_file_handler = _RFH('app.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+_file_handler.setFormatter(_log_formatter)
+_file_handler.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, logging.StreamHandler()])
+
+# ★ 5.2 Chromium僵尸进程清理（启动时执行一次 + 每30分钟定时清理）
+def _cleanup_zombie_chromium():
+    """清理运行超过10分钟的僵尸chromium进程"""
+    import subprocess as _sp
+    import os as _os_z
+    try:
+        # 查找运行超过10分钟的chromium进程（排除当前进程的父进程）
+        _my_pid = _os_z.getpid()
+        result = _sp.run(['ps', '-eo', 'pid,ppid,etime,comm'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and 'chromium' in parts[3].lower():
+                    pid, ppid, etime = int(parts[0]), int(parts[1]), parts[2]
+                    # 跳过当前进程树
+                    if pid == _my_pid or ppid == _my_pid:
+                        continue
+                    # 检查运行时间是否超过10分钟（格式: MM:SS 或 HH:MM:SS）
+                    try:
+                        if ':' in etime:
+                            time_parts = etime.split(':')
+                            minutes = int(time_parts[-2]) if len(time_parts) >= 2 else 0
+                            if len(time_parts) == 3:
+                                minutes += int(time_parts[0]) * 60
+                            if minutes >= 10:
+                                _sp.run(['kill', '-9', str(pid)], timeout=2)
+                                log.info(f"🧹 清理僵尸chromium进程: PID={pid}, 运行时间={etime}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.debug(f"僵尸进程清理异常: {e}")
+
+# 启动时清理一次
+_cleanup_zombie_chromium()
+# 每30分钟定时清理
+import threading as _th_z
+def _schedule_cleanup():
+    _cleanup_zombie_chromium()
+    _th_z.Timer(1800, _schedule_cleanup).start()
+_th_z.Timer(1800, _schedule_cleanup).start()
 
 # ========== Flask 安全配置 ==========
 import secrets
@@ -1456,22 +1541,26 @@ config = {
             {"id": "reddit", "name": "Reddit", "url": "https://www.reddit.com/", "language": "en", "type": "social"},
             {"id": "instagram", "name": "Instagram", "url": "https://www.instagram.com/", "language": "en", "type": "social"},
             {"id": "linkedin", "name": "LinkedIn", "url": "https://www.linkedin.com/", "language": "en", "type": "social"},
-            {"id": "tiktok", "name": "TikTok", "url": "https://www.tiktok.com/", "language": "en", "type": "social"}
+            {"id": "tiktok", "name": "TikTok", "url": "https://www.tiktok.com/", "language": "en", "type": "social"},
+            {"id": "goodreads", "name": "Goodreads", "url": "https://www.goodreads.com/", "language": "en", "type": "social"},
+            {"id": "wattpad", "name": "Wattpad", "url": "https://www.wattpad.com/", "language": "en", "type": "social"},
+            {"id": "quora", "name": "Quora", "url": "https://www.quora.com/", "language": "en", "type": "social"}
         ],
         "region_engine_map": {
-            "US": ["google", "bing", "facebook", "twitter", "reddit", "instagram"],
-            "GB": ["google", "bing", "facebook", "twitter", "reddit"],
-            "AU": ["google", "bing", "facebook", "reddit", "instagram"],
+            "US": ["google", "bing", "facebook", "twitter", "reddit", "instagram", "goodreads", "wattpad", "quora"],
+            "GB": ["google", "bing", "facebook", "twitter", "reddit", "goodreads", "quora"],
+            "AU": ["google", "bing", "facebook", "reddit", "instagram", "goodreads"],
             "DE": ["google", "bing", "facebook", "instagram"],
             "FR": ["google", "bing", "facebook", "instagram"],
             "JP": ["google", "bing", "twitter", "instagram", "tiktok"],
             "CN": ["baidu", "sogou", "tiktok"]
         },
         "keyword_pools": {
-            "zh": ["广告联盟", "SEO优化", "网站推广", "网络营销", "数字营销"],
-            "en": ["affiliate marketing", "SEO optimization", "website promotion", "digital marketing", "online marketing"]
+            "zh": ["免费小说在线阅读", "修真小说推荐", "武侠小说全本", "重生小说排行榜", "网络小说免费阅读", "修仙小说推荐", "穿越小说完本", "玄幻小说在线阅读", "都市重生小说", "仙侠小说免费阅读"],
+            "en": ["free novels online read", "wuxia novels english translation", "cultivation novels free", "rebirth story novel", "xianxia novels online", "read free fiction online", "web novel free reading", "fantasy novel chapters free", "reincarnation novel english", "martial arts novel online", "transmigration story free", "best free novels to read", "novel reading website free", "chinese novel english translation", "immortal cultivation novel", "reborn novel free online", "free story books online", "read novels free no signup", "web fiction free chapters", "cultivation xianxia wuxia novel"]
         },
-        "referer_mode": "dynamic"
+        "referer_mode": "dynamic",
+        "search_mode": "real_search"
     },
     
     # 视频广告配置
@@ -1585,7 +1674,11 @@ def deep_merge_defaults(defaults, overrides):
 
 def ensure_config_defaults():
     global config
+    # ★ 保护用户已保存的proxy_pool（列表类型不应被默认10空条目覆盖）
+    _saved_proxy_pool = config.get('proxy_pool')
     fixed = deep_merge_defaults(DEFAULT_CONFIG, config)
+    if _saved_proxy_pool and isinstance(_saved_proxy_pool, list) and len(_saved_proxy_pool) > 0:
+        fixed['proxy_pool'] = _saved_proxy_pool
     config.clear()
     config.update(fixed)
 
@@ -2361,12 +2454,14 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
         f"动作随机（滚动/鼠标/点击/键盘），参数均从配置读取"
     )
 
-    # 动作权重：滚动和鼠标为主
+    # 动作权重：滚动和鼠标为主，点击权重从配置读取（确保真人行为包含点击）
+    _click_weight = max(2, int(click_count_cfg.get("min", 3)) // 2)  # 至少2，配置min=3→权重2
+    _key_weight = max(1, _click_weight // 2)
     actions = (
         ["scroll"] * 4 +
         ["mouse"] * 4 +
-        ["click"] * 1 +
-        ["key"] * 1
+        ["click"] * _click_weight +
+        ["key"] * _key_weight
     )
 
     action_errors = 0
@@ -2394,29 +2489,81 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
         action = _rnd.choice(actions)
         try:
             if action == "scroll":
-                dy = _rnd.randint(int(scroll_cfg.get("min", 100)), int(scroll_cfg.get("max", 800)))
-                if _rnd.random() < 0.15:
-                    dy = -dy
-                page.evaluate(f"window.scrollBy(0, {dy})")
+                # ★ 2.1 惯性滚动模型：初始速度v0，每帧衰减v*=0.88，模拟真人滚动惯性
+                _v0 = _rnd.uniform(300, 800)  # 初始速度 px/s
+                _direction = -1 if _rnd.random() < 0.15 else 1
+                _inertia_js = """
+                    (v0, direction) => {
+                        return new Promise(resolve => {
+                            let v = v0 * direction;
+                            let totalDist = 0;
+                            const decay = 0.88;
+                            const minV = 20;
+                            function frame() {
+                                if (Math.abs(v) < minV) { resolve(totalDist); return; }
+                                window.scrollBy(0, v * 0.016);
+                                totalDist += Math.abs(v * 0.016);
+                                v *= decay;
+                                requestAnimationFrame(frame);
+                            }
+                            requestAnimationFrame(frame);
+                        });
+                    }
+                """
+                try:
+                    _scrolled = page.evaluate(_inertia_js, [_v0, _direction])
+                    _scrolled = int(abs(_scrolled or 0))
+                except Exception:
+                    _scrolled = _rnd.randint(100, 400)
+                    page.evaluate(f"window.scrollBy(0, {_scrolled * _direction})")
                 stats["scrolls"] += 1
-                stats["scroll_distance"] += abs(dy)
+                stats["scroll_distance"] += _scrolled
                 # 滚动后等待（从配置读取）
                 _sw = min(window_end - _t.time(), _rnd.uniform(scroll_wait_cfg.get("min", 0.5), scroll_wait_cfg.get("max", 2.0)))
                 if _sw > 0:
                     _t.sleep(_sw)
                     stats["total_stay"] += _sw
             elif action == "mouse":
-                tx = _rnd.randint(100, 1100)
-                ty = _rnd.randint(100, 700)
-                # 鼠标移动步数从配置读取
-                steps = _rnd.randint(int(mouse_steps_cfg.get("min", 50)) // 10, int(mouse_steps_cfg.get("max", 250)) // 10)
-                steps = max(3, steps)
+                # ★ 2.4 注意力热区模型：鼠标目标不再完全随机，按热区权重采样
+                _hotzone = _rnd.random()
+                if _hotzone < 0.40:  # 内容区域中心偏上(40%)
+                    tx = _rnd.randint(200, 900)
+                    ty = _rnd.randint(150, 450)
+                elif _hotzone < 0.60:  # 导航栏区域(20%)
+                    tx = _rnd.randint(100, 1000)
+                    ty = _rnd.randint(20, 80)
+                elif _hotzone < 0.75:  # 侧边栏(15%)
+                    tx = _rnd.randint(900, 1150)
+                    ty = _rnd.randint(100, 600)
+                elif _hotzone < 0.85:  # 底部(10%)
+                    tx = _rnd.randint(100, 1000)
+                    ty = _rnd.randint(600, 800)
+                else:  # 随机(15%)
+                    tx = _rnd.randint(50, 1150)
+                    ty = _rnd.randint(50, 750)
+                # ★ 2.2 Fitts定律：距离越远步数越多（模拟真人远距离移动更谨慎）
+                import math as _math_f
+                _dist_f = _math_f.hypot(tx - current_x, ty - current_y)
+                steps = max(8, int(_math_f.log2(_dist_f / 10 + 1) * 10))
+                steps = min(steps, 60)  # 上限60步
+                # 生成随机控制点，制造自然弯曲
+                ctrl_x = _rnd.uniform(min(current_x, tx), max(current_x, tx))
+                ctrl_y = _rnd.uniform(min(current_y, ty) - 80, max(current_y, ty) + 80)
                 for s in range(steps):
                     if _t.time() >= window_end:
                         break
                     tt = (s + 1) / steps
-                    mx = int(current_x + (tx - current_x) * tt + _rnd.randint(-2, 2))
-                    my = int(current_y + (ty - current_y) * tt + _rnd.randint(-2, 2))
+                    # ★ ease-in-out 缓动：先加速后减速（符合Fitts定律）
+                    if tt < 0.5:
+                        eased_tt = 4 * tt * tt * tt
+                    else:
+                        eased_tt = 1 - ((-2 * tt + 2) ** 3) / 2
+                    # 二次贝塞尔曲线
+                    bx = (1-eased_tt)**2 * current_x + 2*(1-eased_tt)*eased_tt * ctrl_x + eased_tt**2 * tx
+                    by = (1-eased_tt)**2 * current_y + 2*(1-eased_tt)*eased_tt * ctrl_y + eased_tt**2 * ty
+                    # 微小抗动（±1-2px，模拟人手微颤）
+                    mx = int(bx + _rnd.randint(-2, 2))
+                    my = int(by + _rnd.randint(-2, 2))
                     page.mouse.move(mx, my)
                     # 每步等待从配置读取
                     _step_wait = _rnd.uniform(mouse_pause_cfg.get("min", 0.01), mouse_pause_cfg.get("max", 0.1))
@@ -2426,6 +2573,11 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                         _t.sleep(_rnd.uniform(0.1, 0.4))
                 current_x, current_y = tx, ty
                 stats["mouse_moves"] += 1
+                # ★ 2.4 阅读停顿：每3-5次鼠标移动后插入1-4s停顿
+                if stats["mouse_moves"] % _rnd.randint(3, 5) == 0:
+                    _read_pause = _rnd.uniform(1.0, 4.0)
+                    _t.sleep(min(_read_pause, max(0, window_end - _t.time())))
+                    stats["total_stay"] += _read_pause
                 # 鼠标移动后等待
                 _mw = min(window_end - _t.time(), _rnd.uniform(mouse_wait_cfg.get("min", 0.1), mouse_wait_cfg.get("max", 1.0)))
                 if _mw > 0:
@@ -2500,6 +2652,7 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
         result = page.evaluate("""
         () => {
             const selectors = [
+                // Google AdSense
                 'ins.adsbygoogle',
                 '.adsbygoogle',
                 '[id*="google_ads_iframe"]',
@@ -2509,7 +2662,66 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
                 'iframe[src*="googlesyndication"]',
                 'iframe[src*="doubleclick"]',
                 '[data-ad-client]',
-                '[data-ad-slot]'
+                '[data-ad-slot]',
+                // HilltopAds
+                'iframe[src*="hilltopads"]',
+                'script[src*="hilltopads"]',
+                '[id*="hilltopads"]',
+                '[class*="hilltopads"]',
+                // PropellerAds / AdMaven / EvaDav / other networks
+                'iframe[src*="propellerads"]',
+                'iframe[src*="ad-maven"]',
+                'iframe[src*="evadav"]',
+                'iframe[src*="mgid"]',
+                'iframe[src*="taboola"]',
+                'iframe[src*="outbrain"]',
+                'script[src*="propellerads"]',
+                'script[src*="evadav"]',
+                'script[src*="mgid"]',
+                'script[src*="taboola"]',
+                'script[src*="outbrain"]',
+                // HilltopAds/EvaDav 投放域名（随机域名，通过白名单确认）
+                'script[src*="curoax"]',
+                'script[src*="pufted"]',
+                'iframe[src*="bony-teaching"]',
+                'script[src*="untimely-hello"]',
+                // Ezoic / Mediavine / AdThrive / Raptive
+                'script[src*="ezoic"]',
+                'script[src*="ezoicnet"]',
+                '[id*="ezoic"]',
+                'script[src*="mediavine"]',
+                '[class*="mediavine"]',
+                'script[src*="adthrive"]',
+                'script[src*="raptive"]',
+                // Monumetric / Broadstreet
+                'script[src*="monumetric"]',
+                'script[src*="broadstreet"]',
+                // Infolinks / Adsterra
+                'script[src*="infolinks"]',
+                'script[src*="adsterra"]',
+                // BuySellAds / Carbon
+                'script[src*="buysellads"]',
+                'script[src*="carbonads"]',
+                // GAM / Google Publisher Tag
+                'script[src*="securepubads"]',
+                'script[src*="googletagservices"]',
+                // 通用广告容器（覆盖大多数联盟）
+                'iframe[src*="/ads/"], iframe[src*="/adserve/"], iframe[src*="/adserver/"]',
+                'iframe[src*="banner"]',
+                '[class*="nativeads"]',
+                '[class*="ad-container"]',
+                '[class*="ad-wrapper"]',
+                '[class*="ad-unit"]',
+                '[id*="ad-container"]',
+                '[id*="ad-wrapper"]',
+                '[id*="ad-unit"]',
+                'iframe[width="728"][height="90"]',
+                'iframe[width="300"][height="250"]',
+                'iframe[width="160"][height="600"]',
+                '[data-zone]',
+                '[data-adzone]',
+                '[data-ad-id]',
+                '[data-adunit]'
             ];
             const seen = new Set();
             const vw = window.innerWidth || document.documentElement.clientWidth || 0;
@@ -2759,7 +2971,13 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             return False, current_x, current_y
 
         # 5. 移动鼠标到搜索框、点击
-        search_box.scroll_into_view_if_needed()
+        if not search_box:
+            log.warning("[真搜索] 搜索框元素为None，直接访问目标页")
+            return False, current_x, current_y
+        try:
+            search_box.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass  # 滚动失败不阻断流程
         rect = search_box.bounding_box()
         if rect:
             center_x = rect["x"] + rect["width"]/2 + random.uniform(-8, 8)
@@ -2773,25 +2991,42 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
 
         time.sleep(random.uniform(0.5, 1.2))
 
-        # 6. 清空搜索框（如果有默认值）
-        page.keyboard.down("Control")
+        # 6. 清空搜索框（如果有默认值）—— 根据平台选择正确修饰键（Mac用Meta，Windows/Linux用Control）
+        _select_all_mod = "Meta" if ("Mac OS X" in user_agent or "Macintosh" in user_agent) else "Control"
+        page.keyboard.down(_select_all_mod)
         page.keyboard.press("a")
-        page.keyboard.up("Control")
+        page.keyboard.up(_select_all_mod)
         time.sleep(random.uniform(0.15, 0.4))
         page.keyboard.press("Backspace")
         time.sleep(random.uniform(0.2, 0.5))
 
         # 7. 模拟真人分段输入关键词（删改1-2次模拟思考）
-        log.info(f"🔍 [真搜索] 模拟真人输入关键词")
+        # ★ 2.3 键盘bigram延迟表：常见字母组合打字更快（如th/he/in），罕见组合更慢（如qz/xj）
+        _BIGRAM_FAST = {"th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar", "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le", "ve", "co", "me", "de", "hi", "ri", "ro", "ic", "ne", "ea", "ra", "ce", "li", "ch", "ll", "be", "ma", "si", "om", "ur"}
+        _BIGRAM_SLOW = {"qz", "xj", "zk", "jx", "qy", "zw", "vx", "jk", "xz", "wq", "qx", "jv", "kx", "zq"}
+        def _bigram_factor(prev_c, curr_c):
+            bg = (prev_c + curr_c).lower()
+            if bg in _BIGRAM_FAST:
+                return random.uniform(0.55, 0.75)  # 常见组合：更快
+            if bg in _BIGRAM_SLOW:
+                return random.uniform(1.5, 1.9)  # 罕见组合：更慢
+            return random.uniform(0.85, 1.15)  # 普通组合
+        log.info(f"🔍 [真搜索] 模拟真人输入关键词(bigram延迟)")
         words = selected_keyword.split(" ")
         i = 0
+        _prev_char = ""
         while i < len(words):
             chunk = " ".join(words[i:i+2])
-            # 使用原生按字符
+            # 使用原生按字符 + bigram延迟
             for c in chunk:
                 page.keyboard.type(c)
-                time.sleep(random.uniform(0.06, 0.18))
-            
+                _base_delay = random.uniform(0.06, 0.18)
+                _delay = _base_delay * _bigram_factor(_prev_char, c) if _prev_char else _base_delay
+                time.sleep(_delay)
+                _prev_char = c
+            # ★ 5%概率词间"思考停顿"（0.5-2s）
+            if random.random() < 0.05:
+                time.sleep(random.uniform(0.5, 2.0))
             # 10%概率删改1个词模拟思考
             if random.random() < 0.1 and i < len(words)-1:
                 log.info(f"🔍 [真搜索] 模拟思考删改")
@@ -2844,8 +3079,11 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                 continue
         
         if target_link_found:
-            # 滚动到可见
-            target_link_found.scroll_into_view_if_needed()
+            # 滚动到可见（加超时保护，避免元素已脱离DOM导致卡死）
+            try:
+                target_link_found.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
             time.sleep(random.uniform(0.6, 1.2))
             # 贝塞尔曲线移动鼠标到链接、点击
             rect2 = target_link_found.bounding_box()
@@ -3141,7 +3379,7 @@ HTML_TEMPLATE = r"""
             padding: 0;
         }
         #planPreviewPanel {
-            display: none !important;
+            display: none;
         }
         
         /* 黄框 - 日志区域（右侧，约1.5倍原宽度，与配置区等高） */
@@ -3331,7 +3569,7 @@ HTML_TEMPLATE = r"""
                 </div>
                 
                 <div id="proxy-pool-container" style="display:flex; flex-direction:column; gap:10px; margin-bottom:20px;">
-                    {% for idx in range([config.proxy_pool|length, 5]|min) %}
+                    {% for idx in range(config.proxy_pool|length) %}
                     {% set p = config.proxy_pool[idx] %}
                     <div class="proxy-item" data-idx="{{ idx }}" style="display:flex; gap:8px; align-items:center; padding:8px; background:#2a2a2a; border-radius:8px;">
                         <div style="width:80px;">
@@ -3910,6 +4148,7 @@ HTML_TEMPLATE = r"""
                                 <tr>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">序号</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">开始时间</th>
+                                    <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">当地时间</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">预估时长</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">结束时间</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">代理国家</th>
@@ -4524,7 +4763,7 @@ HTML_TEMPLATE = r"""
                 if (taskDate !== lastDate) {
                     lastDate = taskDate;
                     const groupRow = document.createElement('tr');
-                    groupRow.innerHTML = `<td colspan="6" style="padding:5px 6px; background:#111827; color:#fbbf24; font-weight:bold; border-bottom:1px solid #374151;">📅 ${taskDate}</td>`;
+                    groupRow.innerHTML = `<td colspan="7" style="padding:5px 6px; background:#111827; color:#fbbf24; font-weight:bold; border-bottom:1px solid #374151;">📅 ${taskDate}</td>`;
                     tbody.appendChild(groupRow);
                 }
                 const startStr = t.plan_time || secToHHMMSS(t.actual_start || 0);
@@ -4535,10 +4774,21 @@ HTML_TEMPLATE = r"""
                 if (status === '已完成') statusColor = '#00d4aa';
                 if (status === '失败') statusColor = '#ff5555';
                 
+                // 计算目标国当地时间
+                const tzMap = {'US':'America/New_York','GB':'Europe/London','DE':'Europe/Berlin','FR':'Europe/Paris','JP':'Asia/Tokyo','SG':'Asia/Singapore','HK':'Asia/Hong_Kong','ID':'Asia/Jakarta','AU':'Australia/Sydney','NZ':'Pacific/Auckland','CA':'America/New_York'};
+                let localTimeStr = '-';
+                if (t.actual_start_epoch && t.proxy_country) {
+                    try {
+                        const tz = tzMap[t.proxy_country] || 'America/New_York';
+                        localTimeStr = new Intl.DateTimeFormat('en-GB', {timeZone: tz, hour:'2-digit', minute:'2-digit', hour12:false}).format(new Date(t.actual_start_epoch * 1000));
+                    } catch(e) { localTimeStr = '-'; }
+                }
+                
                 const row = document.createElement('tr');
                 row.innerHTML = 
                     `<td style="padding:4px 6px; border-bottom:1px solid #222;">${t.idx}</td>` +
                     `<td style="padding:4px 6px; border-bottom:1px solid #222;">${startStr}</td>` +
+                    `<td style="padding:4px 6px; border-bottom:1px solid #222; color:#00d4aa;">${localTimeStr}</td>` +
                     `<td style="padding:4px 6px; border-bottom:1px solid #222;">${duration}s</td>` +
                     `<td style="padding:4px 6px; border-bottom:1px solid #222;">${endStr}</td>` +
                     `<td style="padding:4px 6px; border-bottom:1px solid #222;">${t.proxy_country || '-'}</td>` +
@@ -4553,19 +4803,34 @@ HTML_TEMPLATE = r"""
 
         // 生成计划
         function generatePlan() {
+            // ★ 即时视觉反馈：确认按钮点击生效
+            const _btn = document.getElementById('btn-generate-plan');
+            if (_btn) { _btn.textContent = '⏳ 生成中...'; _btn.disabled = true; }
             console.log('✅ 生成计划按钮被点击');
-            const payload = collectConfigPayload();
+            let payload;
+            try {
+                payload = collectConfigPayload();
+            } catch(e) {
+                console.error('❌ collectConfigPayload 异常:', e);
+                alert('❌ 配置收集失败: ' + e.message);
+                if (_btn) { _btn.textContent = '📋 生成计划'; _btn.disabled = false; }
+                return;
+            }
             console.log('✅ 收集到的配置:', payload);
             // 先保存配置，再生成计划
             fetch('/save_config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
+            }).then(r => {
+                if (!r.ok) throw new Error('save_config HTTP ' + r.status);
+                return r.json();
             }).then(() => {
                 console.log('✅ 配置保存成功');
                 return fetch('/generate_plan', {method: 'POST'});
             }).then(r => {
-                console.log('✅ 获取计划响应:', r);
+                if (!r.ok) throw new Error('generate_plan HTTP ' + r.status);
+                console.log('✅ 获取计划响应:', r.status);
                 return r.json();
             }).then(result => {
                 console.log('✅ 解析的结果:', result);
@@ -4574,13 +4839,18 @@ HTML_TEMPLATE = r"""
                     renderPlan(result.plan);
                     // 确保显示计划预览界面
                     document.getElementById('planPreviewPanel').style.display = 'block';
-                    alert('✅ 计划已生成，请在右侧查看，确认无误后点击"执行计划"');
+                    // 立即刷新日志窗口，确保“待执行计划预览”置顶展示（alert 会阻塞轮询，必须先刷新再弹窗）
+                    refreshLogBox().then(() => {
+                        alert('✅ 计划已生成，请在右侧查看，确认无误后点击“执行计划”');
+                    });
                 } else {
                     alert('❌ 计划生成失败: ' + (result.message || '未知错误'));
                 }
             }).catch(err => {
                 console.error('❌ 请求错误:', err);
-                alert('❌ 请求失败: ' + err);
+                alert('❌ 请求失败: ' + err.message);
+            }).finally(() => {
+                if (_btn) { _btn.textContent = '📋 生成计划'; _btn.disabled = false; }
             });
         }
 
@@ -4972,12 +5242,11 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        // 更新日志
-        setInterval(() => {
-            // 更新日志
+        // 刷新日志窗口（供定时轮询和手动刷新复用）
+        function refreshLogBox() {
             const logModeEl = document.querySelector('input[name="log_mode"]:checked');
             const logMode = logModeEl ? logModeEl.value : 'test';
-            fetch('/get_logs?mode=' + encodeURIComponent(logMode) + '&limit=500').then(r => r.text()).then(html => {
+            return fetch('/get_logs?mode=' + encodeURIComponent(logMode) + '&limit=500').then(r => r.text()).then(html => {
                 const logBox = document.getElementById('logBox');
                 const autoScrollCheckbox = document.getElementById('autoScroll');
                 const filterSelect = document.getElementById('logFilter');
@@ -5004,6 +5273,12 @@ HTML_TEMPLATE = r"""
                     }
                 }
             });
+        }
+
+        // 更新日志
+        setInterval(() => {
+            // 更新日志
+            refreshLogBox();
             
             // 更新统计
             fetch('/api/status').then(r => r.json()).then(status => {
@@ -5106,11 +5381,10 @@ HTML_TEMPLATE = r"""
                 
                 // 更新成功和失败统计
                 const statusItems = document.querySelectorAll('.status-item');
-                if (statusItems.length >= 7) {
-                    statusItems[3].querySelector('.stat-number').textContent = status.success;
-                    statusItems[4].querySelector('.stat-number').textContent = status.fail;
-                    statusItems[5].querySelector('.stat-number').textContent = status.video_view_count + '次';
-                    statusItems[6].querySelector('.stat-number').textContent = status.total_video_watch_time + 's';
+                if (statusItems.length >= 4) {
+                    statusItems[1].querySelector('.stat-number').textContent = status.total;
+                    statusItems[2].querySelector('.stat-number').textContent = status.success;
+                    statusItems[3].querySelector('.stat-number').textContent = status.fail;
                 }
             });
         }, 1000);
@@ -5541,25 +5815,33 @@ HTML_TEMPLATE = r"""
                 if (!d.success) return;
                 const data = d.data;
                 
-                // 更新进度
-                if (data.current_layer !== undefined && data.max_layer !== undefined) {
-                    const pct = Math.round((data.current_layer / data.max_layer) * 100);
-                    setKeywordProgress(pct, data.progress || `正在探索第 ${data.current_layer} 层`);
-                } else {
-                    setKeywordProgress(0, data.progress || '准备中...');
-                }
-                
+                // ★ 修复：先判断是否完成，完成时直接设100%，避免进度条卡在中间值
                 if (!data.is_running) {
                     clearInterval(_keywordPolling);
                     _keywordPolling = null;
                     document.getElementById('btnKeywordExplore').disabled = false;
                     
                     if (data.result) {
+                        const _ar = data.result.ad_hit_rate;
+                        const _arTxt = _ar !== undefined ? '，广告命中率 ' + _ar + '%' : '';
+                        setKeywordProgress(100, '探索完成！共 ' + data.result.total_keywords + ' 个关键词，' + (data.result.total_fallback_links || 0) + ' 个兜底链接' + _arTxt);
                         renderKeywordResult(data.result);
                     } else if (data.error) {
+                        setKeywordProgress(100, '探索失败');
                         document.getElementById('keywordStage').textContent = '探索失败: ' + data.error;
                         document.getElementById('keywordBar').style.background = '#ef4444';
+                    } else {
+                        setKeywordProgress(100, data.progress || '已完成');
                     }
+                    return;
+                }
+                
+                // 运行中：更新进度
+                if (data.current_layer !== undefined && data.max_layer !== undefined && data.max_layer > 0) {
+                    const pct = Math.min(95, Math.round((data.current_layer / data.max_layer) * 100));
+                    setKeywordProgress(pct, data.progress || `正在探索第 ${data.current_layer} 层`);
+                } else {
+                    setKeywordProgress(0, data.progress || '准备中...');
                 }
             }).catch(() => {});
         }
@@ -5571,11 +5853,25 @@ HTML_TEMPLATE = r"""
             html += '<div style="background:#1e293b;border-radius:8px;padding:12px;margin-bottom:12px;">';
             html += '<div style="font-size:16px;font-weight:bold;color:#f59e0b;margin-bottom:8px;">';
             html += ' 关键词探索完成</div>';
-            html += '<div style="display:flex;gap:20px;font-size:14px;color:#cbd5e1;">';
+            html += '<div style="display:flex;gap:20px;font-size:14px;color:#cbd5e1;flex-wrap:wrap;">';
             html += '<span>关键词(锚文本): <strong style="color:#22c55e;">' + result.total_keywords + '</strong></span>';
             html += '<span>兜底链接: <strong style="color:#3b82f6;">' + (result.total_fallback_links || 0) + '</strong></span>';
             html += '<span>层级: <strong style="color:#a78bfa;">' + result.layers_crawled + '</strong></span>';
-            html += '</div></div>';
+            html += '</div>';
+            // ★ 广告统计展示
+            if (result.ad_pages !== undefined) {
+                const hitRate = result.ad_hit_rate || 0;
+                const hitColor = hitRate >= 50 ? '#22c55e' : (hitRate >= 20 ? '#f59e0b' : '#ef4444');
+                html += '<div style="display:flex;gap:20px;font-size:13px;color:#94a3b8;margin-top:8px;padding-top:8px;border-top:1px solid #334155;">';
+                html += '<span>🎯 含广告页: <strong style="color:#22c55e;">' + result.ad_pages + '</strong></span>';
+                html += '<span>❌ 无广告页: <strong style="color:#ef4444;">' + result.no_ad_pages + '</strong></span>';
+                html += '<span>广告命中率: <strong style="color:' + hitColor + ';">' + hitRate + '%</strong></span>';
+                html += '</div>';
+                if (hitRate < 30) {
+                    html += '<div style="font-size:12px;color:#f59e0b;margin-top:6px;">⚠️ 广告命中率较低，建议检查兜底链接是否指向含广告的页面（如章节阅读页、书籍详情页）</div>';
+                }
+            }
+            html += '</div>';
             
             // 2. 各层关键词+兜底链接统计
             if (result.layer_summary) {
@@ -5625,29 +5921,70 @@ HTML_TEMPLATE = r"""
             const mergedKws = result.merged_keywords || [];
             const mergedFbs = result.merged_fallback_urls || [];
             
-            for (let i = 1; i <= 6; i++) {
+            // ★ 必须注入的默认关键词（每层都要有）
+            // "chapter" 通过 includes() 匹配可覆盖 chapter1~chapter3000 所有章节链接
+            const MUST_HAVE_KWS = ['chapter', 'home'];
+            const MUST_HAVE_FBS = ['https://freestoryweb.com/'];
+
+            for (let i = 1; i <= 5; i++) {
                 const layerKey = 'layer_' + i;
-                const data = layerData[layerKey];
-                if (!data) continue;
+                const data = layerData[layerKey];  // 可能为undefined（爬取层数<5时）
                 
-                const kwTextarea = document.getElementById('webnav_' + layerKey + '_keywords');
-                const fbTextarea = document.getElementById('webnav_' + layerKey + '_fallback_urls');
+                // ★ 修复：DOM id是 webnav_layer1_keywords（无下划线），不是 webnav_layer_1_keywords
+                const kwTextarea = document.getElementById('webnav_layer' + i + '_keywords');
+                const fbTextarea = document.getElementById('webnav_layer' + i + '_fallback_urls');
                 
                 if (kwTextarea) {
-                    // 如果该层没有关键词，使用合并的关键词
-                    const kws = data.keywords.length > 0 ? data.keywords : mergedKws;
+                    // 如果该层有爬取数据则用之，否则用合并池，最后至少用MUST_HAVE_KWS
+                    let kws = (data && data.keywords && data.keywords.length > 0) ? [...data.keywords]
+                            : (mergedKws.length > 0 ? [...mergedKws] : []);
+                    // ★ 每层最多保存50个关键词（避免1935个章节标题塞满配置）
+                    if (kws.length > 50) {
+                        kws = kws.sort((a, b) => a.length - b.length).slice(0, 50);
+                    }
+                    // ★ 强制注入 chapter + home（确保每层都能匹配章节链接和首页）
+                    for (const mk of MUST_HAVE_KWS) {
+                        if (!kws.some(k => k.toLowerCase() === mk)) kws.unshift(mk);
+                    }
                     kwTextarea.value = kws.join(',');
                 }
                 
                 if (fbTextarea) {
-                    // 如果该层没有兜底链接，使用合并的兜底链接
-                    const fbs = data.fallback_urls.length > 0 ? data.fallback_urls : mergedFbs;
+                    // 如果该层有爬取数据则用之，否则用合并池
+                    let fbs = (data && data.fallback_urls && data.fallback_urls.length > 0) ? [...data.fallback_urls]
+                            : (mergedFbs.length > 0 ? [...mergedFbs] : []);
+                    // ★ 每层最多保存20个兜底链接
+                    if (fbs.length > 20) fbs = fbs.slice(0, 20);
+                    // ★ 强制注入首页兜底链接
+                    for (const mf of MUST_HAVE_FBS) {
+                        if (!fbs.includes(mf)) fbs.unshift(mf);
+                    }
                     fbTextarea.value = fbs.join(',');
                 }
             }
             
+            // ★ 自动保存到后端（无需用户手动切换Tab点保存）
+            const webNavPayload = {};
+            for (let i = 1; i <= 5; i++) {
+                const kwEl = document.getElementById('webnav_layer' + i + '_keywords');
+                const fbEl = document.getElementById('webnav_layer' + i + '_fallback_urls');
+                webNavPayload['layer_' + i] = {
+                    keywords: kwEl ? kwEl.value.split(',').map(s => s.trim()).filter(s => s) : [],
+                    fallback_urls: fbEl ? fbEl.value.split(',').map(s => s.trim()).filter(s => s) : []
+                };
+            }
+            fetch('/save_config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ web_navigation: webNavPayload })
+            }).then(r => r.json()).then(d => {
+                if (d.success) {
+                    console.log('[关键词探索] 已自动保存关键词和兜底链接到配置');
+                }
+            }).catch(e => console.warn('自动保存配置失败:', e));
+                    
             if (!silent) {
-                alert('✅ 已将关键词和兜底链接自动填写到各层配置！\n\n请切换到“网站流量”Tab查看，\n并点击“保存配置”按钮保存。');
+                alert('✅ 已将关键词和兜底链接自动填写到各层配置并保存！\n\n可切换到"网站流量"Tab查看。');
             }
         }
         
@@ -6542,7 +6879,10 @@ def generate_fingerprint(ip_info):
         "fonts": fonts_shuffled,
         "platform": platform,
         "hardware_concurrency": random.choice([4, 8, 12, 16]),
-        "device_memory": random.choice([4, 8, 16, 32])
+        "device_memory": random.choice([4, 8, 16, 32]),
+        "battery_level": round(random.uniform(0.35, 1.0), 2),
+        "orientation_type": "landscape-primary" if random.random() < 0.85 else "portrait-primary",
+        "orientation_angle": 0
     }
 
 def simulate_human_behavior(page, ad_selector, config):
@@ -6721,13 +7061,9 @@ def simulate_human_behavior(page, ad_selector, config):
                 if daily_ad_click_limit_reached():
                     log.warning(f"🚫 今日广告点击已达上限({config.get('daily_ad_click_limit')})，本次跳过点击")
                     raise StopIteration
-                # 记录点击前的标签页句柄，用于检测广告落地页新标签
-                try:
-                    _driver = getattr(page, "driver", None)
-                    _handles_before = list(_driver.window_handles) if _driver else []
-                    _main_handle = _driver.current_window_handle if _driver else None
-                except Exception:
-                    _driver, _handles_before, _main_handle = None, [], None
+                # 记录点击前的页面数量，用于检测广告落地页新标签（Playwright API）
+                _context = page.context
+                _pages_before = len(_context.pages)
 
                 # 鼠标已通过贝塞尔曲线移动到广告中心，用 CDP 真实鼠标点击（失败降级元素 click）
                 try:
@@ -6743,44 +7079,53 @@ def simulate_human_behavior(page, ad_selector, config):
                 behavior_stats["waits"] += 1
                 behavior_stats["total_stay"] += int(ad_click_wait * 1000)
 
-                # ========== 广告点击后落地页真人行为（切换到新标签→停留→滚动→返回） ==========
+                # ========== 广告点击后落地页真人行为（Playwright：检测新标签页→停留→滚动→关闭） ==========
                 try:
-                    if _driver is not None:
-                        _handles_after = list(_driver.window_handles)
-                        _new_handles = [h for h in _handles_after if h not in _handles_before]
-                        if _new_handles:
-                            _landing = _new_handles[-1]
-                            _driver.switch_to.window(_landing)
-                            log.info("🛬 广告落地页已打开，开始真人浏览落地页")
-                            # 等待落地页加载
-                            _lp_load = get_random_value(config.get("page_load_wait", {"min": 2, "max": 5}))
-                            time.sleep(_lp_load)
-                            # 落地页滚动浏览（2~4 次）
-                            _lp_scrolls = random.randint(2, 4)
-                            for _i in range(_lp_scrolls):
-                                try:
-                                    _dist = random.randint(300, 900)
-                                    _driver.execute_script(f"window.scrollBy(0, {_dist});")
-                                    behavior_stats["scrolls"] += 1
-                                    behavior_stats["scroll_distance"] += _dist
-                                    time.sleep(get_random_value(config.get("scroll_wait", {"min": 1, "max": 3})))
-                                except Exception:
-                                    break
-                            # 落地页停留
-                            _lp_stay = get_random_value(config.get("ad_landing_stay_time", {"min": 5, "max": 15}))
-                            time.sleep(_lp_stay)
-                            behavior_stats["total_stay"] += int((_lp_load + _lp_stay) * 1000)
-                            log.info(f"🛬 落地页浏览完成（停留≈{_lp_load + _lp_stay:.1f}s，滚动{_lp_scrolls}次），关闭并返回原站")
-                            # 关闭落地页标签，返回原标签
+                    _pages_after = _context.pages
+                    if len(_pages_after) > _pages_before:
+                        _landing_page = _pages_after[-1]  # 最新打开的标签页
+                        _lp_url = ""
+                        try:
+                            _lp_url = _landing_page.url or ""
+                        except Exception:
+                            pass
+                        log.info(f"🛬 广告落地页已打开: {_lp_url[:100]}，开始真人浏览")
+                        # 等待落地页加载
+                        _lp_load = get_random_value(config.get("page_load_wait", {"min": 2, "max": 5}))
+                        time.sleep(_lp_load)
+                        # ★ 落地页停留时间：对数正态（中位数25s，最低15s）
+                        import math as _math_lp
+                        _lp_stay = max(15, min(90, _math_lp.exp(random.gauss(_math_lp.log(25), 0.5))))
+                        # 落地页滚动浏览（1~3 次）
+                        _lp_scrolls = random.randint(1, 3)
+                        for _i in range(_lp_scrolls):
                             try:
-                                _driver.close()
+                                _dist = random.randint(200, 700)
+                                _landing_page.evaluate(f"window.scrollBy(0, {_dist})")
+                                behavior_stats["scrolls"] += 1
+                                behavior_stats["scroll_distance"] += _dist
+                                time.sleep(random.uniform(1.5, 4.0))
                             except Exception:
-                                pass
-                            try:
-                                _driver.switch_to.window(_main_handle or _handles_before[0])
-                            except Exception:
-                                if _driver.window_handles:
-                                    _driver.switch_to.window(_driver.window_handles[0])
+                                break
+                        # 落地页剩余停留时间
+                        _elapsed = _lp_load + _lp_scrolls * 2.5
+                        _remaining_stay = max(0, _lp_stay - _elapsed)
+                        if _remaining_stay > 0:
+                            time.sleep(_remaining_stay)
+                        behavior_stats["total_stay"] += int(_lp_stay * 1000)
+                        # ★ 关闭前鼠标移动到关闭按钮区域（模拟真人关闭标签页）
+                        try:
+                            _vw = _landing_page.viewport_size or {"width": 1920, "height": 1080}
+                            _landing_page.mouse.move(random.randint(_vw["width"] - 80, _vw["width"] - 20), random.randint(5, 25))
+                            time.sleep(random.uniform(0.3, 0.8))
+                        except Exception:
+                            pass
+                        log.info(f"🛬 落地页浏览完成（停留≈{_lp_stay:.1f}s，滚动{_lp_scrolls}次），关闭并返回原站")
+                        # 关闭落地页标签
+                        try:
+                            _landing_page.close()
+                        except Exception:
+                            pass
                 except Exception as _lp_err:
                     log.debug(f"落地页行为处理异常（忽略）: {type(_lp_err).__name__}: {str(_lp_err)[:80]}")
         except Exception:
@@ -7981,6 +8326,10 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
     ]
     _seen = set()
     _normalized_user = [t.lower().strip() for t in (text_list or []) if t and t.strip()]
+    # ★ 性能优化：关键词超过50个时随机取50个（避免1935个关键词传入JS导致慢）
+    if len(_normalized_user) > 50:
+        log.info(f"📌 关键词共{len(_normalized_user)}个，随机取50个进行匹配")
+        _normalized_user = random.sample(_normalized_user, 50)
     _merged = list(_normalized_user)
     for t in _normalized_user:
         _seen.add(t)
@@ -7988,7 +8337,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
         if t not in _seen:
             _merged.append(t)
             _seen.add(t)
-    log.info(f"🔍 尝试在页面上找到并点击链接（用户关键词={text_list}, 扩展后共 {len(_merged)} 个）...")
+    log.info(f"🔍 尝试在页面上找到并点击链接（用户关键词={len(text_list or [])}个, 扩展后共 {len(_merged)} 个）...")
 
     # 先等待页面稳定
     time.sleep(random.uniform(1, 2))
@@ -8004,63 +8353,52 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
         except Exception:
             _base_url = ""
 
-        for attempt in range(3):
+        # ★ 使用 JS evaluate 在浏览器内完成链接匹配（比Python逐一遍历CDP快10倍+）
+        for attempt in range(2):
             try:
-                # 查找所有a标签
-                all_links = page.query_selector_all('a[href]')
+                _js_result = page.evaluate("""
+                    (keywords) => {
+                        const links = document.querySelectorAll('a[href]');
+                        const candidates = [];
+                        const seenHref = new Set();
+                        const baseUrl = window.location.href;
+                        for (const link of links) {
+                            const href = (link.getAttribute('href') || '').trim();
+                            if (!href || href.startsWith('mailto:') || href.startsWith('tel:') ||
+                                href.startsWith('javascript:') || href.startsWith('data:') || href === '#') continue;
+                            const text = (link.textContent || '').toLowerCase();
+                            const hrefLow = href.toLowerCase();
+                            // 规范化相对路径
+                            let normalized = href;
+                            try { normalized = new URL(href, baseUrl).href; } catch(e) {}
+                            if (seenHref.has(normalized)) continue;
+                            for (const kw of keywords) {
+                                if (!kw) continue;
+                                if (text.includes(kw) || hrefLow.includes(kw) || normalized.toLowerCase().includes(kw)) {
+                                    // 排除自链接
+                                    if (normalized.replace(/\/#?$/, '') === baseUrl.replace(/\/#?$/, '')) continue;
+                                    seenHref.add(normalized);
+                                    candidates.push({href: normalized, text: text.substring(0, 60), match: kw});
+                                    break;
+                                }
+                            }
+                        }
+                        return candidates;
+                    }
+                """, _merged) or []
                 
-                # ★ 收集所有命中关键词的候选链接，最后随机选一个
-                #   （解决 chapter1~chapter2000 永远只点第一个的问题，实现分散访问）
-                _candidates = []
-                _seen_href = set()
-                # 筛选包含相关文本的链接（不区分大小写；同时检查 href 路径中是否包含目标关键字）
-                for link in all_links:
-                    try:
-                        text = link.text_content().lower()
-                        href = link.get_attribute('href')
-                        # —— 过滤无效 href：空、mailto、tel、javascript、纯锚点 ——
-                        if not href or not isinstance(href, str):
-                            continue
-                        href_low = href.strip().lower()
-                        if not href_low:
-                            continue
-                        if href_low.startswith(("mailto:", "tel:", "javascript:", "data:", "#")):
-                            continue
-                        # —— URL 规范化：相对路径 → 完整 URL ——
-                        try:
-                            from urllib.parse import urljoin as _urljoin
-                            normalized = _urljoin(_base_url, href.strip())
-                        except Exception:
-                            normalized = href.strip()
-                        # 再次安全检查：规范化后仍需是 http(s):// 协议
-                        if not normalized.lower().startswith(("http://", "https://")):
-                            continue
-                        # 排除跳转到自身（与当前页完全相同的 URL，避免点击空白锚点）
-                        if _base_url and normalized.rstrip("/#") == _base_url.rstrip("/#"):
-                            continue
-                        # 匹配规则：链接文本 OR href路径 包含任一目标关键字
-                        for target_text in _merged:
-                            if not target_text:
-                                continue
-                            if target_text in text or target_text in href_low or target_text in normalized.lower():
-                                if normalized not in _seen_href:
-                                    _seen_href.add(normalized)
-                                    _candidates.append((normalized, text or href_low, target_text))
-                                break
-                    except Exception:
-                        continue
-                
-                if _candidates:
-                    # ★ 从所有命中链接中随机选一个，实现 chapter1~N 分散访问
-                    _chosen = random.choice(_candidates)
-                    target_href = _chosen[0]
-                    target_text_found = _chosen[1]
+                if _js_result:
+                    # 从所有命中链接中随机选一个
+                    _chosen = random.choice(_js_result)
+                    target_href = _chosen['href']
+                    target_text_found = _chosen['text']
                     log.info(
-                        f"✅ 命中 {len(_candidates)} 个关键词链接，随机选中: "
-                        f"{str(target_text_found)[:40]} | match={_chosen[2]} | {target_href}"
+                        f"✅ 命中 {len(_js_result)} 个关键词链接(JS)，随机选中: "
+                        f"{str(target_text_found)[:40]} | match={_chosen['match']} | {target_href}"
                     )
                     break
-            except Exception:
+            except Exception as _js_err:
+                log.debug(f"JS链接匹配异常(attempt={attempt}): {str(_js_err)[:80]}")
                 time.sleep(0.5)
                 continue
         
@@ -8161,26 +8499,56 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
         f"（关键词={text_list}, fallback={len(fallback_urls or [])}个, final_fallback={bool(final_fallback_url)}）"
     )
 
-    # 先尝试正常的链接点击（关键词或 href 匹配）——加30秒总超时，避免代理慢导致卡死
+    # ★ 修复：Playwright page对象非线程安全，不能用ThreadPoolExecutor！
+    # 直接调用（JS evaluate本身很快，<1秒），不再套线程池超时
+    _has_kw = bool(text_list and any(str(k).strip() for k in text_list))
+    if _has_kw:
+        try:
+            success, new_x, new_y = click_link_containing_text(page, text_list, current_x, current_y, config)
+            if success:
+                log.info("✅ 通过关键词链接跳转成功")
+                return True, new_x, new_y
+        except Exception as e:
+            log.warning(f"⚠️ click_link_containing_text 异常: {str(e)[:80]}")
+
+    # ★ 新增：通用链接点击回退——在当前页面点击任意内容链接（排除导航/功能链接）
     try:
-        _has_kw = bool(text_list and any(str(k).strip() for k in text_list))
-        if _has_kw:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
-            def _do_click():
-                return click_link_containing_text(page, text_list, current_x, current_y, config)
+        _generic_result = page.evaluate("""
+            () => {
+                const exclude = /login|logout|admin|register|signup|cart|checkout|account|privacy|terms|dmca|refund|contact|about|faq|mailto|javascript/i;
+                const links = document.querySelectorAll('a[href]');
+                const candidates = [];
+                for (const a of links) {
+                    const href = (a.getAttribute('href') || '').trim();
+                    if (!href || href === '#' || href.startsWith('javascript:') || href.startsWith('mailto:')) continue;
+                    if (exclude.test(href)) continue;
+                    const text = (a.textContent || '').trim();
+                    if (text.length < 2 && !a.querySelector('img')) continue;
+                    // 排除自链接
+                    try {
+                        const full = new URL(href, window.location.href).href;
+                        if (full.replace(/\/#?$/, '') === window.location.href.replace(/\/#?$/, '')) continue;
+                    } catch(e) {}
+                    candidates.push(href);
+                }
+                if (candidates.length === 0) return null;
+                return candidates[Math.floor(Math.random() * candidates.length)];
+            }
+        """)
+        if _generic_result:
+            # 解析相对路径为绝对URL
+            from urllib.parse import urljoin as _uj
+            _target = _uj(page.url, _generic_result)
+            log.info(f"🔗 通用回退：随机点击页面链接 → {_target[:80]}")
             try:
-                with ThreadPoolExecutor(max_workers=1) as _ex:
-                    _fut = _ex.submit(_do_click)
-                    success, new_x, new_y = _fut.result(timeout=30)
-                if success:
-                    log.info("✅ 通过关键词链接跳转成功")
-                    return True, new_x, new_y
-            except _FutTimeout:
-                log.warning("⚠️ 关键词链接查找超时(30s)，跳过直接走兜底URL")
-            except Exception as e:
-                log.warning(f"⚠️ click_link_containing_text 异常: {str(e)[:80]}")
-    except Exception as e:
-        log.warning(f"⚠️ click_link_containing_text 异常: {str(e)[:80]}")
+                page.goto(_target, wait_until="domcontentloaded", timeout=12000)
+                time.sleep(random.uniform(1.5, 3))
+                log.info(f"✅ 通用回退跳转成功")
+                return True, current_x or 300, current_y or 300
+            except Exception as _ge:
+                log.warning(f"⚠️ 通用回退跳转失败: {str(_ge)[:80]}")
+    except Exception as _e2:
+        log.debug(f"通用链接回退异常: {str(_e2)[:60]}")
 
     # 如果失败（或关键词为空），尝试使用 fallback_urls
     # ★ 打乱兜底链接池顺序，实现 chapter1~N 分散访问（避免每次只点第一个）
@@ -8189,17 +8557,29 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
     if final_fallback_url:
         _fbs.append(final_fallback_url)  # 终极兜底始终最后尝试
 
+    # ★ 性能优化：最多尝试3个兜底URL，避免19个全试导致超时（每个20s×19=380s/层）
+    _max_fb_try = 3
+    if len(_fbs) > _max_fb_try:
+        log.info(f"📌 兜底URL共{len(_fbs)}个，随机取{_max_fb_try}个尝试（避免超时）")
+        _fbs = _fbs[:_max_fb_try]
+
     if _fbs:
         log.warning(f"⚠️ 未找到关键词链接，尝试使用 {len(_fbs)} 个兜底URL...")
+        _consecutive_fail = 0
         for url in _fbs:
             try:
                 log.info(f"🚀 尝试兜底URL: {url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(random.uniform(2, 4))
+                page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                time.sleep(random.uniform(1.5, 3))
                 log.info(f"✅ 兜底URL跳转成功：{url}")
                 return True, current_x or 300, current_y or 300
             except Exception as e:
                 log.warning(f"⚠️ 兜底URL跳转失败：{str(e)[:120]}")
+                _consecutive_fail += 1
+                # ★ 连续2次失败立即放弃，不再浪费时间
+                if _consecutive_fail >= 2:
+                    log.warning(f"⚠️ 兜底URL连续{_consecutive_fail}次失败，放弃剩余尝试")
+                    break
                 # goto 抛异常但内容实际已加载 → 视为成功
                 try:
                     _u = page_url_safe(page, default="")
@@ -8285,16 +8665,26 @@ def click_chapter_page_link(page, current_x, current_y, config, keywords=None, f
     
     # 如果失败，尝试使用 fallback_urls
     if fallback_urls and len(fallback_urls) > 0:
-        log.warning(f"⚠️ 未找到关键词链接，尝试使用 {len(fallback_urls)} 个兜底URL...")
-        for url in fallback_urls:
+        _fbs2 = list(fallback_urls)
+        random.shuffle(_fbs2)
+        # ★ 性能优化：最多尝试3个
+        if len(_fbs2) > 3:
+            _fbs2 = _fbs2[:3]
+        log.warning(f"⚠️ 未找到关键词链接，尝试使用 {len(_fbs2)} 个兜底URL...")
+        _cf2 = 0
+        for url in _fbs2:
             try:
                 log.info(f"🚀 尝试兜底URL：{url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(random.uniform(2, 4))
+                page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                time.sleep(random.uniform(1.5, 3))
                 log.info(f"✅ 兜底URL跳转成功：{url}")
                 return True, current_x or 300, current_y or 300
             except Exception as e:
                 log.warning(f"⚠️ 兜底URL跳转失败：{url}，错误：{str(e)[:80]}")
+                _cf2 += 1
+                if _cf2 >= 2:
+                    log.warning(f"⚠️ 兜底URL连续{_cf2}次失败，放弃")
+                    break
                 continue
     
     log.error("❌ 关键词链接和所有兜底URL都失败")
@@ -9332,6 +9722,49 @@ def check_ip_leak_robust(page, expected_ip):
         # 异常时仍然返回 "unreachable"（检测异常≠泄漏），避免把一个普通异常变成整个任务失败
         return "unreachable", expected_ip or "unreachable", "disabled"
 
+
+def _format_plan_log_block(plan, title, show_tasks=True, max_tasks=10):
+    """将任务计划格式化为日志窗口展示块。
+
+    由于日志是“最新置顶”且每条日志为一个 <p>，多条 log.info 会被倒序展示，
+    因此这里将多行内容合并为单条日志（内部用 <br> 分行），保证计划预览正序阅读。
+    """
+    total = plan.get("total_tasks", 0)
+    days = plan.get("plan_days", 1)
+    model = plan.get("model_used", "")
+    site_age = plan.get("site_age", "")
+    dist = plan.get("country_distribution", {})
+    dist_str = "、".join(f"{k}={v}" for k, v in dist.items()) if dist else "无"
+    lines = [
+        f"{title}",
+        f"总任务数: <b>{total}</b> | 计划天数: {days} | 流量模型: {model} | 站点年龄: {site_age}",
+        f"国家分布: {dist_str}",
+    ]
+    if show_tasks:
+        import datetime as _dt_fmt
+        tasks = plan.get("tasks", [])
+        for t in tasks[:max_tasks]:
+            # 计算目标国本地时间
+            _cc = t.get('proxy_country', '')
+            _epoch = t.get('actual_start_epoch', 0)
+            _local_str = ''
+            if _epoch and _cc:
+                try:
+                    _tz_name = get_timezone_for_country(_cc)
+                    _tz_obj = pytz.timezone(_tz_name)
+                    _dt_obj = _dt_fmt.datetime.fromtimestamp(_epoch, tz=_tz_obj)
+                    _local_str = f" 当地{_dt_obj.strftime('%H:%M')}"
+                except Exception:
+                    pass
+            lines.append(
+                f"&nbsp;&nbsp;#{t.get('idx','')} {t.get('plan_time','')} "
+                f"[{_cc}]{_local_str} 停留{t.get('task_duration',0)}s"
+            )
+        if len(tasks) > max_tasks:
+            lines.append(f"&nbsp;&nbsp;... 还有 {len(tasks) - max_tasks} 条任务")
+    return "<br>".join(lines)
+
+
 def worker_task(single_task=False, adsl_ip_task=False):
     global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status
     stats["total"] = 0
@@ -9474,6 +9907,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
     log.info(
         f"✅ 任务清单生成成功: total={total_tasks}, model={model_used}, site_age={site_age}"
     )
+    # 在日志最顶部展示当前任务计划的执行日志（执行头部，后续实时执行日志会逐条置顶）
+    log.info(_format_plan_log_block(
+        daily_plan, "▶️ <b>开始执行当前任务计划</b>", show_tasks=False
+    ))
     
     # 设置显示的总任务数
     planned_total_tasks = total_tasks
@@ -9787,7 +10224,19 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 "language": resolved_ip_info.get("language") or _language,
                             }
                             if not resolved_ip_info["timezone"]:
-                                resolved_ip_info["timezone"] = "Etc/UTC"
+                                # ★ 严禁回退到 Etc/UTC！该时区与任何真实用户不匹配，极易被风控标记。
+                                # 尝试用国家代码映射表兜底
+                                from ip_info_resolver import COUNTRY_TO_TIMEZONE as _CC_TZ_MAP
+                                _fallback_tz = _CC_TZ_MAP.get(resolved_ip_info.get("country_code", ""))
+                                if _fallback_tz:
+                                    resolved_ip_info["timezone"] = _fallback_tz
+                                    log.info(f"🗂️ 时区兜底映射: {resolved_ip_info.get('country_code')} → {_fallback_tz}")
+                                else:
+                                    log.warning(
+                                        f"⚠️ IP {exit_ip} 无法确定时区（国家={resolved_ip_info.get('country_code')}），"
+                                        f"舍弃换下一个 IP（严禁使用 Etc/UTC）"
+                                    )
+                                    continue
                             if not resolved_ip_info["language"]:
                                 resolved_ip_info["language"] = "en-US"
                             log.info(
@@ -9840,7 +10289,27 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             log.warning(f"⚠️ 国别 {ip_region} 没有可用平台，舍弃 IP 换下一个")
                             continue
                         
-                        selected_keyword = seo_query.get_random_keyword_for_engine(selected_engine_id)
+                        # ★ 3.6 关键词长尾策略：优先使用keyword_explore已验证词
+                        selected_keyword = None
+                        _kw_strategy = config.get("keyword_strategy", {})
+                        if _kw_strategy.get("explore_first", True):
+                            # 从data/keyword_explore/最新文件中随机抽取
+                            import glob as _glob_kw
+                            import os as _os_kw
+                            _kw_dir = _os_kw.path.join(_os_kw.path.dirname(_os_kw.path.abspath(__file__)), "data", "keyword_explore")
+                            _kw_files = sorted(_glob_kw.glob(_os_kw.path.join(_kw_dir, "keywords_*.txt")), reverse=True)
+                            if _kw_files:
+                                try:
+                                    with open(_kw_files[0], 'r', encoding='utf-8') as _kf:
+                                        _explored_kws = [l.strip() for l in _kf.readlines() if l.strip() and len(l.strip().split()) >= 3]
+                                    if _explored_kws:
+                                        selected_keyword = random.choice(_explored_kws)
+                                        log.info(f"🔑 使用keyword_explore长尾词: {selected_keyword[:50]}")
+                                except Exception:
+                                    pass
+                        # 兜底：从config关键词池选择
+                        if not selected_keyword:
+                            selected_keyword = seo_query.get_random_keyword_for_engine(selected_engine_id)
                         if not selected_keyword:
                             log.warning(f"⚠️ 平台 {selected_engine_id} 没有可用关键词，舍弃 IP 换下一个")
                             continue
@@ -9862,6 +10331,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         log.error(f"获取/识别代理 IP 失败（第 {ip_attempt+1} 次）: {str(e)}")
                 
                 log.proxy_module(layer1_success, ipdeep_success, ip_success, exit_ip, real_ip, country, region, city, timezone, language)
+                
+                # ★ 同步进程/系统时区到 IP 时区（与 ADSL 模式一致，确保日志时间戳 = IP 当地时间）
+                if ip_success and resolved_ip_info:
+                    try:
+                        sync_process_timezone_to_ip(resolved_ip_info)
+                    except Exception as _tz_sync_err:
+                        log.warning(f"⚠️ 进程时区同步失败（浏览器时区已通过 timezone_id 正确设置，不影响反检测）: {str(_tz_sync_err)[:100]}")
                 
                 # 中途停止或最终失败 → 直接进入下一轮
                 if not task_running:
@@ -9922,6 +10398,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     hardware_concurrency = int(fingerprint.get("hardware_concurrency", 8))
                     device_memory = int(fingerprint.get("device_memory", 8))
                     color_depth = int(fingerprint.get("color_depth", 24))
+                    battery_level = float(fingerprint.get("battery_level", 0.85))
+                    orientation_type = fingerprint.get("orientation_type", "landscape-primary")
+                    orientation_angle = int(fingerprint.get("orientation_angle", 0))
                     fonts_json = json.dumps(fingerprint.get("fonts", []))
                     # 会话存储随机化种子（仅 new_each_task 模式注入，避免覆盖 country_host_7d 持久化会话）
                     storage_randomize_js = "true" if (get_global_session_mode() != "country_host_7d") else "false"
@@ -9972,65 +10451,33 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     stats["fail"] += 1
                     continue
 
-                # ========== Step C-1: 目标网站健康检测（通过代理，仅诊断用，不影响任务执行） ==========
-                # 说明：这里仅做诊断记录，不因为检测失败而跳过任务 —— requests 的 TCP/TLS/HTTP2 行为与真实浏览器不同
-                _target_urls_cfg = config.get("target_urls")
-                if isinstance(_target_urls_cfg, list) and _target_urls_cfg:
-                    _target_url = next((item.get("url", "").strip() for item in _target_urls_cfg if item.get("enabled") and item.get("url", "").strip()), config.get("target_url", ""))
-                else:
-                    _target_url = config.get("target_url", "")
-                if _target_url:
-                    try:
-                        # 使用 IPDeep 代理进行诊断
-                        _diag_host = proxy_info.get('proxy_host', '')
-                        _diag_port = proxy_info.get('proxy_port', '')
-                        _diag_user = proxy_info.get('proxy_username', '')
-                        _diag_pwd = proxy_info.get('proxy_password', '')
-                        if _diag_user and _diag_pwd:
-                            _diag_url = f"http://{_diag_user}:{_diag_pwd}@{_diag_host}:{_diag_port}"
-                        else:
-                            _diag_url = f"http://{_diag_host}:{_diag_port}"
-                        _proxy_for_check = {
-                            "http": _diag_url,
-                            "https": _diag_url
-                        }
-                        log.info(f"🩺 [诊断] 通过 IPDeep 代理访问 {_target_url} ...")
-                        _health_resp = requests.get(
-                            _target_url,
-                            proxies=_proxy_for_check,
-                            timeout=15,
-                            headers={"User-Agent": user_agent}
-                        )
-                        log.info(
-                            f"🩺 [诊断] 目标站访问: HTTP {_health_resp.status_code} "
-                            f"(长度≈{len(_health_resp.content or b'')}字节，仅用于诊断，不用于判定任务)"
-                        )
-                    except requests.exceptions.ConnectionError as _ce:
-                        log.warning(
-                            f"⚠️ [诊断] 目标站访问 ConnectionError: {str(_ce)[:120]} "
-                            f"(仅用于诊断，继续浏览器访问)"
-                        )
-                    except requests.exceptions.Timeout as _to:
-                        log.warning(
-                            f"⚠️ [诊断] 目标站访问 Timeout(15s) (仅用于诊断，继续浏览器访问): {str(_to)[:80]}"
-                        )
-                    except requests.exceptions.ProxyError as _pe:
-                        log.warning(
-                            f"⚠️ [诊断] 目标站访问 ProxyError (代理认证或链路问题，仅诊断): {str(_pe)[:120]}"
-                        )
-                    except Exception as _he:
-                        log.warning(
-                            f"⚠️ [诊断] 目标站访问异常（忽略，继续浏览器访问）: "
-                            f"{type(_he).__name__}: {str(_he)[:120]}"
-                        )
+                # ========== Step C-1: 目标网站健康检测 ==========
+                # ★ 风控修复：已移除 requests.get() 直连目标站！
+                # 原因：该请求无Referer、无Cookie、TLS指纹与浏览器不同，
+                # 目标站服务器日志会记录一次"裸访问"，AdSense/广告联盟后台可关联此IP为机器人。
+                # 所有对目标站的访问必须且只能通过浏览器+Referer来源页进入。
+                log.info("🔒 [风控] 已禁用直连诊断，所有目标站访问将通过浏览器Referer链路")
 
                 # 启动浏览器，强制关闭WebRTC，添加反检测参数
                 log.info("正在启动浏览器...")
-                _headless_mode = bool(config.get("headless", True))
+                _headless_mode = bool(config.get("headless", False))
+                # ★ 有头模式反检测保障：无图形界面服务器（无 DISPLAY）上必须通过 Xvfb 虚拟显示器运行有头模式，
+                #   因为 headless 模式会被谷歌风控识别。若 Xvfb 不可用则任务直接失败，绝不降级为无头模式。
+                if not _headless_mode and not os.environ.get("DISPLAY"):
+                    try:
+                        ensure_xvfb_for_headed_mode(_headless_mode)
+                    except Exception as _xvfb_err:
+                        log.error(f"❌ 有界面模式不可用（无 DISPLAY 且 Xvfb 启动失败: {str(_xvfb_err)[:120]}）。"
+                                  f"有头模式为反检测硬性要求，任务终止。请安装 xvfb: apt-get install -y xvfb")
+                        raise RuntimeError(f"Xvfb 不可用，无法运行有头模式: {str(_xvfb_err)[:120]}")
+                    if not os.environ.get("DISPLAY"):
+                        log.error("❌ Xvfb 启动后仍无 DISPLAY，有头模式不可用，任务终止。")
+                        raise RuntimeError("Xvfb 启动后仍无 DISPLAY")
+                    log.info(f"✅ Xvfb 虚拟显示器已就绪 DISPLAY={os.environ.get('DISPLAY')}，有头模式可正常运行")
                 _use_real_chrome = bool(config.get("use_real_chrome", True))
                 if proxy_config and str(proxy_config.get("server", "")).startswith("http://"):
                     log.info("IPDeep HTTP代理模式：通过Selenium Chrome访问，噪音请求已通过--host-rules和JS hook拦截")
-                log.info(f"浏览器模式: {'无头(headless=True)' if _headless_mode else '有界面(headless=False, 调试用)'}，浏览器内核: {'本地 Chrome（带 H.264/AAC）' if _use_real_chrome else '系统Chrome（无专有 codec）'}")
+                log.info(f"浏览器模式: {'无头(headless=True)' if _headless_mode else '有界面(headless=False, Xvfb虚拟显示)'}，浏览器内核: {'本地 Chrome（带 H.264/AAC）' if _use_real_chrome else '系统Chrome（无专有 codec）'}")
                 
                 # 使用指纹生成的 User-Agent（与IP匹配）
                 selected_ua = user_agent
@@ -10056,20 +10503,31 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 if proxy_config is not None:
                     _launch_args.extend([
                         f"--proxy-server={proxy_config['server']}",
-                        "--proxy-bypass-list=*.google.com;*.googleapis.com;*.gstatic.com;*.gvt1.com;accounts.google.com;clients2.google.com;safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;httpbin.org;api.ipify.org;icanhazip.com;ifconfig.me;checkip.amazonaws.com;ident.me",
+                        # ★ 代理绕过列表：仅包含 Chrome 内部后台服务，严禁包含 *.google.com！
+                        # 之前包含 *.google.com;*.googleapis.com;*.gstatic.com 导致：
+                        #   - Google搜索请求绕过代理直连 → Google看到VPS真实IP（致命）
+                        #   - Google Fonts/广告资源绕过代理 → IP不一致
+                        # 仅保留 Chrome 安全浏览和组件更新等内部服务
+                        "--proxy-bypass-list=safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;clients2.google.com;update.googleapis.com;edgedl.me.gvt1.com",
                     ])
-                # WebRTC防护与配置面板同步
+                # WebRTC防护：仅强制走代理，不完全禁用（完全禁用是强检测信号）
+                # init_script 已通过包装 RTCPeerConnection + 过滤 ICE candidate 实现 IP 泄露防护
                 if config.get("webrtc_leak_check_enabled", True):
                     _launch_args.extend([
-                        "--disable-webrtc",
-                        "--disable-webrtc-encryption",
-                        "--disable-webrtc-stun-origin",
+                        # ★ 严禁 --disable-webrtc！真实浏览器都有 WebRTC，完全禁用会被风控检测。
+                        # 仅用 policy 强制 UDP 走代理，保留 API 可用性
                         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                        "--webrtc-max-packet-size=0"
+                        "--enforce-webrtc-ip-handling-policy",
                     ])
-                    log.info("WebRTC防泄漏已启用")
+                    log.info("WebRTC防泄漏已启用（仅强制代理，保留API可用性）")
                 else:
                     log.warning("WebRTC防泄漏已禁用（可能导致IP泄漏风险）")
+                
+                # ★ 7.1 DNS-over-HTTPS：防止系统级DNS查询泄露真实地理位置
+                _launch_args.extend([
+                    "--dns-over-https-templates=https://dns.google/dns-query",
+                    "--dns-over-https-mode=secure",
+                ])
                 
                 _launch_args.extend([
                         f"--lang={_launch_lang}",
@@ -10092,8 +10550,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         "--safebrowsing-disable-auto-update",
                         "--disable-domain-reliability",
                         "--disable-translate",
-                        "--translate-ranker-model-url=0.0.0.0",
-                        "--translate-security-origin=0.0.0.0",
                         "--metrics-recording-only",
                         "--disable-component-update",
                         "--disable-component-extensions-with-background-pages",
@@ -10101,9 +10557,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         "--disable-default-apps",
                         "--disable-hang-monitor",
                         "--disable-prompt-on-repost",
-                        "--disable-client-side-phishing-detection",
-                        "--disable-password-manager-reauthentication",
-                        "--disable-ipc-flooding-protection"
+                        "--disable-client-side-phishing-detection"
                     ])
                 _launch_kwargs = dict(headless=_headless_mode, args=_launch_args)
                 
@@ -10195,20 +10649,30 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 
                 # 创建浏览器上下文，严格应用指纹配置
                 
-                # 构建额外头部：只设置业务需要的 Referer，避免发送非法空代理头
+                # ★ 风控修复：严禁在 extra_http_headers 中设置全局 Referer！
+                # 原因：真实浏览器只在顶层导航请求发送 Referer，子资源(img/css/js/xhr)不发。
+                # 全局设置 Referer 会导致所有请求都带 Referer，这是机器人特征，广告联盟可检测。
+                # Referer 将通过自然导航链路（先访问来源页→再跳转目标站）正确传递。
                 extra_http_headers = {}
-                if generated_referer:
-                    extra_http_headers["Referer"] = generated_referer
-                    log.info(f"设置Referer头部: {generated_referer}")
-                else:
-                    default_referers = ["https://www.google.com/", "https://www.bing.com/", "https://www.baidu.com/"]
-                    default_referer = random.choice(default_referers)
-                    extra_http_headers["Referer"] = default_referer
-                    log.info(f"设置默认Referer头部: {default_referer}")
+                log.info(f"🔒 [风控] Referer将通过自然导航链路传递，来源={generated_referer or '搜索引擎'}")
                 
-                # 添加 Accept-Language 请求头，确保与指纹语言一致
+                # 添加 Accept-Language 请求头，确保与指纹语言一致（避免自引用：en-US 不再重复出现在 q=0.9 位）
                 lang_prefix = fingerprint["language"].split("-")[0]
-                accept_language = f"{fingerprint['language']},{lang_prefix};q=0.9,en-US;q=0.8,en;q=0.7"
+                _al_primary = fingerprint['language']  # e.g. "en-US"
+                _al_fallback = f",{_al_primary};q=0.9" if _al_primary != f"{lang_prefix}" else ""
+                # 构建合理回退链：主语言 → 语言前缀(如果不同) → en-US/en(如果主语言非英语)
+                _al_parts = [_al_primary]
+                if lang_prefix != _al_primary:
+                    _al_parts.append(f"{lang_prefix};q=0.9")
+                if not _al_primary.startswith("en"):
+                    _al_parts.append("en-US;q=0.8")
+                    _al_parts.append("en;q=0.7")
+                else:
+                    # 英语变体（en-GB/en-AU等）追加 en-US 作为次级回退
+                    if _al_primary != "en-US":
+                        _al_parts.append("en-US;q=0.8")
+                    _al_parts.append("en;q=0.7")
+                accept_language = ",".join(_al_parts)
                 extra_http_headers["Accept-Language"] = accept_language
                 log.info(f"设置Accept-Language头部: {accept_language}")
                 
@@ -10227,7 +10691,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 if _ua_match:
                     _ua_chrome_ver = _ua_match.group(1)
                 extra_http_headers["Sec-Ch-Ua"] = f'"Not_A Brand";v="8", "Chromium";v="{_ua_chrome_ver}", "Google Chrome";v="{_ua_chrome_ver}"'
-                extra_http_headers["Sec-Ch-Ua-Mobile"] = "?0"
+                # ★ Sec-Ch-Ua-Mobile: 根据UA动态判断（Android/Mobile为?1，桌面为?0）
+                _is_mobile_ua = any(kw in user_agent for kw in ("Android", "Mobile", "iPhone", "iPad"))
+                extra_http_headers["Sec-Ch-Ua-Mobile"] = "?1" if _is_mobile_ua else "?0"
                 # 平台一致性：根据UA中的平台信息动态设置
                 _ua_platform_str = '"Windows"'
                 if 'Mac OS X' in user_agent or 'Macintosh' in user_agent:
@@ -10261,6 +10727,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 else:
                     log.info("[QA会话] 使用全局session策略: new_each_task，本轮不加载历史会话")
 
+                # ★ 专家1修复: 上下文参数必须与UA类型严格一致（风控交叉验证致命点）
+                _ctx_is_mobile = any(kw in selected_ua for kw in ("Android", "Mobile", "iPhone", "iPad"))
+                _ctx_dsf = random.choice([2, 3]) if _ctx_is_mobile else random.choice([1, 2])
                 context_kwargs = dict(
                     user_agent=selected_ua,
                     viewport={"width": width, "height": height},
@@ -10268,9 +10737,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     timezone_id=browser_timezone,
                     permissions=[],
                     geolocation=None,
-                    device_scale_factor=1,
-                    is_mobile=False,
-                    has_touch=False,
+                    device_scale_factor=_ctx_dsf,
+                    is_mobile=_ctx_is_mobile,
+                    has_touch=_ctx_is_mobile,
                     color_scheme="light",
                     extra_http_headers=extra_http_headers if extra_http_headers else None
                 )
@@ -10532,10 +11001,36 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         try {{ _patch(WebGL2RenderingContext.prototype); }} catch(e) {{}}
                     }})();
                     
-                    // ========== 3.1 硬件信息注入（hardwareConcurrency / deviceMemory / connection） ==========
+                    // ========== 3.1 硬件信息注入（hardwareConcurrency / deviceMemory / connection / platform / vendor / maxTouchPoints） ==========
                     try {{
                         Object.defineProperty(navigator, 'hardwareConcurrency', {{
                             get: function() {{ return {hardware_concurrency}; }}, configurable: true
+                        }});
+                    }} catch(e) {{}}
+                    // ★ navigator.platform: 必须与UA一致（风控会交叉验证）
+                    try {{
+                        const _ua = navigator.userAgent;
+                        let _platform = 'Win32';
+                        if (_ua.includes('Mac OS X') || _ua.includes('Macintosh')) _platform = 'MacIntel';
+                        else if (_ua.includes('Linux') && !_ua.includes('Android')) _platform = 'Linux x86_64';
+                        else if (_ua.includes('Android')) _platform = 'Linux armv8l';
+                        else if (_ua.includes('iPhone') || _ua.includes('iPad')) _platform = 'iPhone';
+                        Object.defineProperty(navigator, 'platform', {{
+                            get: function() {{ return _platform; }}, configurable: true
+                        }});
+                    }} catch(e) {{}}
+                    // ★ navigator.vendor: Chrome固定为"Google Inc."
+                    try {{
+                        Object.defineProperty(navigator, 'vendor', {{
+                            get: function() {{ return 'Google Inc.'; }}, configurable: true
+                        }});
+                    }} catch(e) {{}}
+                    // ★ navigator.maxTouchPoints: 桌面=0，移动端=5（与UA一致）
+                    try {{
+                        const _ua_tp = navigator.userAgent;
+                        const _is_touch = _ua_tp.includes('Android') || _ua_tp.includes('iPhone') || _ua_tp.includes('iPad') || _ua_tp.includes('Mobile');
+                        Object.defineProperty(navigator, 'maxTouchPoints', {{
+                            get: function() {{ return _is_touch ? 5 : 0; }}, configurable: true
                         }});
                     }} catch(e) {{}}
                     try {{
@@ -10687,6 +11182,86 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     }})();
                     
                     // ========== 5. 其他指纹伪装 ==========
+                    // ★ Battery API保护（headless可能缺失，补充真实值 + toString保护）
+                    try {{
+                        if (navigator.getBattery) {{
+                            const _origGetBattery = navigator.getBattery.bind(navigator);
+                            const _hookedGetBattery = function() {{
+                                return Promise.resolve({{
+                                    charging: true,
+                                    chargingTime: 0,
+                                    dischargingTime: Infinity,
+                                    level: {battery_level},
+                                    onchargingchange: null,
+                                    onchargingtimechange: null,
+                                    ondischargingtimechange: null,
+                                    onlevelchange: null,
+                                    addEventListener: function() {{}},
+                                    removeEventListener: function() {{}}
+                                }});
+                            }};
+                            Object.defineProperty(_hookedGetBattery, 'toString', {{
+                                value: function() {{ return 'function getBattery() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                            navigator.getBattery = _hookedGetBattery;
+                        }}
+                    }} catch(e) {{}}
+                    
+                    // ★ Screen Orientation保护（补充真实值）
+                    try {{
+                        if (screen.orientation) {{
+                            Object.defineProperty(screen.orientation, 'type', {{
+                                get: function() {{ return '{orientation_type}'; }},
+                                configurable: true
+                            }});
+                            Object.defineProperty(screen.orientation, 'angle', {{
+                                get: function() {{ return {orientation_angle}; }},
+                                configurable: true
+                            }});
+                        }}
+                    }} catch(e) {{}}
+                    
+                    // ★ SpeechSynthesis保护（headless可能缺失voices）
+                    try {{
+                        if (window.speechSynthesis) {{
+                            const _origGetVoices = window.speechSynthesis.getVoices.bind(window.speechSynthesis);
+                            window.speechSynthesis.getVoices = function() {{
+                                const voices = _origGetVoices();
+                                if (!voices || voices.length === 0) {{
+                                    return [
+                                        {{ name: 'Google US English', lang: 'en-US', voiceURI: 'Google US English', localService: false, default: true }},
+                                        {{ name: 'Google UK English Male', lang: 'en-GB', voiceURI: 'Google UK English Male', localService: false, default: false }}
+                                    ].map(v => {{
+                                        const voice = Object.create(SpeechSynthesisVoice.prototype);
+                                        Object.defineProperties(voice, {{
+                                            name: {{ value: v.name }},
+                                            lang: {{ value: v.lang }},
+                                            voiceURI: {{ value: v.voiceURI }},
+                                            localService: {{ value: v.localService }},
+                                            default: {{ value: v.default }}
+                                        }});
+                                        return voice;
+                                    }});
+                                }}
+                                return voices;
+                            }};
+                        }}
+                    }} catch(e) {{}}
+                    
+                    // ★ MediaDevices保护（headless可能缺失，补充空列表）
+                    try {{
+                        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+                            const _origEnumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+                            navigator.mediaDevices.enumerateDevices = function() {{
+                                return _origEnumerate().then(devices => {{
+                                    // 过滤掉可能暴露自动化的设备
+                                    return devices.filter(d => d.kind === 'audiooutput' || d.kind === 'videoinput');
+                                }});
+                            }};
+                        }}
+                    }} catch(e) {{}}
+                    
                     // chrome.runtime 保留对象但限制敏感API（完全删除会被检测）
                     if (window.chrome) {{
                         if (!window.chrome.runtime) {{
@@ -10744,6 +11319,83 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             configurable: true
                         }});
                     }})();
+                    
+                    // ========== ★ 4.1 AudioContext指纹噪声（CreepJS检测点） ==========
+                    (function() {{
+                        try {{
+                            const _seed = {canvas_noise_seed} >>> 0;
+                            let _s = _seed || 1;
+                            const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
+                            // Hook OfflineAudioContext.startRendering
+                            if (window.OfflineAudioContext) {{
+                                const _origStart = OfflineAudioContext.prototype.startRendering;
+                                OfflineAudioContext.prototype.startRendering = function() {{
+                                    return _origStart.call(this).then(function(buffer) {{
+                                        // 在渲染结果中注入微量噪声
+                                        try {{
+                                            for (let ch = 0; ch < buffer.numberOfChannels; ch++) {{
+                                                const data = buffer.getChannelData(ch);
+                                                for (let i = 0; i < data.length; i += 100) {{
+                                                    data[i] += (_rnd() - 0.5) * 0.0001;
+                                                }}
+                                            }}
+                                        }} catch(e) {{}}
+                                        return buffer;
+                                    }});
+                                }};
+                            }}
+                        }} catch(e) {{}}
+                    }})();
+                    
+                    // ========== ★ 4.2 ClientRects微噪声（防止DOM布局测量指纹） ==========
+                    (function() {{
+                        try {{
+                            const _seed = {canvas_noise_seed} >>> 0;
+                            let _s = _seed || 1;
+                            const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
+                            const _origGetBCR = Element.prototype.getBoundingClientRect;
+                            Element.prototype.getBoundingClientRect = function() {{
+                                const rect = _origGetBCR.call(this);
+                                // 添加±0.1-0.3px微噪声（极小，不影响布局）
+                                const _noise = (_rnd() - 0.5) * 0.4;
+                                return new DOMRect(rect.x + _noise, rect.y + _noise, rect.width + _noise, rect.height + _noise);
+                            }};
+                            Object.defineProperty(Element.prototype.getBoundingClientRect, 'toString', {{
+                                value: function() {{ return 'function getBoundingClientRect() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                        }} catch(e) {{}}
+                    }})();
+                    
+                    // ========== ★ 4.4 document.hasFocus() 保护（AdSense Active View检测） ==========
+                    (function() {{
+                        try {{
+                            const _origHasFocus = document.hasFocus;
+                            document.hasFocus = function() {{ return true; }};
+                            Object.defineProperty(document.hasFocus, 'toString', {{
+                                value: function() {{ return 'function hasFocus() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                        }} catch(e) {{}}
+                    }})();
+                    
+                    // ========== ★ 6.2 iframe顶层窗口检测应对（AdSense检测嵌套） ==========
+                    (function() {{
+                        try {{
+                            // 确保 window.top === window.self（防止被检测为嵌套iframe）
+                            if (window.top !== window.self) {{
+                                Object.defineProperty(window, 'top', {{
+                                    get: function() {{ return window.self; }},
+                                    configurable: true
+                                }});
+                            }}
+                            // frameElement 返回 null
+                            Object.defineProperty(window, 'frameElement', {{
+                                get: function() {{ return null; }},
+                                configurable: true
+                            }});
+                        }} catch(e) {{}}
+                    }})();
                 """)
                 
                 # ========== 安装隐私保护扩展 ==========
@@ -10761,10 +11413,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     
                     # 对视频请求进行特殊处理（支持udis视频混合中转方案）
                     if is_udis_video_url(url):
-                        # 对udis视频请求使用特殊的User-Agent（浏览器内置播放器UA）
+                        # ★ 使用当前浏览器实际UA（而非硬编码），避免UA版本不一致被检测
                         custom_headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-                            "Referer": "https://udisxxx.com/"  # 使用udis的真实域名作为Referer
+                            "User-Agent": selected_ua,
+                            "Referer": "https://udisxxx.com/"
                         }
                         
                         # 使用自定义头部继续请求
@@ -10780,13 +11432,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 try:
                     def _block_background_noise(route):
                         req_url = route.request.url.lower()
-                        noisy_hosts = (
-                            "googleapis.com", "accounts.google.com", "clients2.google.com",
-                            "safebrowsing", "gvt1.com", "gstatic.com/generate_204",
+                        # ★ 仅拦截 Chrome 后台噪音请求，严禁拦截 gstatic.com/googleapis.com 全域名！
+                        # gstatic.com 承载 Google Fonts 和部分广告资源，拦截后页面字体/广告异常
+                        noisy_patterns = (
+                            "gstatic.com/generate_204",  # 仅拦截连通性检测
+                            "googleapis.com/generate_204",
+                            "safebrowsing",
                             "httpbin.org", "api.ipify.org", "icanhazip.com", "ifconfig.me",
                             "checkip.amazonaws.com", "ident.me"
                         )
-                        if any(host in req_url for host in noisy_hosts):
+                        if any(p in req_url for p in noisy_patterns):
                             return route.abort()
                         return route.continue_()
                     context.route("**/*", _block_background_noise)
@@ -11035,10 +11690,19 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         total_ratio = sum(l["ratio"] for l in layers) or 1.0
 
                         # ★ 修正逻辑：配置时长优先，保险绳保底
-                        #   每轮独立随机，但总时长不超过7-9分钟保险绳
+                        #   每轮独立随机，但总时长不超过对数正态保险绳
                         if enter_site_time is None:
                             enter_site_time = time.time()
-                        task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机保险绳
+                        # ★ 对数正态采样（中位数180s，95%分位≈540s，硬上限600s）
+                        _sd_cfg = config.get("session_duration", {})
+                        _sd_median = float(_sd_cfg.get("median_sec", 180))
+                        _sd_sigma = float(_sd_cfg.get("sigma", 0.7))
+                        _sd_cap = float(_sd_cfg.get("hard_cap_sec", 600))
+                        import math as _math
+                        _sd_mu = _math.log(_sd_median)
+                        _session_secs = min(_sd_cap, max(60, _math.exp(random.gauss(_sd_mu, _sd_sigma))))
+                        task_deadline = enter_site_time + _session_secs
+                        log.info(f"⏱️ Session时长(对数正态): {_session_secs:.0f}s (中位数={_sd_median:.0f}s, σ={_sd_sigma})")
                         
                         round_total_stays = []
                         remaining_time = task_deadline - time.time()  # 剩余可运行时间
@@ -11071,8 +11735,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(min(5, len(round_layer_stays[_ridx]))))
                             )
     
-                        # ========== 第 1 步：访问首页（layer_1） ==========
-                        log.info("第 1 步：访问首页（layer_1）")
+                        # ========== 风控核心：Referer来源页自然导航链路 ==========
+                        # ★ 铁律：严禁直接访问目标网站！必须先访问来源页（搜索引擎/社媒），
+                        #   模拟真人浏览行为后，通过自然跳转进入目标站。
+                        #   这确保：HTTP Referer正确 + document.referrer正确 + 浏览器历史正确
+                        
                         # 统一设置更宽松的导航超时，避免网络抖动时过早失败
                         try:
                             page.set_default_navigation_timeout(120000)
@@ -11081,15 +11748,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             pass
     
                         # ---------- 辅助：检测"页面是否真的有内容" ----------
-                        # 使用 page_has_meaningful_content（底层 page_eval 已处理 JSHandle）
                         _detect = page_has_meaningful_content
     
                         home_load_success = False
                         _home_page_reason = "未执行"
 
-                        # ========== 处理 already_on_target ==========
+                        # ========== 处理 already_on_target（真搜索模式已成功跳转） ==========
                         if already_on_target:
-                            log.info("🔍 [真搜索] 已在目标页，跳过直接导航，直接检测当前页面")
+                            log.info("🔍 [真搜索] 已在目标页，跳过导航，直接检测当前页面")
                             _ok, _bl, _u = _detect(page)
                             if _ok:
                                 home_load_success = True
@@ -11100,50 +11766,134 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if "enter_site_time" not in locals() or enter_site_time is None:
                                 enter_site_time = time.time()
                         else:
-                            # ========== 严禁直跳：先访问Referer来源页（搜索引擎/社媒），再跳转目标网站 ==========
-                            if generated_referer:
-                                try:
-                                    log.info(f"🔗 [严禁直跳] 先访问Referer来源页: {generated_referer[:80]}")
-                                    page.goto(generated_referer, timeout=30000, wait_until="domcontentloaded")
-                                    time.sleep(random.uniform(1.5, 3.5))
-                                    log.info(f"✅ [严禁直跳] Referer来源页已访问，准备跳转目标网站")
-                                except Exception as e:
-                                    log.warning(f"⚠️ [严禁直跳] Referer来源页访问失败({str(e)[:60]})，继续跳转目标")
+                            # ========== 第 0 步：强制访问Referer来源页（搜索引擎/社媒） ==========
+                            # ★ 风控铁律：没有Referer来源页就不允许访问目标站！
+                            _referer_url = generated_referer
+                            if not _referer_url:
+                                # 兆底：如果SEO模块未生成referer，使用搜索引擎首页
+                                _referer_url = random.choice([
+                                    "https://www.google.com/", "https://www.bing.com/",
+                                    "https://search.yahoo.com/", "https://duckduckgo.com/"
+                                ])
+                                log.warning(f"⚠️ [风控] SEO未生成Referer，使用兆底搜索引擎: {_referer_url}")
                             
-                            _retry_wait_list = [6, 10]  # 第1、2次失败后的等待（秒）
+                            log.info(f"🔗 [风控铁律] 第0步：访问Referer来源页: {_referer_url[:80]}")
+                            _referer_visited = False
+                            try:
+                                page.goto(_referer_url, timeout=30000, wait_until="domcontentloaded")
+                                try:
+                                    page.wait_for_load_state("networkidle", timeout=5000)
+                                except Exception:
+                                    pass
+                                _referer_visited = True
+                                log.info(f"✅ [风控] Referer来源页已加载: {page.url[:60]}")
+                            except Exception as e:
+                                log.warning(f"⚠️ [风控] Referer来源页加载异常({str(e)[:60]})，尝试继续")
+                                _referer_visited = True  # 即使超时也认为已访问（页面可能部分加载）
+                            
+                            # ★ 模拟真人在来源页的浏览行为（5-15秒停留+滚动+鼠标+键盘）
+                            if _referer_visited:
+                                _dwell_time = random.uniform(5.0, 15.0)
+                                log.info(f"👤 [风控] 模拟真人在来源页浏览 {_dwell_time:.1f}秒...")
+                                # 滚动浏览来源页内容
+                                try:
+                                    for _scroll_i in range(random.randint(1, 3)):
+                                        _scroll_y = random.randint(100, 400)
+                                        page.mouse.wheel(0, _scroll_y)
+                                        time.sleep(random.uniform(0.8, 2.0))
+                                    # 随机鼠标移动（模拟阅读/浏览）
+                                    page.mouse.move(random.randint(200, 800), random.randint(150, 500))
+                                    time.sleep(random.uniform(0.5, 1.5))
+                                    # ★ 风控增强：模拟键盘交互（AdSense行为分析检测keydown事件）
+                                    # 真实用户在社媒/搜索页会有Tab导航、箭头键滚动、空格翻页等行为
+                                    _kb_actions = random.choice(['tab_nav', 'arrow_scroll', 'space_page', 'none'])
+                                    if _kb_actions == 'tab_nav':
+                                        for _ in range(random.randint(1, 3)):
+                                            page.keyboard.press('Tab')
+                                            time.sleep(random.uniform(0.3, 0.8))
+                                    elif _kb_actions == 'arrow_scroll':
+                                        for _ in range(random.randint(1, 2)):
+                                            page.keyboard.press('ArrowDown')
+                                            time.sleep(random.uniform(0.5, 1.0))
+                                    elif _kb_actions == 'space_page':
+                                        page.keyboard.press('Space')
+                                        time.sleep(random.uniform(0.8, 1.5))
+                                except Exception:
+                                    pass
+                                # 剩余停留时间
+                                _elapsed = 3.0  # 上面滚动大约用了3秒
+                                if _dwell_time > _elapsed:
+                                    time.sleep(_dwell_time - _elapsed)
+                                log.info(f"✅ [风控] 来源页浏览完成，准备自然跳转目标站")
+                            
+                            # ========== 第 1 步：从来源页自然跳转到目标站 ==========
+                            log.info("第 1 步：从Referer来源页自然跳转目标站（layer_1）")
+                            
+                            _retry_wait_list = [6, 10]
                             for retry in range(3):
                                 try:
-                                    # wait_until="commit" 最快返回（响应头到达即算成功），后续自行等待内容
-                                    # 优化网络请求：添加重试机制和资源拦截
                                     def optimized_page_goto(page, url, max_retries=2, referer=None):
-                                        # 拦截不必要的资源（图片、视频等，提升加载速度）
+                                        # ★ 严禁拦截任何资源类型！
+                                        # 图片(.png/.jpg/.webp/.gif)是广告素材的核心载体，
+                                        # 拦截后 AdSense 广告将显示空白，无法形成有效曝光。
+                                        # 仅拦截大体积视频文件以提升加载速度。
                                         try:
-                                            page.route("**/*.png", lambda route: route.abort())
-                                            page.route("**/*.jpg", lambda route: route.abort())
-                                            page.route("**/*.jpeg", lambda route: route.abort())
                                             page.route("**/*.mp4", lambda route: route.abort())
-                                            page.route("**/*.gif", lambda route: route.abort())
-                                            page.route("**/*.webp", lambda route: route.abort())
-                                            page.route("**/*.svg", lambda route: route.abort())
-                                            # 拦截已知广告域名（不用过于宽泛的模式，避免误伤正常JS）
-                                            page.route("**/*googleadservices*.com*", lambda route: route.abort())
-                                            page.route("**/*googlesyndication*.com*", lambda route: route.abort())
-                                            page.route("**/*doubleclick*.net*", lambda route: route.abort())
+                                            page.route("**/*.webm", lambda route: route.abort())
                                         except Exception:
                                             pass
                                         for attempt in range(max_retries):
                                             try:
-                                                # 优化页面加载（带Referer严禁直跳）
-                                                page.goto(url, timeout=25000, wait_until="domcontentloaded", referer=referer)
+                                                # ★ 风控核心：使用 window.location.href 自然跳转
+                                                # 这确保 document.referrer = 来源页URL（真实浏览器行为）
+                                                # 而 page.goto(url, referer=xxx) 只设置HTTP头，不设置document.referrer
+                                                page.evaluate("(url) => { window.location.href = url; }", url)
+                                                # 等待页面加载
+                                                try:
+                                                    page.wait_for_load_state("domcontentloaded", timeout=25000)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    page.wait_for_load_state("networkidle", timeout=8000)
+                                                except Exception:
+                                                    pass
+                                                # Cloudflare/WAF挑战检测
+                                                try:
+                                                    if is_cloudflare_challenge(page):
+                                                        log.info("🔐 检测到Cloudflare验证挑战，等待自动通过...")
+                                                        time.sleep(random.uniform(5.0, 8.0))
+                                                        try:
+                                                            page.wait_for_load_state("networkidle", timeout=15000)
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    pass
                                                 return True
                                             except Exception as e:
                                                 log.warning(f"第{attempt+1}次访问失败: {e}")
                                                 if attempt < max_retries - 1:
                                                     time.sleep(2)
                                         return False
-                                        
-                                    # 执行优化后的页面访问（带Referer严禁直跳）
-                                    if not optimized_page_goto(page, target_url, referer=generated_referer):
+                                    
+                                    # ★ 深层URL策略：70%概率从深层页面开始
+                                    _actual_target = target_url
+                                    _web_nav_cfg = config.get("web_navigation", {})
+                                    _layer1_fallbacks = _web_nav_cfg.get("layer_1", {}).get("fallback_urls", [])
+                                    _NO_AD_PATHS = ['/about', '/contact', '/privacy', '/refund', '/dmca', '/faq', '/terms', '/tos', '/cookie', '/sitemap', '/login', '/register', '/account']
+                                    _deep_urls = [
+                                        u for u in _layer1_fallbacks
+                                        if u and u.strip()
+                                        and u.strip().rstrip('/') != target_url.rstrip('/')
+                                        and not any(p in u.lower() for p in _NO_AD_PATHS)
+                                    ]
+                                    if _deep_urls and random.random() < 0.70:
+                                        _actual_target = random.choice(_deep_urls)
+                                        log.info(f"📄 深层URL策略：跳转内容页 {_actual_target[:60]}...")
+                                    else:
+                                        log.info(f"📄 从首页开始浏览: {target_url}")
+                                    
+                                    # ★ 自然跳转（从来源页通过JS导航，document.referrer自动正确）
+                                    if not optimized_page_goto(page, _actual_target):
                                         log.error(f"页面访问多次失败，任务终止")
                                         return False
                                         
@@ -11154,6 +11904,103 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                         home_load_success = True
                                         _home_page_reason = f"goto成功，body≈{_bl}字符"
                                         log.info(f"✅ 首页访问成功，页面已响应（URL={str(_u)[:80]}，body≈{_bl}字符）")
+                                        # ★ 即时广告检测：页面加载后立即检查是否含广告代码（提前诊断）
+                                        try:
+                                            _early_ad = page.evaluate("""
+                                                () => {
+                                                    // Google AdSense / GAM
+                                                    if (document.querySelector('ins.adsbygoogle,script[src*="adsbygoogle"],[data-ad-client]')) return 'AdSense';
+                                                    if (document.querySelector('script[src*="googlesyndication"],script[src*="pagead2"],iframe[src*="googlesyndication"]')) return 'AdSense/GAM';
+                                                    if (document.querySelector('script[src*="securepubads"],script[src*="googletagservices"]')) return 'GAM';
+                                                    // HilltopAds
+                                                    if (document.querySelector('script[src*="hilltopads"],iframe[src*="hilltopads"],[id*="hilltopads"]')) return 'HilltopAds';
+                                                    // EvaDav
+                                                    if (document.querySelector('script[src*="evadav"],iframe[src*="evadav"]')) return 'EvaDav';
+                                                    // HilltopAds/EvaDav 投放域名
+                                                    if (document.querySelector('script[src*="curoax"],script[src*="pufted"],iframe[src*="bony-teaching"],script[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
+                                                    // NativeAds
+                                                    if (document.querySelector('[class*="nativeads"]')) return 'NativeAds';
+                                                    // PropellerAds
+                                                    if (document.querySelector('script[src*="propellerads"],iframe[src*="propellerads"]')) return 'PropellerAds';
+                                                    // MGID
+                                                    if (document.querySelector('script[src*="mgid"],iframe[src*="mgid"]')) return 'MGID';
+                                                    // Taboola / Outbrain
+                                                    if (document.querySelector('script[src*="taboola"],iframe[src*="taboola"]')) return 'Taboola';
+                                                    if (document.querySelector('script[src*="outbrain"],iframe[src*="outbrain"]')) return 'Outbrain';
+                                                    // Ezoic / Mediavine / AdThrive / Raptive
+                                                    if (document.querySelector('script[src*="ezoic"],script[src*="ezoicnet"],[id*="ezoic"]')) return 'Ezoic';
+                                                    if (document.querySelector('script[src*="mediavine"],script[data-cfasync*="mediavine"],[class*="mediavine"]')) return 'Mediavine';
+                                                    if (document.querySelector('script[src*="adthrive"],script[src*="raptive"]')) return 'AdThrive/Raptive';
+                                                    // Monumetric / Bloomreach
+                                                    if (document.querySelector('script[src*="monumetric"],script[src*="broadstreet"]')) return 'Monumetric';
+                                                    // BuySellAds / Carbon
+                                                    if (document.querySelector('script[src*="buysellads"],script[src*="carbonads"]')) return 'BuySellAds';
+                                                    // Infolinks / Adsterra
+                                                    if (document.querySelector('script[src*="infolinks"],script[src*="adsterra"]')) return 'Infolinks/Adsterra';
+                                                    // 通用广告特征
+                                                    if (document.querySelector('iframe[width="728"][height="90"],iframe[width="300"][height="250"],iframe[width="160"][height="600"]')) return 'Banner';
+                                                    if (document.querySelector('[data-zone],[data-adzone],[data-ad-id],[data-adunit]')) return 'Generic';
+                                                    if (document.querySelector('iframe[src*="/ads/"],iframe[src*="/adserve/"],iframe[src*="/adserver/"]')) return 'Generic';
+                                                    if (document.querySelector('[class*="ad-container"],[class*="ad-wrapper"],[class*="ad-unit"],[id*="ad-container"],[id*="ad-wrapper"]')) return 'Generic';
+                                                    return false;
+                                                }
+                                            """)
+                                            if _early_ad:
+                                                log.info(f"🎯 页面含广告代码 [{_early_ad}]，本次访问将产生有效曝光")
+                                            else:
+                                                # ★ 延迟二次检测：滚动页面后再检测（捕获懒加载广告）
+                                                try:
+                                                    page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
+                                                    time.sleep(random.uniform(2.0, 3.5))
+                                                    _early_ad_retry = page.evaluate("""
+                                                        () => {
+                                                            if (document.querySelector('ins.adsbygoogle,script[src*="adsbygoogle"],[data-ad-client],script[src*="googlesyndication"],script[src*="securepubads"]')) return 'AdSense/GAM';
+                                                            if (document.querySelector('script[src*="hilltopads"],iframe[src*="hilltopads"]')) return 'HilltopAds';
+                                                            if (document.querySelector('script[src*="evadav"],iframe[src*="evadav"]')) return 'EvaDav';
+                                                            if (document.querySelector('script[src*="propellerads"],iframe[src*="propellerads"]')) return 'PropellerAds';
+                                                            if (document.querySelector('script[src*="mgid"],iframe[src*="mgid"]')) return 'MGID';
+                                                            if (document.querySelector('script[src*="taboola"],script[src*="outbrain"]')) return 'Taboola/Outbrain';
+                                                            if (document.querySelector('script[src*="ezoic"],script[src*="mediavine"],script[src*="adthrive"]')) return 'Ezoic/Mediavine/AdThrive';
+                                                            if (document.querySelector('[data-zone],[data-adzone],[data-ad-id]')) return 'Generic';
+                                                            if (document.querySelector('iframe[width="728"][height="90"],iframe[width="300"][height="250"]')) return 'Banner';
+                                                            if (document.querySelector('[class*="ad-container"],[class*="ad-wrapper"],[id*="ad-container"]')) return 'Generic';
+                                                            return false;
+                                                        }
+                                                    """)
+                                                    if _early_ad_retry:
+                                                        _early_ad = _early_ad_retry
+                                                        log.info(f"🎯 滚动后检测到广告代码 [{_early_ad}]（懒加载广告）")
+                                                except Exception:
+                                                    pass
+                                                if not _early_ad:
+                                                    # ★ 诊断：输出页面所有外部script/iframe来源，帮助排查未识别的广告网络
+                                                    try:
+                                                        _diag_sources = page.evaluate("""
+                                                            () => {
+                                                                const scripts = Array.from(document.querySelectorAll('script[src]')).map(s => s.src).filter(s => s && !s.includes('chrome-extension'));
+                                                                const iframes = Array.from(document.querySelectorAll('iframe[src]')).map(f => f.src).filter(s => s && s !== 'about:blank');
+                                                                return {scripts: scripts.slice(0, 15), iframes: iframes.slice(0, 10)};
+                                                            }
+                                                        """)
+                                                        _diag_s = _diag_sources.get('scripts', []) if _diag_sources else []
+                                                        _diag_f = _diag_sources.get('iframes', []) if _diag_sources else []
+                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兜底链接配置为含广告的页面）")
+                                                        if _diag_s or _diag_f:
+                                                            log.info(f"🔍 [广告诊断] 页面外部脚本({len(_diag_s)}): {_diag_s[:8]}")
+                                                            if _diag_f:
+                                                                log.info(f"🔍 [广告诊断] 页面iframe({len(_diag_f)}): {_diag_f[:5]}")
+                                                        else:
+                                                            # ★ 增强诊断：输出HTML原始长度和title，判断是SPA空壳还是被拦截
+                                                            try:
+                                                                _html_len = page.evaluate("() => document.documentElement.outerHTML.length") or 0
+                                                                _page_title = page.evaluate("() => document.title || ''") or ''
+                                                                log.info(f"🔍 [广告诊断] 页面无任何外部脚本/iframe | HTML原始长度={_html_len} | title='{_page_title[:60]}' | 可能原因: SPA未渲染/CF拦截/广告被屏蔽")
+                                                            except Exception:
+                                                                log.info(f"🔍 [广告诊断] 页面无任何外部脚本/iframe（可能为纯SPA或广告被屏蔽）")
+                                                    except Exception:
+                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兜底链接配置为含广告的页面）")
+                                        except Exception:
+                                            pass
                                         break
                                     # 内容为空，但 URL 是正常的——也算成功（某些 SPA 首屏渲染延迟）
                                     _u_str = str(_u or "")
@@ -11224,7 +12071,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "首页加载后")
 
                         # ========== 任务总时长保险绳（防止任务无限延长） ==========
-                        task_deadline = enter_site_time + random.uniform(420, 540)  # 7-9分钟（420-540秒）随机时长
+                        # ★ 对数正态采样（与前置计算一致，不重复随机）
+                        if 'task_deadline' not in dir() or task_deadline is None:
+                            _sd_cfg2 = config.get("session_duration", {})
+                            _sd_cap2 = float(_sd_cfg2.get("hard_cap_sec", 600))
+                            task_deadline = enter_site_time + _session_secs if '_session_secs' in dir() else enter_site_time + _sd_cap2
                         
                         def _check_rope(stage_desc=""):
                             if not task_running:
@@ -11234,11 +12085,22 @@ def worker_task(single_task=False, adsl_ip_task=False):
     
                         current_x, current_y = 100, 100
 
-                        # ========== 网页浏览模式循环：每轮 首页(L1)→列表页(L2)→L3→L4→L5→L6→返回首页 ==========
-                        # 每轮使用该轮独立随机时长（round_layer_stays[loop_idx]），各层按 stay_ratio 比率停留。
-                        log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L6，任务总时长=各轮之和）")
-
-                        if True:
+                        # ========== ★ 跳出率模拟 + 网页浏览模式循环 ==========
+                        _bounce_cfg = config.get("bounce_rate", {"min": 0.20, "max": 0.35})
+                        _bounce_prob = random.uniform(float(_bounce_cfg.get("min", 0.20)), float(_bounce_cfg.get("max", 0.35)))
+                        _is_bounce = random.random() < _bounce_prob
+                        if _is_bounce:
+                            log.info(f"🚪 本次任务为跳出型(概率{_bounce_prob:.0%})：仅停留首页后离开")
+                            _bounce_stay = random.uniform(15, 60)
+                            current_x, current_y = simulate_human_in_window(
+                                page, _bounce_stay, page_behavior_stats, current_x, current_y,
+                                config, page_name=f"[T{task_idx+1}] 首页(跳出)", deadline=task_deadline
+                            )
+                            ad_monitor = scan_ads_during_task(page, ad_monitor, "跳出型任务首页停留后")
+                            log.info(f"🚪 跳出型任务完成：首页停留{_bounce_stay:.0f}s后离开")
+                        if not _is_bounce:
+                            log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L6，任务总时长=各轮之和）")
+                        if not _is_bounce:
                             for loop_idx in range(chapter_loop_count):
                                 try:
                                     _check_rope(f"循环第 {loop_idx+1} 次前")
@@ -11416,13 +12278,65 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         _dur_map = ad_monitor.get("exposure_duration_ms", {}) or {}
                         _total_dur = sum(_dur_map.values())
                         _max_dur = max(_dur_map.values()) if _dur_map else 0
+                        
+                        # ★ 诊断：检查页面是否包含广告代码（支持所有主流联盟，不仅限AdSense）
+                        _has_ad_code = False
+                        _detected_network = '无'
+                        try:
+                            _ad_check_result = page.evaluate("""
+                                () => {
+                                    // Google AdSense / GAM
+                                    if (document.querySelector('script[src*="adsbygoogle"],ins.adsbygoogle,[data-ad-client]')) return 'AdSense';
+                                    if (document.querySelector('script[src*="googlesyndication"],script[src*="pagead2"],iframe[src*="googlesyndication"]')) return 'AdSense/GAM';
+                                    if (document.querySelector('script[src*="securepubads"],script[src*="googletagservices"]')) return 'GAM';
+                                    // HilltopAds
+                                    if (document.querySelector('script[src*="hilltopads"],iframe[src*="hilltopads"],[id*="hilltopads"]')) return 'HilltopAds';
+                                    // EvaDav
+                                    if (document.querySelector('script[src*="evadav"],iframe[src*="evadav"]')) return 'EvaDav';
+                                    // HilltopAds/EvaDav 投放域名（随机域名）
+                                    if (document.querySelector('script[src*="curoax"],script[src*="pufted"],iframe[src*="bony-teaching"],script[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
+                                    // NativeAds 容器
+                                    if (document.querySelector('[class*="nativeads"]')) return 'NativeAds';
+                                    // 标准广告尺寸 iframe
+                                    if (document.querySelector('iframe[width="728"][height="90"],iframe[width="300"][height="250"],iframe[width="160"][height="600"]')) return 'Banner';
+                                    // PropellerAds
+                                    if (document.querySelector('script[src*="propellerads"],iframe[src*="propellerads"]')) return 'PropellerAds';
+                                    // MGID
+                                    if (document.querySelector('script[src*="mgid"],iframe[src*="mgid"]')) return 'MGID';
+                                    // Taboola / Outbrain
+                                    if (document.querySelector('script[src*="taboola"],iframe[src*="taboola"]')) return 'Taboola';
+                                    if (document.querySelector('script[src*="outbrain"],iframe[src*="outbrain"]')) return 'Outbrain';
+                                    // Ezoic / Mediavine / AdThrive / Raptive
+                                    if (document.querySelector('script[src*="ezoic"],script[src*="ezoicnet"],[id*="ezoic"]')) return 'Ezoic';
+                                    if (document.querySelector('script[src*="mediavine"],[class*="mediavine"]')) return 'Mediavine';
+                                    if (document.querySelector('script[src*="adthrive"],script[src*="raptive"]')) return 'AdThrive/Raptive';
+                                    // Monumetric / Broadstreet
+                                    if (document.querySelector('script[src*="monumetric"],script[src*="broadstreet"]')) return 'Monumetric';
+                                    // Infolinks / Adsterra
+                                    if (document.querySelector('script[src*="infolinks"],script[src*="adsterra"]')) return 'Infolinks/Adsterra';
+                                    // BuySellAds / Carbon
+                                    if (document.querySelector('script[src*="buysellads"],script[src*="carbonads"]')) return 'BuySellAds';
+                                    // 通用广告iframe/script（兜底检测）
+                                    if (document.querySelector('iframe[src*="/ads/"],iframe[src*="adserve"],iframe[src*="/adserver/"]')) return 'Generic';
+                                    if (document.querySelector('[data-zone],[data-adzone],[data-ad-id],[data-adunit]')) return 'Generic';
+                                    if (document.querySelector('[class*="ad-container"],[class*="ad-wrapper"],[class*="ad-unit"],[id*="ad-container"],[id*="ad-wrapper"]')) return 'Generic';
+                                    return false;
+                                }
+                            """)
+                            if _ad_check_result:
+                                _has_ad_code = True
+                                _detected_network = _ad_check_result
+                        except Exception:
+                            pass
+                        
                         log.info(
                             f"[广告监控汇总] 扫描={ad_monitor.get('scan_count', 0)} "
                             f"容器去重={len(ad_monitor.get('containers', set()))} "
                             f"曾进入视口={len(ad_monitor.get('visible', set()))} "
                             f"曾曝光={ad_impressions} 刷新={ad_refreshes} "
                             f"有效曝光达标(≥50%可见且累计≥{int(config.get('ad_effective_exposure_ms', 1000) or 1000)}ms)={_eff_exposed} "
-                            f"累计曝光时长={_total_dur}ms 单广告位最长={_max_dur}ms"
+                            f"累计曝光时长={_total_dur}ms 单广告位最长={_max_dur}ms "
+                            f"| 页面含广告代码={'是' if _has_ad_code else '否'} 联盟={_detected_network}"
                         )
                         
                         log.page_ad_module(target_url, load_success, load_time, ad_found, ad_in_viewport, ad_loaded, ad_impressions, ad_refreshes)
@@ -11471,11 +12385,15 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         
                         # ==================== 任务结果 ====================
                         task_time = time.time() - task_start_time
-                        traffic_valid = bool(ad_loaded and ad_impressions > 0)
+                        # ★ 有效流量判定：广告监控检测到曝光 OR 页面确实含有广告代码（联盟会自行计数）
+                        traffic_valid = bool(ad_loaded and ad_impressions > 0) or _has_ad_code
                         valid_traffic = traffic_valid
                         success = bool(load_success and consistency)
                         if success and not traffic_valid:
-                            log.warning("⚠️ 任务流程已完成，但广告未形成有效曝光（任务不判失败，流量标记为无效）")
+                            if not _has_ad_code:
+                                log.info("ℹ️ 任务流程已完成，目标页无广告代码（流量标记为无效，非系统问题）")
+                            else:
+                                log.warning(f"⚠️ 任务流程已完成，页面含{_detected_network}广告代码但广告未形成有效曝光（可能被代理/网络阻断，流量标记为无效）")
                         
                         # 更新任务状态
                         if task_idx < len(tasks_list):
@@ -11706,11 +12624,16 @@ def get_current_ip_context():
 @app.route('/')
 def index():
     ensure_config_defaults()
-    return render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
+    from flask import make_response
+    resp = make_response(render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
                                   stats=stats, runningtask=task_running,
-                                  planned_total=planned_total_tasks)
+                                  planned_total=planned_total_tasks))
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 
@@ -11954,6 +12877,10 @@ def generate_plan():
         # 生成计划但不执行
         pending_plan = generate_daily_tasks(config)
         log.info(f"✅ 计划生成成功: days={pending_plan.get('plan_days', 1)}, total={pending_plan['total_tasks']}, model={pending_plan['model_used']}")
+        # 在日志窗口展示待执行计划预览（待执行状态，供用户确认后执行）
+        log.info(_format_plan_log_block(
+            pending_plan, "📋 <b>待执行计划预览</b>（确认无误后点击“执行计划”开始执行）"
+        ))
         # 设置显示的总任务数
         planned_total_tasks = pending_plan['total_tasks']
         return jsonify({
@@ -12133,7 +13060,7 @@ def start_security_drill():
             target_url = str(body["target_url"]).strip()
         if not target_url:
             return jsonify({"status": "error", "success": False, "message": "未配置目标网站，请先在网站流量Tab勾选目标站"}), 400
-        headless = bool(body.get("headless", True))
+        headless = bool(body.get("headless", False))  # ★ 默认有头模式（headless会被风控检测）
         _drill_state.update({"running": True, "progress": 0, "stage": "启动中",
                              "report": None, "json_path": None, "html_path": None})
     from threading import Thread
@@ -12182,8 +13109,11 @@ def _run_production_test_thread(layers, headless, target_url):
             layers=layers, progress=_progress_fn, log=_log_fn,
             config=config, target_url=target_url, headless=headless,
         )
-        _prodtest_state["layers"] = result.get("layers", {})
-        _prodtest_state["gate"] = result.get("gate")
+        # 累积合并：将新层结果合入已有层（单层按钮不覆盖其他层）
+        new_layers = result.get("layers", {})
+        _prodtest_state["layers"].update(new_layers)
+        # 从所有累积层重建准入检查单
+        _prodtest_state["gate"] = production_test.build_gate_report(_prodtest_state["layers"])
         _prodtest_state["report_path"] = result.get("report_path")
         _prodtest_state["stage"] = "完成"
         _prodtest_state["progress"] = 100
@@ -12205,7 +13135,7 @@ def start_production_test():
         except Exception:
             body = {}
         layers = body.get("layers") or "all"
-        headless = bool(body.get("headless", True))
+        headless = bool(body.get("headless", False))  # ★ 默认有头模式（headless会被风控检测）
         # 从配置取第一个已勾选目标站（L3对抗验证需要真实目标）
         target_url = ""
         _urls_cfg = config.get("target_urls")
@@ -12214,8 +13144,12 @@ def start_production_test():
                                if item.get("enabled") and item.get("url", "").strip()), "")
         if not target_url:
             target_url = config.get("target_url", "") or ""
-        _prodtest_state.update({"running": True, "progress": 0, "stage": "启动中",
-                                "layers": {}, "gate": None, "report_path": None, "logs": []})
+        # 全量测试重置所有状态；单层测试保留已有层结果（累积合并）
+        if layers == "all":
+            _prodtest_state.update({"running": True, "progress": 0, "stage": "启动中",
+                                    "layers": {}, "gate": None, "report_path": None, "logs": []})
+        else:
+            _prodtest_state.update({"running": True, "progress": 0, "stage": "启动中", "logs": []})
     from threading import Thread
     Thread(target=_run_production_test_thread, args=(layers, headless, target_url), daemon=True).start()
     log.info(f"✅ 生产准入测试线程已启动，层级: {layers}")
@@ -12319,6 +13253,9 @@ def _extract_anchor_texts_from_html(html, url):
         # 过滤：太短、纯数字、导航/功能性文本
         if len(text) < 2:
             continue
+        # ★ 过滤过长的锚文本（>60字符通常是章节标题，不适合作为搜索关键词）
+        if len(text) > 60:
+            continue
         if text.isdigit() or text.isnumeric():
             continue
         text_lower = text.lower()
@@ -12382,6 +13319,68 @@ def _is_same_origin(url, target_domain):
         return False
 
 
+# -------- 广告代码检测（HTML级别，用于关键词探索过滤无广告页面） --------
+# 主流广告联盟的 HTML 特征签名
+_AD_HTML_SIGNATURES = [
+    # HilltopAds
+    'hilltopads.com', 'hilltopads.net',
+    # Google AdSense
+    'adsbygoogle', 'googlesyndication', 'pagead2.googlesyndication', 'data-ad-client', 'data-ad-slot',
+    # PropellerAds
+    'propellerads.com', 'propellerclick.com',
+    # MGID
+    'mgid.com',
+    # Taboola / Outbrain
+    'taboola.com', 'outbrain.com',
+    # AdMaven
+    'ad-maven.com',
+    # EvaDav
+    'evadav.com',
+    # HilltopAds/EvaDav 投放域名（随机域名，通过站点白名单确认）
+    'curoax.com', 'pufted.com', 'bony-teaching.com', 'untimely-hello.com',
+    # NativeAds 容器
+    'nativeads',
+    # 通用广告服务器路径
+    '/adserve/', '/adserver/', '/ads/',
+    # 通用广告属性
+    'data-zone', 'data-adzone',
+]
+
+def _html_has_ad_code(html):
+    """检查 HTML 源码中是否包含广告联盟代码。
+    返回检测到的联盟名称(str)或 None。
+    """
+    if not html:
+        return None
+    html_lower = html.lower()
+    # 按优先级检测
+    checks = [
+        ('HilltopAds', ['hilltopads.com', 'hilltopads.net']),
+        ('AdSense', ['adsbygoogle', 'googlesyndication', 'pagead2.googlesyndication', 'data-ad-client']),
+        ('GAM', ['securepubads.g.doubleclick', 'googletagservices']),
+        ('EvaDav', ['evadav.com']),
+        ('HilltopAds/EvaDav', ['curoax.com', 'pufted.com', 'bony-teaching.com', 'untimely-hello.com']),
+        ('NativeAds', ['nativeads']),
+        ('PropellerAds', ['propellerads.com', 'propellerclick.com']),
+        ('MGID', ['mgid.com']),
+        ('Taboola', ['taboola.com']),
+        ('Outbrain', ['outbrain.com']),
+        ('AdMaven', ['ad-maven.com']),
+        ('Ezoic', ['ezoic.com', 'ezoicnet.com']),
+        ('Mediavine', ['mediavine.com']),
+        ('AdThrive/Raptive', ['adthrive.com', 'raptive.com']),
+        ('Monumetric', ['monumetric.com', 'broadstreetads.com']),
+        ('Infolinks/Adsterra', ['infolinks.com', 'adsterra.com']),
+        ('BuySellAds', ['buysellads.com', 'carbonads']),
+        ('Generic', ['/adserve/', '/adserver/', 'data-zone', 'data-adzone', 'data-ad-id', 'data-adunit']),
+    ]
+    for network, sigs in checks:
+        for sig in sigs:
+            if sig in html_lower:
+                return network
+    return None
+
+
 def _fetch_page(url, session=None, timeout=10):
     """获取单个页面 HTML"""
     headers = {
@@ -12412,6 +13411,7 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
     mgr['is_running'] = True
     mgr['progress'] = '准备开始爬取...'
     mgr['current_layer'] = 0
+    mgr['max_layer'] = max_layer  # ★ 修复：使用实际传入的max_layer，而非硬编码6
     mgr['result'] = None
     mgr['error'] = None
 
@@ -12421,7 +13421,11 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
     visited = set()
     layer_anchor_texts = {}   # {layer_num: set(anchor_text)} 每层的关键词（可点击链接文本）
     layer_fallback_links = {} # {layer_num: set(url)} 每层的兜底链接
+    layer_all_outgoing = {}   # {layer_num: set(url)} 每层全量出站链接（回退用）
     all_urls = set()          # 所有层级的去重URL汇总
+    # ★ 广告统计累加器
+    total_ad_pages = 0
+    total_no_ad_pages = 0
 
     current_urls = {target_url.rstrip('/')}
 
@@ -12451,8 +13455,8 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
 
             log.info(f'[关键词探索] 第 {layer} 层实际待抓取: {len(urls_to_fetch)} 个页面')
 
-            # 存储每个页面的 (anchor_texts, outgoing_links)
-            page_data = []  # [(url, anchor_texts_set, outgoing_links_set), ...]
+            # 存储每个页面的 (anchor_texts, outgoing_links, has_ad_network)
+            page_data = []  # [(url, anchor_texts_set, outgoing_links_set, ad_network_or_None), ...]
 
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = {}
@@ -12473,9 +13477,12 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
                         anchor_texts = _extract_anchor_texts_from_html(html, url)
                         # 提取 outgoing 链接
                         outgoing_links = _extract_page_links(html, url, target_domain)
+                        # ★ 检测页面是否含广告代码
+                        ad_network = _html_has_ad_code(html)
 
-                        page_data.append((url, anchor_texts, outgoing_links))
-                        log.info(f'[关键词探索] ✅ {url} | 锚文本: {len(anchor_texts)} | 出站链接: {len(outgoing_links)}')
+                        page_data.append((url, anchor_texts, outgoing_links, ad_network))
+                        _ad_tag = f'🎯广告:{ad_network}' if ad_network else '❌无广告'
+                        log.info(f'[关键词探索] ✅ {url} | 锚文本: {len(anchor_texts)} | 出站链接: {len(outgoing_links)} | {_ad_tag}')
 
                     except Exception as e:
                         log.warning(f'[关键词探索] 页面异常 {url}: {e}')
@@ -12483,28 +13490,53 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
             # ---- 构建本层关键词池和兜底链接 ----
             # 本层关键词 = 所有页面的锚文本并集（可点击链接文本）
             layer_kw_pool = set()
-            for _, ats, _ in page_data:
+            for _, ats, _, _ in page_data:
                 layer_kw_pool.update(ats)
+            # ★ 每层最多保留100个关键词（优先短关键词，匹配率更高）
+            if len(layer_kw_pool) > 100:
+                _sorted_kws = sorted(layer_kw_pool, key=lambda x: len(x))
+                layer_kw_pool = set(_sorted_kws[:100])
+                log.info(f'[关键词探索] 第 {layer} 层关键词过多，截取前100个短关键词')
 
-            # 本层兜底链接 = 该层所有页面的出站链接合并去重
+            # ★ 本层兜底链接 = 只纳入含广告页面的出站链接（过滤无广告页面）
             layer_fb = set()
-            for _, _, out_links in page_data:
-                layer_fb.update(out_links)
+            layer_all_fb = set()  # 全量出站链接（回退用）
+            _ad_pages = 0
+            _no_ad_pages = 0
+            for url, _, out_links, ad_net in page_data:
+                layer_all_fb.update(out_links)
+                if ad_net:
+                    _ad_pages += 1
+                    layer_fb.update(out_links)
+                else:
+                    _no_ad_pages += 1
             # 兜底链接去除已经作为关键词来源的页面URL
-            layer_fb -= {u for u, _, _ in page_data}
+            layer_fb -= {u for u, _, _, _ in page_data}
+            layer_all_fb -= {u for u, _, _, _ in page_data}
 
             layer_anchor_texts[layer] = layer_kw_pool
             layer_fallback_links[layer] = layer_fb
-            log.info(f'[关键词探索] 第 {layer} 层完成 | 关键词(锚文本): {len(layer_kw_pool)} | 兜底链接: {len(layer_fb)}')
+            layer_all_outgoing[layer] = layer_all_fb
+            total_ad_pages += _ad_pages
+            total_no_ad_pages += _no_ad_pages
+            log.info(f'[关键词探索] 第 {layer} 层完成 | 关键词: {len(layer_kw_pool)} | 兜底链接: {len(layer_fb)} | 含广告页: {_ad_pages} | 无广告页: {_no_ad_pages}')
 
             # 下一层的URL = 本层所有页面的 outgoing 链接（去重后未访问的）
             next_layer_urls = set()
-            for _, _, out_links in page_data:
+            for _, _, out_links, _ in page_data:
                 for link in out_links:
                     if link not in visited:
                         next_layer_urls.add(link)
                         all_urls.add(link)
             current_urls = next_layer_urls
+
+        # ★ 回退逻辑：如果所有页面都检测不到广告代码（说明该站广告是JS动态注入），
+        # 则使用全量出站链接作为兜底链接，否则兜底链接为0毫无意义
+        if total_ad_pages == 0 and total_no_ad_pages > 0:
+            log.warning(f'[关键词探索] ⚠️ 所有 {total_no_ad_pages} 个页面均未在HTML中检测到广告代码')
+            log.warning(f'[关键词探索] ⚠️ 该站可能使用JS动态加载广告，回退为使用全量出站链接作为兜底链接')
+            for layer_num in layer_all_outgoing:
+                layer_fallback_links[layer_num] = layer_all_outgoing[layer_num]
 
         # 构建报告数据
         total_keywords = sum(len(v) for v in layer_anchor_texts.values())
@@ -12522,7 +13554,8 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
             f.write(f'# 目标网站: {target_url}\n')
             f.write(f'# 生成时间: {timestamp}\n')
             f.write(f'# 总关键词数: {total_keywords}\n')
-            f.write(f'# 总兜底链接数: {total_fallback}\n\n')
+            f.write(f'# 总兜底链接数: {total_fallback}（仅含广告页面的链接）\n')
+            f.write(f'# 广告统计: 含广告页 {total_ad_pages} 个, 无广告页 {total_no_ad_pages} 个, 广告命中率 {total_ad_pages/(total_ad_pages+total_no_ad_pages)*100:.0f}%\n\n')
 
             for layer_num in sorted(layer_anchor_texts.keys()):
                 kws = layer_anchor_texts[layer_num]
@@ -12580,10 +13613,14 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
             'layers_crawled': len(layer_anchor_texts),
             'layer_data': layer_data_for_frontend,
             'merged_keywords': sorted(all_merged_kws),
-            'merged_fallback_urls': sorted(all_merged_fbs)
+            'merged_fallback_urls': sorted(all_merged_fbs),
+            # ★ 广告统计
+            'ad_pages': total_ad_pages,
+            'no_ad_pages': total_no_ad_pages,
+            'ad_hit_rate': round(total_ad_pages / max(1, total_ad_pages + total_no_ad_pages) * 100)
         }
-        mgr['progress'] = f'探索完成！共 {total_keywords} 个关键词，{total_fallback} 个兜底链接'
-        log.info(f'[关键词探索] ✅ 完成！关键词: {total_keywords} | 兜底链接: {total_fallback} | 文件: {filename}')
+        mgr['progress'] = f'探索完成！共 {total_keywords} 个关键词，{total_fallback} 个兜底链接（广告命中率 {round(total_ad_pages / max(1, total_ad_pages + total_no_ad_pages) * 100)}%）'
+        log.info(f'[关键词探索] ✅ 完成！关键词: {total_keywords} | 兜底链接: {total_fallback} | 含广告页: {total_ad_pages} | 无广告页: {total_no_ad_pages} | 文件: {filename}')
 
     except Exception as e:
         mgr['error'] = str(e)
@@ -13052,8 +14089,14 @@ if __name__ == "__main__":
                 return merged
             if 'web_navigation' in loaded_config and isinstance(config.get('web_navigation'), dict):
                 loaded_config['web_navigation'] = _merge_web_navigation(config['web_navigation'], loaded_config['web_navigation'])
+            # ★ 修复：deep_merge_defaults对列表类型会取默认值（10空条目），覆盖用户保存的proxy_pool
+            # 先保存用户已加载的proxy_pool，合并后恢复
+            _user_proxy_pool = loaded_config.get('proxy_pool')
             config.clear()
             config.update(deep_merge_defaults(DEFAULT_CONFIG, loaded_config))
+            # 恢复用户保存的proxy_pool（非空时优先使用用户配置）
+            if _user_proxy_pool and isinstance(_user_proxy_pool, list) and len(_user_proxy_pool) > 0:
+                config['proxy_pool'] = _user_proxy_pool
         ensure_config_defaults()
         # === 安全：环境变量覆盖敏感配置（优先级：.env > config.json） ===
         _env_overrides = {
@@ -13074,6 +14117,37 @@ if __name__ == "__main__":
     # 加载历史任务
     load_historical_tasks()
     log.info(f"已加载 {len(historical_tasks)} 条历史任务记录")
+    
+    # 加载指纹统计
+    load_fingerprint_stats()
+    log.info(f"已加载指纹统计数据: {len(fingerprint_stats['ua_usage'])}个UA, {len(fingerprint_stats['fingerprint_usage'])}个指纹")
+    
+    # Selenium 使用系统已安装的 Chrome + Selenium Manager 自动管理 chromedriver，无需额外安装步骤
+    log.info("使用 Selenium + 本地 Chrome 驱动")
+    
+   # app.run(host="0.0.0.0", port=5001, debug=False)
+
+
+    import os
+    # 优先读取环境变量，无参数默认5001
+    port = int(os.getenv("RUN_PORT",5001))
+    host = os.getenv("RUN_HOST","0.0.0.0")
+    app.run(host=host,port=port)
+    # 加载指纹统计
+    load_fingerprint_stats()
+    log.info(f"已加载指纹统计数据: {len(fingerprint_stats['ua_usage'])}个UA, {len(fingerprint_stats['fingerprint_usage'])}个指纹")
+    
+    # Selenium 使用系统已安装的 Chrome + Selenium Manager 自动管理 chromedriver，无需额外安装步骤
+    log.info("使用 Selenium + 本地 Chrome 驱动")
+    
+   # app.run(host="0.0.0.0", port=5001, debug=False)
+
+
+    import os
+    # 优先读取环境变量，无参数默认5001
+    port = int(os.getenv("RUN_PORT",5001))
+    host = os.getenv("RUN_HOST","0.0.0.0")
+    app.run(host=host,port=port)
     
     # 加载指纹统计
     load_fingerprint_stats()

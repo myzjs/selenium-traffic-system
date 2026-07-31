@@ -1,0 +1,1022 @@
+{
+  "ip_proxy_api": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=5a4cN2JmMTI2Mjg1MDQ3MDY3MTgxMTM0",
+  "ip_proxy_user": "d8187332000-res-country-US-session-5461369000-sessiontime-5",
+  "ip_proxy_pwd": "zhan7263",
+  "skip_browser_ip_check": true,
+  "webrtc_leak_check_enabled": true,
+  "qa_session_enabled": true,
+  "session_mode": "country_host_7d",
+  "ua_repeat_max_rate": 0.2,
+  "target_urls": [
+    {
+      "url": "https://freestoryweb.com",
+      "enabled": true
+    },
+    {
+      "url": "https://vipnet.net",
+      "enabled": false
+    },
+    {
+      "url": "",
+      "enabled": false
+    },
+    {
+      "url": "",
+      "enabled": false
+    },
+    {
+      "url": "",
+      "enabled": false
+    }
+  ],
+  "site_creation_date": "2026-06-06",
+  "selected_models": [
+    "normal",
+    "gamma",
+    "bimodal",
+    "poisson"
+  ],
+  "daily_traffic_range": {
+    "new": {
+      "min": 50,
+      "max": 100
+    },
+    "mid": {
+      "min": 200,
+      "max": 300
+    },
+    "old": {
+      "min": 500,
+      "max": 600
+    }
+  },
+  "plan_days": 1,
+  "ip_provider_type": "proxy_api",
+  "task_interval": {
+    "min": 20,
+    "max": 40
+  },
+  "ad_stay_time": {
+    "min": 3,
+    "max": 40
+  },
+  "page_load_wait": {
+    "min": 1,
+    "max": 8
+  },
+  "scroll_pixels": {
+    "min": 200,
+    "max": 1000
+  },
+  "scroll_wait": {
+    "min": 0.5,
+    "max": 5
+  },
+  "ad_click_prob": {
+    "min": 0.005,
+    "max": 0.05
+  },
+  "ad_click_wait": {
+    "min": 2,
+    "max": 20
+  },
+  "random_click_count": {
+    "min": 3,
+    "max": 10
+  },
+  "random_click_wait": {
+    "min": 0.5,
+    "max": 3
+  },
+  "qa_human_profile": "standard",
+  "total_stay": {
+    "min": 120,
+    "max": 250
+  },
+  "mouse_move_count": {
+    "min": 2,
+    "max": 20
+  },
+  "mouse_move_steps": {
+    "min": 10,
+    "max": 60
+  },
+  "mouse_move_wait": {
+    "min": 0.1,
+    "max": 1
+  },
+  "scroll_count": {
+    "min": 2,
+    "max": 10
+  },
+  "bezier_pause_prob": {
+    "min": 0.05,
+    "max": 0.2
+  },
+  "mouse_move_pause": {
+    "min": 0.01,
+    "max": 0.1
+  },
+  "enabled": false,
+  "ad_selector": ".ad-container, [class*='ad'], [id*='ad']",
+  "enable_seo": true,
+  "skip_timezone_check": true,
+  "skip_ip_leak_check": false,
+  "headless": false,
+  "log_mode": "test",
+  "use_real_chrome": true,
+  "proxy_timeout": 30,
+  "max_retries": 3,
+  "seo": {
+    "search_engines": [
+      {
+        "id": "baidu",
+        "name": "百度",
+        "url": "https://www.baidu.com/s?wd=",
+        "language": "zh",
+        "type": "search"
+      },
+      {
+        "id": "sogou",
+        "name": "搜狗",
+        "url": "https://www.sogou.com/web?query=",
+        "language": "zh",
+        "type": "search"
+      },
+      {
+        "id": "so360",
+        "name": "360搜索",
+        "url": "https://www.so.com/s?q=",
+        "language": "zh",
+        "type": "search"
+      },
+      {
+        "id": "google",
+        "name": "谷歌",
+        "url": "https://www.google.com/search?q=",
+        "language": "en",
+        "type": "search"
+      },
+      {
+        "id": "bing",
+        "name": "必应",
+        "url": "https://www.bing.com/search?q=",
+        "language": "en",
+        "type": "search"
+      },
+      {
+        "id": "facebook",
+        "name": "Facebook",
+        "url": "https://www.facebook.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "twitter",
+        "name": "Twitter/X",
+        "url": "https://twitter.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "instagram",
+        "name": "Instagram",
+        "url": "https://www.instagram.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "tiktok",
+        "name": "TikTok",
+        "url": "https://www.tiktok.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "reddit",
+        "name": "Reddit",
+        "url": "https://www.reddit.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "pinterest",
+        "name": "Pinterest",
+        "url": "https://www.pinterest.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "linkedin",
+        "name": "LinkedIn",
+        "url": "https://www.linkedin.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "youtube",
+        "name": "YouTube",
+        "url": "https://www.youtube.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "goodreads",
+        "name": "Goodreads",
+        "url": "https://www.goodreads.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "wattpad",
+        "name": "Wattpad",
+        "url": "https://www.wattpad.com/",
+        "language": "en",
+        "type": "social"
+      },
+      {
+        "id": "quora",
+        "name": "Quora",
+        "url": "https://www.quora.com/",
+        "language": "en",
+        "type": "social"
+      }
+    ],
+    "region_engine_map": {
+      "US": [
+        "google",
+        "bing",
+        "facebook",
+        "twitter",
+        "instagram",
+        "tiktok",
+        "reddit",
+        "pinterest",
+        "linkedin",
+        "youtube",
+        "goodreads",
+        "wattpad",
+        "quora"
+      ],
+      "GB": [
+        "google",
+        "bing",
+        "facebook",
+        "twitter",
+        "reddit",
+        "instagram",
+        "youtube",
+        "goodreads",
+        "quora"
+      ],
+      "CA": [
+        "google",
+        "bing",
+        "facebook",
+        "twitter",
+        "reddit",
+        "instagram",
+        "youtube",
+        "goodreads"
+      ],
+      "AU": [
+        "google",
+        "bing",
+        "facebook",
+        "reddit",
+        "instagram",
+        "youtube",
+        "goodreads"
+      ],
+      "DE": [
+        "google",
+        "bing",
+        "facebook",
+        "instagram"
+      ],
+      "FR": [
+        "google",
+        "bing",
+        "facebook",
+        "instagram"
+      ],
+      "JP": [
+        "google",
+        "bing",
+        "twitter",
+        "instagram",
+        "tiktok"
+      ],
+      "CN": [
+        "baidu",
+        "sogou",
+        "so360"
+      ]
+    },
+    "keyword_pools": {
+      "zh": [
+        "免费小说在线阅读",
+        "修真小说推荐",
+        "武侠小说全本",
+        "重生小说排行榜",
+        "网络小说免费阅读",
+        "修仙小说推荐",
+        "穿越小说完本",
+        "玄幻小说在线阅读",
+        "都市重生小说",
+        "仙侠小说免费阅读",
+        "完本小说推荐",
+        "好看的网络小说",
+        "免费全本小说",
+        "重生逆袭小说",
+        "修仙升级流小说"
+      ],
+      "en": [
+        "free novels online read",
+        "wuxia novels english translation",
+        "cultivation novels free",
+        "rebirth story novel",
+        "xianxia novels online",
+        "read free fiction online",
+        "web novel free reading",
+        "fantasy novel chapters free",
+        "reincarnation novel english",
+        "martial arts novel online",
+        "transmigration story free",
+        "best free novels to read",
+        "novel reading website free",
+        "chinese novel english translation",
+        "immortal cultivation novel",
+        "reborn novel free online",
+        "free story books online",
+        "read novels free no signup",
+        "web fiction free chapters",
+        "cultivation xianxia wuxia novel"
+      ]
+    },
+    "referer_mode": "dynamic",
+    "search_mode": "real_search"
+  },
+  "video_ad": {
+    "enabled": false,
+    "video_urls": [
+      "https://www.example.com/video1",
+      "https://www.example.com/video2"
+    ],
+    "min_watch_time": 60,
+    "max_watch_time": 180,
+    "click_probability": 0.3,
+    "skip_intro": 20,
+    "skip_outro": 30,
+    "playback_rate_min": 1.2,
+    "playback_rate_max": 1.5
+  },
+  "vt_video_urls": "",
+  "vt_entry_mode": "auto",
+  "vt_layer2_video_mode": "auto",
+  "vt_watch_count": 2,
+  "vt_task_days": 2,
+  "vt_duration_min": 30,
+  "vt_duration_max": 60,
+  "vt_speed_min": 1.5,
+  "vt_speed_max": 2,
+  "vt_interval_min": 10,
+  "vt_interval_max": 25,
+  "vt_udis_referer": "https://vids.st/v/",
+  "qa_run_phases": {
+    "website": true,
+    "video": false
+  },
+  "vt_layer1_keywords": [],
+  "vt_layer2_keywords": [],
+  "vt_layer1_fallback_urls": [],
+  "vt_layer2_fallback_urls": [],
+  "web_navigation": {
+    "layer_1": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.15,
+      "min_stay": 10
+    },
+    "layer_2": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.15,
+      "min_stay": 10
+    },
+    "layer_3": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.35,
+      "min_stay": 10
+    },
+    "layer_4": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.2,
+      "min_stay": 10
+    },
+    "layer_5": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.1,
+      "min_stay": 10
+    },
+    "loop_count": {
+      "min": 1,
+      "max": 3
+    },
+    "loop_interval": {
+      "min": 1,
+      "max": 5
+    },
+    "layer_6": {
+      "keywords": [
+        "The Banana Peel of Destiny",
+        "A Bouquet of Irises for You",
+        "The Return of the Lunar Goddess",
+        "Rise as a Global Tycoon: Reborn in 1980",
+        "Reborn",
+        "Fantasy",
+        "Fiction",
+        "Wuxia",
+        "Xianxia",
+        "Cultivation",
+        "Romance",
+        "Action",
+        "Adventure",
+        "Sci-Fi",
+        "Young Adult",
+        "All Books",
+        "Home",
+        "Next Chapter",
+        "Previous Chapter",
+        "Next",
+        "Previous",
+        "Back to Contents",
+        "View Directory",
+        "Reading Mode",
+        "Chapter 1",
+        "Read Now",
+        "Latest Updates",
+        "Popular",
+        "Rankings",
+        "Free Novels",
+        "Immortal",
+        "Martial Arts",
+        "Transmigration",
+        "Reincarnation"
+      ],
+      "fallback_urls": [
+        "https://freestoryweb.com/books/the-banana-peel-of-destiny/",
+        "https://freestoryweb.com/books/a-bouquet-of-irises-for-you/",
+        "https://freestoryweb.com/books/the-return-of-the-lunar-goddess/",
+        "https://freestoryweb.com/books/rise-as-a-global-tycoon-reborn-in-1980/",
+        "https://freestoryweb.com/videos/",
+        "https://freestoryweb.com/videos/upbolt/",
+        "https://freestoryweb.com/videos/vids-st/",
+        "https://freestoryweb.com/videos/upbolt/yudie-2/",
+        "https://freestoryweb.com/videos/upbolt/xiaofang/",
+        "https://freestoryweb.com/videos/upbolt/person/",
+        "https://freestoryweb.com/videos/upbolt/i-miss-you-terribly/",
+        "https://freestoryweb.com/videos/upbolt/yudie/",
+        "https://freestoryweb.com/videos/vids-st/were-not-the-same-mp4/",
+        "https://freestoryweb.com/videos/vids-st/the-purpose-of-life-mp4/",
+        "https://freestoryweb.com/videos/vids-st/i-miss-you-terribly-mp4/",
+        "https://freestoryweb.com/videos/vids-st/xiaofang-mp4/",
+        "https://freestoryweb.com/videos/vids-st/person-mp4/",
+        "https://freestoryweb.com/videos/vids-st/a-wet-heart-mp4/",
+        "https://freestoryweb.com/",
+        "https://freestoryweb.com/books/",
+        "https://freestoryweb.com/chapter-reader/?id=1-1184",
+        "https://freestoryweb.com/chapter-reader/?id=1184"
+      ],
+      "stay_ratio": 0.05,
+      "min_stay": 10
+    },
+    "back_links": [
+      "Back",
+      "back",
+      "Home",
+      "home",
+      "All Books",
+      "Back to Contents",
+      "Next Chapter",
+      "Previous Chapter",
+      "Next",
+      "Previous",
+      "View Directory",
+      "Reading Mode",
+      "Free Novels",
+      "Fantasy",
+      "Fiction",
+      "Wuxia",
+      "Xianxia",
+      "Cultivation",
+      "Romance",
+      "The Banana Peel of Destiny",
+      "A Bouquet of Irises for You",
+      "The Return of the Lunar Goddess",
+      "Rise as a Global Tycoon: Reborn in 1980"
+    ],
+    "back_home_links": [
+      "Home",
+      "home",
+      "All Books",
+      "Free Novels",
+      "Back to Contents",
+      "back to contents"
+    ]
+  },
+  "proxy_pool": [
+    {
+      "enabled": true,
+      "country_code": "US",
+      "proxy_api_url": "https://api.ipdeep.com/api/Pro/DynamicIp/GetIpByGenerateLink?id=000eNGNjZTI2Mjg3MjEzNjYyNTY4NTI2",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": false,
+      "country_code": "GB",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": false,
+      "country_code": "DE",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": false,
+      "country_code": "FR",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": false,
+      "country_code": "JP",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": false,
+      "country_code": "SG",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": true,
+      "country_code": "HK",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": true,
+      "country_code": "ID",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": true,
+      "country_code": "AU",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    },
+    {
+      "enabled": true,
+      "country_code": "NZ",
+      "proxy_api_url": "",
+      "proxy_user": "",
+      "proxy_pwd": ""
+    }
+  ],
+  "vps_host": "104.129.54.64",
+  "vps_port": 6666,
+  "vps_new_port": 6666,
+  "vps_socks5_port": 1666,
+  "vps_user": "admin",
+  "vps_pass": "SET_VIA_ENV_OR_WEBUI",
+  "adsl_task_count": 1,
+  "vt_adsl_task_count": 1,
+  "adsl_profile": "pppoe",
+  "adsl_username": "",
+  "adsl_password": "",
+  "adsl_interface": "ppp0",
+  "adsl_min_redial_interval": 30,
+  "adsl_ip_blacklist_hours": 24,
+  "adsl_ip_redial_max_attempts": 10,
+  "social_media": {
+    "platform_region": "auto",
+    "platforms": [
+      "facebook",
+      "twitter",
+      "instagram"
+    ],
+    "frequency": {
+      "min": 10,
+      "max": 30
+    },
+    "stay_time": {
+      "min": 30,
+      "max": 60
+    },
+    "interaction_prob": {
+      "min": 0.1,
+      "max": 0.3
+    },
+    "post_urls": []
+  },
+  "adsl_required_country": "US",
+  "ad_landing_stay_time": {
+    "min": 5,
+    "max": 15
+  },
+  "daily_ad_click_limit": 0,
+  "ad_effective_exposure_ms": 1000,
+  "ad_exposure_max_gap_ms": 30000,
+  "target_url": "https://freestoryweb.com",
+  "bezier_min_steps": {
+    "min": 50,
+    "max": 120
+  },
+  "bezier_max_steps": {
+    "min": 100,
+    "max": 250
+  },
+  "bezier_min_pause": {
+    "min": 0.01,
+    "max": 0.05
+  },
+  "bezier_max_pause": {
+    "min": 0.05,
+    "max": 0.1
+  },
+  "ad_min_stay": {
+    "min": 3,
+    "max": 10
+  },
+  "ad_max_stay": {
+    "min": 10,
+    "max": 40
+  },
+  "bounce_rate": {
+    "min": 0.2,
+    "max": 0.35
+  },
+  "session_duration": {
+    "median_sec": 180,
+    "sigma": 0.7,
+    "hard_cap_sec": 600
+  },
+  "hourly_weights": [
+    0.2,
+    0.1,
+    0.1,
+    0.1,
+    0.2,
+    0.3,
+    0.5,
+    0.8,
+    1.0,
+    1.0,
+    0.9,
+    0.8,
+    0.7,
+    0.7,
+    0.8,
+    0.9,
+    1.0,
+    1.0,
+    0.9,
+    0.8,
+    0.7,
+    0.5,
+    0.4,
+    0.3
+  ],
+  "weekend_factor": {
+    "min": 0.6,
+    "max": 0.8
+  },
+  "device_ratio": {
+    "desktop": 0.7,
+    "mobile": 0.3
+  },
+  "geo_dispersion": {
+    "enabled": true,
+    "countries_per_site": 3,
+    "weights": {
+      "US": 0.5,
+      "GB": 0.2,
+      "CA": 0.15,
+      "AU": 0.1,
+      "DE": 0.05
+    }
+  },
+  "keyword_strategy": {
+    "explore_first": true,
+    "min_words": 3,
+    "max_words": 7
+  },
+  "browser_restart_every": 10
+}
