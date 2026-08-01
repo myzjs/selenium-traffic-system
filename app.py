@@ -12037,18 +12037,31 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                 except Exception:
                                                     pass
                                                 # ★ 根因修复：验证导航是否成功（window.location.href可能被Referer页SW/CSP阻止）
-                                                # 如果当前URL不是目标站，强制用page.goto跳转（丢失Referer总比停留在错误页面强）
+                                                # 如果当前URL不是目标站，使用CDP Referer + page.goto强制跳转（不丢失Referer头）
                                                 try:
                                                     from urllib.parse import urlparse as _urlparse_nav
                                                     _nav_target = _urlparse_nav(url).hostname or ''
                                                     _nav_current = _urlparse_nav(page.url or '').hostname or ''
                                                     if _nav_target and _nav_current and _nav_target not in _nav_current and _nav_current not in _nav_target:
-                                                        log.warning(f"⚠️ [导航失败] window.location.href被阻止！当前={_nav_current}，目标={_nav_target}，强制goto")
-                                                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                                                        log.warning(f"⚠️ [导航失败] window.location.href被{_nav_current}的SW/CSP阻止！使用CDP Referer+goto回退")
+                                                        # ★ 通过selenium_bridge的referer参数设置HTTP Referer头（CDP Network.setExtraHTTPHeaders）
+                                                        # 这确保目标站收到的HTTP请求包含正确的Referer头
+                                                        _referer_for_goto = referer or ''
+                                                        page.goto(url, timeout=30000, wait_until="domcontentloaded", referer=_referer_for_goto)
                                                         try:
                                                             page.wait_for_load_state("networkidle", timeout=8000)
                                                         except Exception:
                                                             pass
+                                                        # ★ 注入document.referrer覆写（让页面JS/广告脚本也能读到正确的referrer）
+                                                        if _referer_for_goto:
+                                                            try:
+                                                                page.evaluate("""(ref) => {
+                                                                    try {
+                                                                        Object.defineProperty(document, 'referrer', {get: () => ref, configurable: true});
+                                                                    } catch(e) {}
+                                                                }""", _referer_for_goto)
+                                                            except Exception:
+                                                                pass
                                                 except Exception:
                                                     pass
                                                 return True
@@ -12076,7 +12089,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                         log.info(f"📄 从首页开始浏览: {target_url}")
                                     
                                     # ★ 自然跳转（从来源页通过JS导航，document.referrer自动正确）
-                                    if not optimized_page_goto(page, _actual_target):
+                                    if not optimized_page_goto(page, _actual_target, referer=_referer_url):
                                         log.error(f"页面访问多次失败，任务终止")
                                         return False
                                         
