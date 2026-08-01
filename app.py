@@ -4286,6 +4286,7 @@ HTML_TEMPLATE = r"""
                     <div class="log-header" style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;">
                         <div class="log-title" style="flex-shrink: 0;">实时运行日志</div>
                         <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+                            <button id="btn-toggle-plan-preview" class="btn" onclick="togglePlanPreview()" style="background: #555; color: #fff; padding: 4px 10px; font-size: 12px; border-radius: 4px; cursor: pointer; border: 1px solid #00d4aa;">📋 计划预览</button>
                             <select class="log-select" id="logFilter">
                                 <option value="all">全部日志</option>
                                 <option value="info">信息日志</option>
@@ -4938,6 +4939,9 @@ HTML_TEMPLATE = r"""
                     renderPlan(result.plan);
                     // 确保显示计划预览界面
                     document.getElementById('planPreviewPanel').style.display = 'block';
+                    // 同步切换按钮状态为"关闭预览"
+                    const _toggleBtn = document.getElementById('btn-toggle-plan-preview');
+                    if (_toggleBtn) { _toggleBtn.style.background = '#00d4aa'; _toggleBtn.style.color = '#1a1a1a'; _toggleBtn.textContent = '📋 关闭预览'; }
                     // 立即刷新日志窗口，确保“待执行计划预览”置顶展示（alert 会阻塞轮询，必须先刷新再弹窗）
                     refreshLogBox().then(() => {
                         alert('✅ 计划已生成，请在右侧查看，确认无误后点击“执行计划”');
@@ -4966,7 +4970,22 @@ HTML_TEMPLATE = r"""
         function executePlan() {
             if (!confirm('确定要开始执行计划吗？')) return;
             clearLogBox();
+            // 执行计划后隐藏计划预览面板
+            document.getElementById('planPreviewPanel').style.display = 'none';
             fetch('/start_task', {method: 'POST'}).then(() => location.reload());
+        }
+
+        // 切换计划预览面板显示/隐藏
+        function togglePlanPreview() {
+            const panel = document.getElementById('planPreviewPanel');
+            const btn = document.getElementById('btn-toggle-plan-preview');
+            if (panel.style.display === 'none' || panel.style.display === '') {
+                panel.style.display = 'block';
+                if (btn) { btn.style.background = '#00d4aa'; btn.style.color = '#1a1a1a'; btn.textContent = '📋 关闭预览'; }
+            } else {
+                panel.style.display = 'none';
+                if (btn) { btn.style.background = '#555'; btn.style.color = '#fff'; btn.textContent = '📋 计划预览'; }
+            }
         }
 
         // 单独任务：保存当前配置后，立即执行 1 个任务，不生成/消费计划
@@ -4998,6 +5017,9 @@ HTML_TEMPLATE = r"""
             if (!confirm('确定要清除当前计划吗？')) return;
             fetch('/clear_plan', {method: 'POST'}).then(() => {
                 document.getElementById('planPreviewPanel').style.display = 'none';
+                // 重置切换按钮状态
+                const _tb = document.getElementById('btn-toggle-plan-preview');
+                if (_tb) { _tb.style.background = '#555'; _tb.style.color = '#fff'; _tb.textContent = '📋 计划预览'; }
                 alert('✅ 计划已清除');
             });
         }
@@ -5411,9 +5433,9 @@ HTML_TEMPLATE = r"""
                     const planPreviewPanel = document.getElementById('planPreviewPanel');
                     
                     if (websiteStatus.running && websiteStatus.current_task) {
-                        // 任务运行中：显示任务计划状态面板和计划面板
+                        // 任务运行中：仅显示任务计划状态面板，计划预览默认隐藏（可通过切换按钮查看）
                         planStatusPanel.style.display = 'block';
-                        planPreviewPanel.style.display = 'block';
+                        // planPreviewPanel 不再自动显示，用户可通过"📋 计划预览"按钮手动切换
                         
                         // 更新任务计划状态进度
                         const task = websiteStatus.current_task;
