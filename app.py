@@ -12036,6 +12036,21 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                             pass
                                                 except Exception:
                                                     pass
+                                                # ★ 根因修复：验证导航是否成功（window.location.href可能被Referer页SW/CSP阻止）
+                                                # 如果当前URL不是目标站，强制用page.goto跳转（丢失Referer总比停留在错误页面强）
+                                                try:
+                                                    from urllib.parse import urlparse as _urlparse_nav
+                                                    _nav_target = _urlparse_nav(url).hostname or ''
+                                                    _nav_current = _urlparse_nav(page.url or '').hostname or ''
+                                                    if _nav_target and _nav_current and _nav_target not in _nav_current and _nav_current not in _nav_target:
+                                                        log.warning(f"⚠️ [导航失败] window.location.href被阻止！当前={_nav_current}，目标={_nav_target}，强制goto")
+                                                        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                                                        try:
+                                                            page.wait_for_load_state("networkidle", timeout=8000)
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    pass
                                                 return True
                                             except Exception as e:
                                                 log.warning(f"第{attempt+1}次访问失败: {e}")
@@ -12192,6 +12207,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                         except Exception:
                                             pass
                                         break
+                                    # ★ 根因修复：URL域名不匹配时，不允许“二次检测”误判为成功
+                                    # 防止Referer页面（Reddit/Instagram等）被误认为目标站加载成功
+                                    if _home_page_reason and 'URL域名不匹配' in _home_page_reason:
+                                        log.warning(f"⚠️ [导航失败] 当前页面非目标站（{_home_page_reason}），重试...")
+                                        if retry < 2:
+                                            _wait = _retry_wait_list[retry]
+                                            time.sleep(_wait)
+                                        continue
                                     # 内容为空，但 URL 是正常的——也算成功（某些 SPA 首屏渲染延迟）
                                     _u_str = str(_u or "")
                                     if _u_str and _u_str.lower().startswith(("http://", "https://")):
