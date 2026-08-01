@@ -13256,6 +13256,18 @@ def get_plan():
     global pending_plan, current_plan, _last_executed_plan
     # 优先返回待执行计划，其次当前执行中的计划，最后保留的历史计划（供预览查看）
     plan_data = pending_plan if pending_plan is not None else (current_plan if current_plan is not None else _last_executed_plan)
+    # 内存变量全为空时，从磁盘文件加载（服务重启后内存丢失）
+    if plan_data is None:
+        try:
+            import json as _json
+            if os.path.exists(PLAN_PROGRESS_FILE):
+                with open(PLAN_PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                    _disk_data = _json.load(f)
+                plan_data = _disk_data.get("plan")
+                if plan_data:
+                    _last_executed_plan = plan_data  # 缓存到内存
+        except Exception:
+            pass
     return jsonify({
         "plan": plan_data
     })
