@@ -361,13 +361,20 @@ def get_proxy_from_api_url(api_url: str, api_user: str = "", api_pwd: str = "",
     """
     provider = _global_ip_provider
 
-    # 1. 检查缓存
+    # 1. 检查缓存（★ 缓存命中后仍需IP去重检查，防止同一IP被重复使用）
     if use_cache and not force_refresh and api_url:
         with _proxy_cache_lock:
             cached = _proxy_cache.get(api_url)
             if cached and (time.time() - cached["timestamp"]) <= PROXY_CACHE_TTL:
-                logger.debug(f"[代理缓存] 使用缓存代理 (API: {api_url[:50]}...)")
-                return cached["data"]
+                # ★ 关键修复：缓存命中后检查IP是否已在去重池中
+                cached_ip = cached["data"].get("ip_info", {}).get("ip", "")
+                if cached_ip and cached_ip != "未知" and check_ip_used_recently(cached_ip):
+                    # IP已使用过，清除缓存，强制重新获取
+                    del _proxy_cache[api_url]
+                    logger.warning(f"[代理缓存] ⚠️ 缓存IP {cached_ip} 已在去重池中，清除缓存重新获取")
+                else:
+                    logger.debug(f"[代理缓存] 使用缓存代理 (API: {api_url[:50]}...)")
+                    return cached["data"]
 
     # 2. 直连 IPDeep API
     result = provider._fetch_proxy_from_ipdeep(
@@ -514,8 +521,8 @@ _proxy_cache = {}  # {api_url: {"data": proxy_data, "timestamp": float}}
 _proxy_cache_lock = threading.Lock()
 _used_ips = {}  # {ip: timestamp}
 _used_ips_lock = threading.Lock()
-PROXY_CACHE_TTL = 600  # 代理缓存TTL（秒），默认10分钟
-IP_REUSE_INTERVAL = 12 * 3600  # IP去重间隔（秒），默认12小时
+PROXY_CACHE_TTL = 60  # 代理缓存TTL（秒），★ 从600s降60s，防止session过期后缓存返回失效凭证
+IP_REUSE_INTERVAL = 24 * 3600  # IP去重间隔（秒），★ 24小时去重（设计要求）
 
 
 if __name__ == "__main__":

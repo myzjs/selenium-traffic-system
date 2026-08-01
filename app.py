@@ -19,6 +19,9 @@ from datetime import datetime
 from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
+# ========== 应用版本号 ==========
+APP_VERSION = "2.5.8"
+
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
 def _bridge_should_stop():
@@ -56,6 +59,7 @@ from seo_query_module import get_seo_query
 from ip_region_module import get_ip_recognizer, REGION_CHINA, REGION_US_EU, REGION_OTHER, REGION_FAILED
 from ip_info_resolver import resolve_ip_info
 import ip_provider as _ip_provider
+from local_proxy_relay import start_relay as _start_proxy_relay, stop_relay as _stop_proxy_relay
 
 _xvfb_process = None
 _xvfb_lock = threading.Lock()
@@ -3019,6 +3023,12 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             log.warning(f"[真搜索] 找不到引擎配置，直接访问目标页")
             return False, current_x, current_y
         
+        # ★ 社媒平台不走真搜索流程（无搜索框/结果页），直接返回让Referer流程处理
+        _engine_type = selected_engine.get("type", "search")
+        if _engine_type == "social":
+            log.info(f"🔍 [真搜索] 引擎 {selected_engine_id} 为社媒平台(type=social)，跳过真搜索，由Referer流程处理")
+            return False, current_x, current_y
+        
         engine_url = selected_engine.get("url")
         homepage_url = seo_query.get_engine_homepage(engine_url)
         if not homepage_url:
@@ -3547,7 +3557,7 @@ HTML_TEMPLATE = r"""
         <!-- 顶部栏 -->
         <div class="top-bar">
             <!-- 蓝框 - 系统名称 -->
-            <div class="system-name">Selenium流量系统</div>
+            <div class="system-name">Selenium流量系统 <span style="font-size:12px;color:#aaa;font-weight:normal;">v{{ APP_VERSION }}</span></div>
             
             <!-- 运行模式区域 -->
             <div class="button-panel">
@@ -9536,6 +9546,38 @@ def _record_adsl_ip_use(ip, resolved=None):
         _save_adsl_ip_history(history)
 
 
+def _generate_proxy_auth_extension(proxy_host, proxy_port, username, password):
+    """动态生成Chrome代理认证扩展，解决Chrome 150+不支持--proxy-server内嵌凭证的问题。
+    扩展仅处理代理认证(onAuthRequired)，代理服务器由--proxy-server参数指定。
+    返回扩展目录路径，供--load-extension使用。"""
+    import json as _json
+    ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.proxy_auth_ext')
+    os.makedirs(ext_dir, exist_ok=True)
+    manifest = {
+        "version": "1.0.0",
+        "manifest_version": 3,
+        "name": "Proxy Auth Helper",
+        "permissions": ["webRequest", "webRequestAuthProvider"],
+        "host_permissions": ["<all_urls>"],
+        "background": {"service_worker": "background.js"},
+        "minimum_chrome_version": "108"
+    }
+    # ★ 仅处理代理认证，不设置proxy（由--proxy-server命令行参数控制）
+    background_js = f"""const USERNAME = {repr(username)};
+const PASSWORD = {repr(password)};
+chrome.webRequest.onAuthRequired.addListener(
+  (details) => ({{authCredentials: {{username: USERNAME, password: PASSWORD}}}}),
+  {{urls: ["<all_urls>"]}},
+  ["asyncBlocking"]
+);
+"""
+    with open(os.path.join(ext_dir, 'manifest.json'), 'w') as f:
+        _json.dump(manifest, f)
+    with open(os.path.join(ext_dir, 'background.js'), 'w') as f:
+        f.write(background_js)
+    log.info(f"[代理认证] 生成MV3认证扩展: {ext_dir} (user={username[:6]}...)")
+    return ext_dir
+
 def ensure_xvfb_for_headed_mode(headless):
     """服务器无 DISPLAY 时，为 headed 模式自动启动 Xvfb 虚拟显示器。"""
     global _xvfb_process
@@ -10357,6 +10399,19 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 continue
                             _ip_provider.record_c_segment_use(exit_ip)
 
+                        # ===== ★ IP会话频率控制：24h内单IP最多4次，会话间隔≥5分钟 =====
+                        if exit_ip and exit_ip != "未知":
+                            if not ip_session_manager.is_ip_available(exit_ip):
+                                log.warning(
+                                    f"⚠️ IP {exit_ip} 24h内使用次数已达上限或会话间隔不足，舍弃"
+                                )
+                                continue
+
+                        # ===== ★ 任务使用后立即清除代理缓存，防止下一个任务命中相同缓存 =====
+                        # 注：IP去重已在 _fetch_proxy_from_ipdeep 内部完成（check + record）
+                        # 此处仅确保缓存不会导致下一个任务复用相同代理凭证
+                        _ip_provider.invalidate_proxy_cache(current_task.get("proxy_api_url"))
+
                         # —— Step 1: 精准识别 IP 三要素 country/timezone/language ——
                         log.info(f"🔎 精准识别 IP 信息: {exit_ip}")
                         resolved_ip_info = resolve_ip_info(exit_ip, proxy_ip_info=ip_info)
@@ -10627,14 +10682,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     # 直接使用 IPDeep 返回的 HTTP 代理出网
                     proxy_username = proxy_info.get('proxy_username', '')
                     proxy_password = proxy_info.get('proxy_password', '')
+                    # ★ Chrome 150+ 不支持 --proxy-server 内嵌凭证，使用本地代理转发器
+                    # 本地转发器: 127.0.0.1:18082 (无需认证) → IPDeep代理 (自动添加认证头)
                     if proxy_username and proxy_password:
-                        proxy_server = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
+                        _relay_addr = _start_proxy_relay(proxy_host, int(proxy_port), proxy_username, proxy_password)
+                        proxy_server = _relay_addr  # http://127.0.0.1:18082
+                        log.info(f"[代理配置] ✅ 启动本地代理转发器: {_relay_addr} → {proxy_host}:{proxy_port}")
                     else:
                         proxy_server = f"http://{proxy_host}:{proxy_port}"
+                        log.info(f"[代理配置] ✅ 直连代理(无认证): {proxy_host}:{proxy_port}")
                     proxy_config = {
                         "server": proxy_server,
+                        "username": proxy_username,
+                        "password": proxy_password,
                     }
-                    log.info(f"[代理配置] ✅ 浏览器数据面使用 IPDeep HTTP 代理: {proxy_host}:{proxy_port}")
                 except Exception as e:
                     log.error(f"❌ 构建代理配置失败: {e}")
                     log.error(f"❌ 错误类型: {type(e).__name__}")
@@ -10708,6 +10769,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 仅保留 Chrome 安全浏览和组件更新等内部服务
                         "--proxy-bypass-list=safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;clients2.google.com;update.googleapis.com;edgedl.me.gvt1.com",
                     ])
+                    # ★ 本地代理转发器已处理认证，无需Chrome扩展
                 # WebRTC防护：仅强制走代理，不完全禁用（完全禁用是强检测信号）
                 # init_script 已通过包装 RTCPeerConnection + 过滤 ICE candidate 实现 IP 泄露防护
                 if config.get("webrtc_leak_check_enabled", True):
@@ -12757,6 +12819,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         else:
                             stats["fail"] += 1
                         
+                        # ★ 记录IP会话（用于24h频率控制）
+                        if exit_ip and exit_ip != "未知":
+                            ip_session_manager.record_ip_session(exit_ip)
+                        
                         # ⏱️ 时间统计：前置流程时长（拨号→进入网站）、浏览网站时长（进入网站→任务结束）
                         _task_end_time = time.time()
                         if enter_site_time is not None:
@@ -12919,6 +12985,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             else:
                                 log.warning("⚠️ 关闭 browser 超时，已跳过强制杀进程，等待系统自然回收")
     
+                        # ★ 停止本地代理转发器
+                        try:
+                            _stop_proxy_relay()
+                            log.debug("🧹 已停止本地代理转发器")
+                        except Exception:
+                            pass
+
                         # 不再强杀 Chrome/Chromium 进程：正常关闭失败时只记录，并给系统自然回收时间
                         if browser:
                             try:
@@ -12984,7 +13057,7 @@ def index():
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
                                   stats=stats, runningtask=task_running,
-                                  planned_total=planned_total_tasks))
+                                  planned_total=planned_total_tasks, APP_VERSION=APP_VERSION))
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'

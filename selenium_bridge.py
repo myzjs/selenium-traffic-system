@@ -1681,31 +1681,34 @@ class Chromium:
         # 注意：不block googleapis.com整体（会影响Chrome功能），只block特定子域名
         args.append(f"--host-rules={','.join(host_rules_map)}")
 
+        # ★ 检测是否有--load-extension参数（如代理认证扩展）
+        has_load_extension = any(a.startswith('--load-extension') for a in args)
+
         for arg in args:
             if arg.startswith("--disable-extensions"):
-                # 但如果有.crx扩展要加载，需要允许扩展
-                if not os.path.exists(extensions_dir):
+                # 如果有--load-extension或.crx扩展要加载，跳过--disable-extensions
+                if has_load_extension or os.path.exists(extensions_dir):
+                    continue  # 不添加--disable-extensions
+                else:
                     chrome_options.add_argument(arg)
             else:
                 chrome_options.add_argument(arg)
 
-        # 加载扩展
+        # 加载扩展（extensions目录中的.crx文件）
         if os.path.exists(extensions_dir):
             ext_paths = []
             for f in os.listdir(extensions_dir):
                 if f.endswith('.crx'):
                     ext_paths.append(os.path.join(extensions_dir, f))
             if ext_paths:
-                # Selenium加载扩展需要解压
-                # 添加--load-extension参数
-                chrome_options.add_experimental_option(
-                    "excludeSwitches", ["disable-extensions"]
-                )
-                # 暂时不支持动态.crx加载（需要解压），仅记录
-                pass
+                has_load_extension = True
 
         # 关键反检测配置
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        # ★ excludeSwitches 必须一次性设置，多次调用会覆盖！
+        _exclude_switches = ["enable-automation"]
+        if has_load_extension:
+            _exclude_switches.append("disable-extensions")
+        chrome_options.add_experimental_option("excludeSwitches", _exclude_switches)
         chrome_options.add_experimental_option("useAutomationExtension", False)
 
         # 设置页面加载策略为none，由我们手动控制等待
