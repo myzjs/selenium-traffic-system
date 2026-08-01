@@ -1703,6 +1703,7 @@ _single_task_mode = False  # 单独任务模式标志：不影响网站任务状
 pending_plan = None
 current_task_idx = -1  # 当前正在执行的任务索引（-1表示无）
 current_plan = None    # 当前执行的计划
+_last_executed_plan = None  # 保留最后一次执行的计划（供预览查看）
 
 # ★ 断点恢复：计划进度持久化文件
 PLAN_PROGRESS_FILE = "plan_progress.json"
@@ -4982,6 +4983,13 @@ HTML_TEMPLATE = r"""
             if (panel.style.display === 'none' || panel.style.display === '') {
                 panel.style.display = 'block';
                 if (btn) { btn.style.background = '#00d4aa'; btn.style.color = '#1a1a1a'; btn.textContent = '📋 关闭预览'; }
+                // 打开时检查表格是否为空，若空则重新加载计划数据
+                const tbody = document.getElementById('planTableBody');
+                if (tbody && tbody.children.length === 0) {
+                    fetch('/get_plan').then(r => r.json()).then(data => {
+                        if (data.plan) { renderPlan(data.plan); }
+                    });
+                }
             } else {
                 panel.style.display = 'none';
                 if (btn) { btn.style.background = '#555'; btn.style.color = '#fff'; btn.textContent = '📋 计划预览'; }
@@ -5213,10 +5221,13 @@ HTML_TEMPLATE = r"""
 
         // 页面加载时检查是否已有计划，并加载代理池配置
         document.addEventListener('DOMContentLoaded', function() {
-            // 1. 加载计划预览
+            // 1. 加载计划预览数据（填充表格，但不自动显示面板）
             fetch('/get_plan').then(r => r.json()).then(data => {
                 if (data.plan) {
                     renderPlan(data.plan);
+                    // 页面加载时不自动展示计划预览（仅生成计划时才自动展示）
+                    // 用户可通过“📋 计划预览”按钮手动查看
+                    document.getElementById('planPreviewPanel').style.display = 'none';
                 }
             });
             
@@ -9925,7 +9936,7 @@ def _format_plan_log_block(plan, title, show_tasks=True, max_tasks=10):
 
 
 def worker_task(single_task=False, adsl_ip_task=False):
-    global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status
+    global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status, _last_executed_plan
     stats["total"] = 0
     stats["success"] = 0
     stats["fail"] = 0
@@ -12945,6 +12956,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
         adsl_status["running"] = False
         adsl_status["status"] = "已停止" if adsl_status.get("completed", 0) < adsl_status.get("total", 0) else "完成"
     current_task_idx = -1
+    _last_executed_plan = current_plan  # 保留计划数据供预览查看
     current_plan = None
     stop_human_model()
     log.info("任务已停止")
@@ -13241,9 +13253,11 @@ def generate_plan():
 
 @app.route('/get_plan')
 def get_plan():
-    global pending_plan
+    global pending_plan, current_plan, _last_executed_plan
+    # 优先返回待执行计划，其次当前执行中的计划，最后保留的历史计划（供预览查看）
+    plan_data = pending_plan if pending_plan is not None else (current_plan if current_plan is not None else _last_executed_plan)
     return jsonify({
-        "plan": pending_plan
+        "plan": plan_data
     })
 
 @app.route('/clear_plan', methods=['POST'])
