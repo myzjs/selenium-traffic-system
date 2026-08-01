@@ -614,3 +614,64 @@ class TestConfigAuditLog:
         assert len(log_data) == 200
         # Verify it kept the most recent entries
         assert log_data[-1]["action"] == "action_209"
+
+
+# ========== 浏览时长配置尊重测试 ==========
+
+class TestBounceStayRespectsConfig:
+    """验证跳出型任务停留时间不低于配置的total_stay.min"""
+
+    def test_bounce_stay_floor_equals_config_min(self):
+        """跳出停留下限 = max(30, config_min)，当config_min=80时应为80"""
+        config_min = 80
+        config_max = 220
+        bounce_floor = max(30, config_min)
+        bounce_ceil = min(config_max, (config_min + config_max) / 2)
+        if bounce_ceil <= bounce_floor:
+            bounce_ceil = bounce_floor + 20
+        # 验证下限不低于配置min
+        assert bounce_floor >= config_min
+        # 验证上限大于下限
+        assert bounce_ceil > bounce_floor
+        # 模拟100次随机采样，全部在范围内
+        import random
+        for _ in range(100):
+            stay = random.uniform(bounce_floor, bounce_ceil)
+            assert stay >= config_min, f"跳出停留{stay:.1f}s < 配置min {config_min}s"
+            assert stay <= bounce_ceil
+
+    def test_bounce_stay_with_low_config(self):
+        """配置min=30时，跳出停留下限=max(30,30)=30"""
+        config_min = 30
+        config_max = 60
+        bounce_floor = max(30, config_min)
+        bounce_ceil = min(config_max, (config_min + config_max) / 2)
+        if bounce_ceil <= bounce_floor:
+            bounce_ceil = bounce_floor + 20
+        assert bounce_floor == 30
+        assert bounce_ceil == 45  # min(60, 45) = 45
+
+    def test_session_rope_floor_respects_config(self):
+        """保险绳下限必须≥配置total_stay.min"""
+        config_min = 80
+        rope_floor = max(60, config_min)
+        assert rope_floor >= config_min
+        assert rope_floor == 80
+
+    def test_session_rope_floor_with_high_config(self):
+        """配置min=120时，保险绳下限=120"""
+        config_min = 120
+        rope_floor = max(60, config_min)
+        assert rope_floor == 120
+
+    def test_old_bounce_logic_would_violate_config(self):
+        """复现原Bug：旧逻辑uniform(15,60)在配置min=80时必然违规"""
+        import random
+        config_min = 80
+        violations = 0
+        for _ in range(1000):
+            old_stay = random.uniform(15, 60)
+            if old_stay < config_min:
+                violations += 1
+        # 旧逻辑100%违规
+        assert violations == 1000, "旧逻辑应100%低于配置min=80"

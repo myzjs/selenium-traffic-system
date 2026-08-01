@@ -179,7 +179,7 @@ def run_code_check(progress=None, log=None, config=None):
     try:
         cmd = [sys.executable, "-m", "pytest", tests_dir, "-q", "--tb=no",
                "-p", "no:cacheprovider", "--no-header"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=BASE_DIR)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=BASE_DIR)
         out = (proc.stdout or "") + (proc.stderr or "")
         # 解析 "155 passed, 2 failed" 摘要行
         import re as _re
@@ -195,7 +195,7 @@ def run_code_check(progress=None, log=None, config=None):
         if total == 0:
             summary = "未能解析测试结果（pytest 可能未安装）"
     except subprocess.TimeoutExpired:
-        summary = "测试超时(>300s)"
+        summary = "测试超时(>120s)"  # ★ 审计修复#9：与实际timeout=120一致
     except Exception as e:
         summary = f"测试执行异常: {type(e).__name__}"
 
@@ -211,28 +211,113 @@ def run_code_check(progress=None, log=None, config=None):
 
 
 # ============================================================
+# Xvfb 虚拟显示器支持（VPS 有头模式必须）
+# ============================================================
+def _ensure_xvfb():
+    """VPS无DISPLAY时自动启动Xvfb，确保有头模式可用（headless会被风控检测）。"""
+    if os.environ.get("DISPLAY"):
+        return  # 已有DISPLAY，无需处理
+    import subprocess as _sp
+    display = ":99"
+    try:
+        # 检查是否已有Xvfb在运行
+        chk = _sp.run(["pgrep", "-f", f"Xvfb {display}"], capture_output=True, text=True)
+        if chk.returncode == 0:
+            os.environ["DISPLAY"] = display
+            return
+        # 启动Xvfb
+        _sp.Popen(
+            ["Xvfb", display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+        )
+        import time as _t
+        _t.sleep(1)
+        os.environ["DISPLAY"] = display
+    except Exception:
+        pass  # Xvfb不可用时回退headless（测试环境容错）
+
+
+def _build_launch_args():
+    """构建与主应用app.py一致的反检测启动参数。"""
+    return [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-popup-blocking",
+        "--disable-sync",
+        "--disable-default-apps",
+        "--disable-hang-monitor",
+        "--disable-prompt-on-repost",
+        "--disable-client-side-phishing-detection",
+        "--disable-component-update",
+        "--disable-component-extensions-with-background-pages",
+        "--metrics-recording-only",
+        "--disable-ipc-flooding-protection",
+        "--autoplay-policy=no-user-gesture-required",
+        "--mute-audio",
+        # WebRTC防护：仅强制走代理，不完全禁用（完全禁用是强检测信号）
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--enforce-webrtc-ip-handling-policy",
+        # 禁用翻译/优化提示等后台服务
+        "--disable-features=AutoplayIgnoreWebAudio,MediaRouter,Translate,TranslateUI,LanguageDetection,OptimizationHints",
+    ]
+
+
+def _build_accept_language(locale):
+    """构建Accept-Language头（修复自引用bug）。"""
+    lang_prefix = locale.split('-')[0] if '-' in locale else locale
+    parts = [locale]
+    if lang_prefix != locale:
+        parts.append(f"{lang_prefix};q=0.9")
+    if not locale.startswith("en"):
+        parts.append("en-US;q=0.8")
+        parts.append("en;q=0.7")
+    else:
+        if locale != "en-US":
+            parts.append("en-US;q=0.8")
+        parts.append("en;q=0.7")
+    return ",".join(parts)
+
+
+# ============================================================
 # L2 环境伪装（隐身浏览器）
 # ============================================================
-def _launch_stealth_browser(headless=True):
-    """启动带反检测注入的浏览器，返回 (playwright, browser, context, page)。"""
+def _launch_stealth_browser(headless=False):
+    """启动带反检测注入的浏览器，返回 (playwright, browser, context, page)。
+    
+    ★ 默认 headless=False（有头模式），因为 headless 会被 CreepJS/Pixelscan/Google 检测。
+    VPS 上通过 Xvfb 虚拟显示器支持有头模式。
+    """
     from selenium_bridge import sync_playwright
     import risk_check
+    # 有头模式需要Xvfb支持
+    if not headless:
+        _ensure_xvfb()
     p = sync_playwright()
     p.__enter__()
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage",
-                   "--disable-blink-features=AutomationControlled"]
+    launch_args = _build_launch_args()
     try:
         browser = p.chromium.launch(channel="chrome", headless=headless, args=launch_args)
     except Exception:
         browser = p.chromium.launch(headless=headless, args=launch_args)
+    _locale = risk_check.LOCALE
+    _tz = risk_check.TIMEZONE
     context = browser.new_context(
-        locale=risk_check.LOCALE,
-        timezone_id=risk_check.TIMEZONE,
+        locale=_locale,
+        timezone_id=_tz,
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         viewport={"width": 1920, "height": 1080},
         extra_http_headers={
-            "Accept-Language": f"{risk_check.LOCALE},{risk_check.LOCALE.split('-')[0]};q=0.9,en;q=0.8",
+            "Accept-Language": _build_accept_language(_locale),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Dest": "document",
@@ -241,7 +326,6 @@ def _launch_stealth_browser(headless=True):
             "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="149", "Google Chrome";v="149"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Linux"',
-            "Referer": "https://www.google.com/",
             "Upgrade-Insecure-Requests": "1",
         },
     )
@@ -250,12 +334,13 @@ def _launch_stealth_browser(headless=True):
     return p, browser, context, page
 
 
-def run_env_check(progress=None, log=None, config=None, headless=True):
+def run_env_check(progress=None, log=None, config=None, headless=False):
     progress = progress or _noop
     log = log or _noop
     t0 = time.time()
     checks = []
     browser = p = None
+    import risk_check
     try:
         progress(10, "启动隐身浏览器")
         log("🕵️ L2: 启动隐身浏览器进行环境伪装检测 ...")
@@ -328,9 +413,10 @@ def run_env_check(progress=None, log=None, config=None, headless=True):
                 return r;
             })()
         """) or {}
-        tz_expected = "Asia/Shanghai"
+        tz_expected = risk_check.TIMEZONE
         tz_ok = consis.get("tz") == tz_expected
-        lang_ok = str(consis.get("lang", "")).lower().startswith("zh")
+        _locale_prefix = risk_check.LOCALE.split('-')[0].lower()
+        lang_ok = str(consis.get("lang", "")).lower().startswith(_locale_prefix)
         all_ok = tz_ok and lang_ok and consis.get("viewport_ok", False)
         checks.append(_check(
             "fingerprint_consistency", "指纹一致性(时区/语言/视口)",
@@ -357,7 +443,7 @@ def run_env_check(progress=None, log=None, config=None, headless=True):
 # ============================================================
 # L3 对抗验证（攻防演练 + CreepJS + Pixelscan）
 # ============================================================
-def run_adversarial_check(progress=None, log=None, config=None, target_url=None, headless=True):
+def run_adversarial_check(progress=None, log=None, config=None, target_url=None, headless=False):
     progress = progress or _noop
     log = log or _noop
     t0 = time.time()
@@ -460,14 +546,15 @@ def run_adversarial_check(progress=None, log=None, config=None, target_url=None,
 def _new_stealth_context(browser):
     """创建与主隐身浏览器一致配置的上下文（含反检测注入），供第三方检测探针使用。"""
     import risk_check
+    _locale = risk_check.LOCALE
     ctx = browser.new_context(
-        locale=risk_check.LOCALE,
+        locale=_locale,
         timezone_id=risk_check.TIMEZONE,
         user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         viewport={"width": 1920, "height": 1080},
         extra_http_headers={
-            "Accept-Language": f"{risk_check.LOCALE},{risk_check.LOCALE.split('-')[0]};q=0.9,en;q=0.8",
+            "Accept-Language": _build_accept_language(_locale),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Dest": "document",
@@ -491,21 +578,52 @@ def _probe_creepjs(p, browser, log):
         _creepjs_script = os.path.join(BASE_DIR, "_creepjs_probe.py")
         with open(_creepjs_script, "w") as f:
             f.write('''
-import sys, time, json
+import sys, time, json, os, subprocess
 sys.path.insert(0, "{base_dir}")
+# ★ Xvfb支持：有头模式必须
+if not os.environ.get("DISPLAY"):
+    try:
+        chk = subprocess.run(["pgrep", "-f", "Xvfb :99"], capture_output=True, text=True)
+        if chk.returncode == 0:
+            os.environ["DISPLAY"] = ":99"
+        else:
+            subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            os.environ["DISPLAY"] = ":99"
+    except: pass
 from selenium_bridge import sync_playwright
 import risk_check
 p = sync_playwright()
 p.__enter__()
-launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+# ★ 与主应用一致的完整反检测启动参数
+launch_args = [
+    "--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
+    "--disable-infobars", "--disable-extensions", "--disable-background-networking",
+    "--no-first-run", "--no-default-browser-check", "--disable-popup-blocking",
+    "--disable-sync", "--disable-default-apps", "--metrics-recording-only",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--enforce-webrtc-ip-handling-policy",
+    "--disable-features=AutoplayIgnoreWebAudio,MediaRouter,Translate,TranslateUI,LanguageDetection,OptimizationHints",
+]
+_headless = not bool(os.environ.get("DISPLAY"))
 try:
-    browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
+    browser = p.chromium.launch(channel="chrome", headless=_headless, args=launch_args)
 except:
-    browser = p.chromium.launch(headless=True, args=launch_args)
+    browser = p.chromium.launch(headless=_headless, args=launch_args)
+_locale = risk_check.LOCALE
+_lang_prefix = _locale.split("-")[0] if "-" in _locale else _locale
+_al_parts = [_locale]
+if _lang_prefix != _locale: _al_parts.append(f"{{_lang_prefix}};q=0.9")
+if not _locale.startswith("en"): _al_parts.extend(["en-US;q=0.8", "en;q=0.7"])
+else:
+    if _locale != "en-US": _al_parts.append("en-US;q=0.8")
+    _al_parts.append("en;q=0.7")
 ctx = browser.new_context(
-    locale=risk_check.LOCALE, timezone_id=risk_check.TIMEZONE,
+    locale=_locale, timezone_id=risk_check.TIMEZONE,
     user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     viewport={{"width": 1920, "height": 1080}},
+    extra_http_headers={{"Accept-Language": ",".join(_al_parts)}},
 )
 ctx.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
 page = ctx.new_page()
@@ -583,20 +701,24 @@ def _probe_pixelscan(p, browser, log):
     try:
         from selenium_bridge import sync_playwright
         import risk_check
+        # ★ 有头模式需要Xvfb
+        _ensure_xvfb()
         _p2 = sync_playwright()
         _p2.__enter__()
-        launch_args = ["--no-sandbox", "--disable-dev-shm-usage",
-                       "--disable-blink-features=AutomationControlled"]
+        launch_args = _build_launch_args()
+        _headless = not bool(os.environ.get("DISPLAY"))
         try:
-            _browser2 = _p2.chromium.launch(channel="chrome", headless=True, args=launch_args)
+            _browser2 = _p2.chromium.launch(channel="chrome", headless=_headless, args=launch_args)
         except Exception:
-            _browser2 = _p2.chromium.launch(headless=True, args=launch_args)
+            _browser2 = _p2.chromium.launch(headless=_headless, args=launch_args)
+        _locale = risk_check.LOCALE
         ctx = _browser2.new_context(
-            locale=risk_check.LOCALE,
+            locale=_locale,
             timezone_id=risk_check.TIMEZONE,
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
+            extra_http_headers={"Accept-Language": _build_accept_language(_locale)},
         )
         ctx.add_init_script(risk_check._STEALTH_INIT_SCRIPT)
         page = ctx.new_page()
@@ -742,7 +864,7 @@ def run_behavior_check(progress=None, log=None, config=None):
 # ============================================================
 # L5 工程可靠性（稳定性探针 + 自愈 + 会话持久化）
 # ============================================================
-def run_reliability_check(progress=None, log=None, config=None, headless=True):
+def run_reliability_check(progress=None, log=None, config=None, headless=False):
     progress = progress or _noop
     log = log or _noop
     t0 = time.time()
@@ -918,7 +1040,7 @@ _LAYER_SLICES = {
 
 
 def run_production_test(layers=None, progress=None, log=None, config=None,
-                        target_url=None, headless=True):
+                        target_url=None, headless=False):
     """运行指定层（默认全部），返回 {layers:{...}, gate:{...}, report_path}。"""
     progress = progress or _noop
     log = log or _noop

@@ -21,20 +21,24 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 
 def test_ip_provider_with_mock():
     logger.info("=" * 60)
-    logger.info("测试阶段1：通过中转服务器获取IPDeep代理（Mock）")
+    logger.info("测试阶段1：直连 IPDeep API 获取代理（Mock）")
     logger.info("=" * 60)
     
+    # 模拟 IPDeep 直连返回（格式: host:port:user:pwd）
     mock_result = {
         "success": True,
         "proxy_host": "104.129.54.64",
-        "proxy_port": 1666,
+        "proxy_port": "8082",
+        "proxy_username": "ipdeep_user01",
+        "proxy_password": "ipdeep_pass01",
         "ip_info": {"ip": "192.168.1.100", "country": "United States", "city": "New York"},
         "country_code": "US"
     }
     
-    logger.info("获取代理成功！")
+    logger.info("IPDeep 直连获取代理成功！")
     logger.info(f"出口IP: {mock_result['ip_info']['ip']}")
-    logger.info(f"代理: {mock_result['proxy_host']}:{mock_result['proxy_port']}")
+    logger.info(f"代理: {mock_result['proxy_host']}:{mock_result['proxy_port']} (HTTP认证代理)")
+    logger.info(f"认证: {mock_result['proxy_username']}:***")
     return mock_result
 
 

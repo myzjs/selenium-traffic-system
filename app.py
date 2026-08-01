@@ -60,6 +60,21 @@ import ip_provider as _ip_provider
 _xvfb_process = None
 _xvfb_lock = threading.Lock()
 
+# ★ 审计修复#12：进程退出时清理Xvfb子进程，防止泄漏
+import atexit as _atexit
+def _cleanup_xvfb():
+    global _xvfb_process
+    if _xvfb_process and _xvfb_process.poll() is None:
+        try:
+            _xvfb_process.terminate()
+            _xvfb_process.wait(timeout=3)
+        except Exception:
+            try:
+                _xvfb_process.kill()
+            except Exception:
+                pass
+_atexit.register(_cleanup_xvfb)
+
 # ========== 时区和工作时间判断函数 ==========
 COUNTRY_TIMEZONE_MAP = {
     # 原有国家
@@ -1689,6 +1704,50 @@ pending_plan = None
 current_task_idx = -1  # 当前正在执行的任务索引（-1表示无）
 current_plan = None    # 当前执行的计划
 
+# ★ 断点恢复：计划进度持久化文件
+PLAN_PROGRESS_FILE = "plan_progress.json"
+
+def _save_plan_progress(plan, tasks_list):
+    """保存当前计划进度到文件，支持停止后断点恢复"""
+    try:
+        import json as _json
+        progress = {
+            "plan": plan,
+            "tasks_status": [t.get("status", "待执行") for t in tasks_list] if tasks_list else [],
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(PLAN_PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            _json.dump(progress, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"保存计划进度失败: {e}")
+
+def _load_plan_progress():
+    """加载上次未完成的计划进度，返回(plan, tasks_status)或(None, None)"""
+    try:
+        import json as _json
+        if not os.path.exists(PLAN_PROGRESS_FILE):
+            return None, None
+        with open(PLAN_PROGRESS_FILE, 'r', encoding='utf-8') as f:
+            data = _json.load(f)
+        # 只恢复当天的计划（跨天不恢复）
+        saved_at = data.get("saved_at", "")
+        today = time.strftime("%Y-%m-%d")
+        if not saved_at.startswith(today):
+            log.info(f"📋 计划进度文件已过期（保存于{saved_at}），不恢复")
+            return None, None
+        return data.get("plan"), data.get("tasks_status", [])
+    except Exception as e:
+        log.warning(f"加载计划进度失败: {e}")
+        return None, None
+
+def _clear_plan_progress():
+    """清除计划进度文件（计划全部完成时调用）"""
+    try:
+        if os.path.exists(PLAN_PROGRESS_FILE):
+            os.remove(PLAN_PROGRESS_FILE)
+    except Exception:
+        pass
+
 # 历史任务存储
 historical_tasks = []
 HISTORICAL_TASKS_FILE = "historical_tasks.json"
@@ -2755,6 +2814,43 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
                     items.push({key, tag: el.tagName, id, cls, src, width, height, visible, inViewport, exposed, exposed50, visibleRatio: Math.round(visibleRatio*100)/100, loaded});
                 });
             }
+            // ★ 通用跨域iframe检测器：捕获HilltopAds/EvaDav等随机投放域名的广告iframe
+            // 原理：广告iframe通常是跨域的、有合理尺寸的、且不属于已知非广告嵌入
+            const _nonAdDomains = ['youtube.com','youtu.be','vimeo.com','dailymotion.com','twitter.com','x.com','facebook.com','instagram.com','tiktok.com','spotify.com','soundcloud.com','maps.google','recaptcha','hcaptcha','disqus.com','paypal.com','stripe.com'];
+            const _pageHost = window.location.hostname;
+            document.querySelectorAll('iframe').forEach((el) => {
+                if (seen.has(el)) return;
+                const _src = el.getAttribute('src') || '';
+                if (!_src || _src === 'about:blank' || _src.startsWith('javascript:')) return;
+                // 跳过同源iframe
+                try { if (new URL(_src, window.location.href).hostname === _pageHost) return; } catch(e) {}
+                // 跳过已知非广告嵌入
+                const _srcLower = _src.toLowerCase();
+                if (_nonAdDomains.some(d => _srcLower.includes(d))) return;
+                const r = el.getBoundingClientRect();
+                const w = Math.round(r.width || 0);
+                const h = Math.round(r.height || 0);
+                // 广告iframe通常宽度>=160且高度>=90
+                if (w < 160 || h < 90) return;
+                // 排除超大iframe（可能是页面布局框架）
+                if (w > vw * 0.95 && h > vh * 0.95) return;
+                seen.add(el);
+                const style = window.getComputedStyle(el);
+                const id = el.id || '';
+                const cls = typeof el.className === 'string' ? el.className : '';
+                const key = id || `ADFRAME:${cls}:${Math.round(r.left)}:${Math.round(r.top)}:${w}x${h}`;
+                const visible = style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+                const inViewport = visible && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+                let visibleRatio = 0;
+                if (inViewport && w > 0 && h > 0) {
+                    const visW = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+                    const visH = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+                    visibleRatio = (visW * visH) / (w * h);
+                }
+                const exposed = inViewport && w >= 20 && h >= 20;
+                const exposed50 = exposed && visibleRatio >= 0.5;
+                items.push({key, tag: 'IFRAME', id, cls, src: _src, width: w, height: h, visible, inViewport, exposed, exposed50, visibleRatio: Math.round(visibleRatio*100)/100, loaded: true});
+            });
             return items;
         }
         """)
@@ -4071,9 +4167,12 @@ HTML_TEMPLATE = r"""
                     </div>
                     <!-- 进度条 -->
                     <div id="prodTestProgress" style="display:none; margin:16px 0;">
-                        <div style="display:flex;justify-content:space-between;font-size:13px;color:#cbd5e1;margin-bottom:6px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#cbd5e1;margin-bottom:6px;">
                             <span id="prodTestStage">准备中...</span>
-                            <span id="prodTestPercent">0%</span>
+                            <div style="display:flex;align-items:center;gap:10px;">
+                                <span id="prodTestPercent">0%</span>
+                                <button id="btnForceStopProd" class="btn" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px;display:none;" onclick="forceStopProductionTest()">🛑 强制停止</button>
+                            </div>
                         </div>
                         <div style="width:100%;height:18px;background:#1e293b;border-radius:9px;overflow:hidden;">
                             <div id="prodTestBar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width .4s ease;"></div>
@@ -5642,7 +5741,10 @@ HTML_TEMPLATE = r"""
             document.querySelectorAll('#tab-taskvalidation button[onclick^="startProductionTest"]').forEach(b => b.disabled = true);
             document.getElementById('prodTestReport').style.display = 'none';
             document.getElementById('prodTestProgress').style.display = 'block';
+            document.getElementById('btnForceStopProd').style.display = 'inline-block';
             setProdTestProgress(0, '启动中...');
+            _prodTestLastProgress = -1;
+            _prodTestStuckCount = 0;
             fetch('/start_production_test', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -5652,6 +5754,7 @@ HTML_TEMPLATE = r"""
                     alert('启动失败: ' + (d.message || '未知错误'));
                     enableProdTestButtons();
                     document.getElementById('prodTestProgress').style.display = 'none';
+                    document.getElementById('btnForceStopProd').style.display = 'none';
                     return;
                 }
                 _prodTestPolling = setInterval(pollProductionTest, 1000);
@@ -5659,11 +5762,23 @@ HTML_TEMPLATE = r"""
                 alert('请求异常: ' + e);
                 enableProdTestButtons();
                 document.getElementById('prodTestProgress').style.display = 'none';
+                document.getElementById('btnForceStopProd').style.display = 'none';
+            });
+        }
+        function forceStopProductionTest() {
+            if (!confirm('确定要强制停止当前测试吗？')) return;
+            fetch('/force_stop_production_test', {method:'POST'}).then(r => r.json()).then(d => {
+                if (_prodTestPolling) { clearInterval(_prodTestPolling); _prodTestPolling = null; }
+                enableProdTestButtons();
+                document.getElementById('btnForceStopProd').style.display = 'none';
+                setProdTestProgress(0, '已强制停止');
             });
         }
         function enableProdTestButtons() {
             document.querySelectorAll('#tab-taskvalidation button[onclick^="startProductionTest"]').forEach(b => b.disabled = false);
         }
+        var _prodTestLastProgress = -1;
+        var _prodTestStuckCount = 0;
         function setProdTestProgress(pct, stage) {
             document.getElementById('prodTestBar').style.width = pct + '%';
             document.getElementById('prodTestPercent').textContent = pct + '%';
@@ -5672,10 +5787,26 @@ HTML_TEMPLATE = r"""
         function pollProductionTest() {
             fetch('/get_production_test_status').then(r => r.json()).then(d => {
                 setProdTestProgress(d.progress || 0, d.stage || '');
+                // ★ 卡死检测：如果进度60秒未变化，显示警告
+                if (d.running) {
+                    if (d.progress === _prodTestLastProgress) {
+                        _prodTestStuckCount++;
+                        if (_prodTestStuckCount > 60) {
+                            document.getElementById('prodTestStage').textContent = (d.stage || '') + ' ⚠️ 可能卡死，点击强制停止';
+                            document.getElementById('prodTestStage').style.color = '#f59e0b';
+                        }
+                    } else {
+                        _prodTestStuckCount = 0;
+                        document.getElementById('prodTestStage').style.color = '#cbd5e1';
+                    }
+                    _prodTestLastProgress = d.progress;
+                }
                 if (!d.running) {
                     clearInterval(_prodTestPolling);
                     _prodTestPolling = null;
                     enableProdTestButtons();
+                    document.getElementById('btnForceStopProd').style.display = 'none';
+                    document.getElementById('prodTestStage').style.color = '#cbd5e1';
                     renderProductionReport(d);
                 }
             }).catch(() => {});
@@ -8553,6 +8684,12 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
     # 如果失败（或关键词为空），尝试使用 fallback_urls
     # ★ 打乱兜底链接池顺序，实现 chapter1~N 分散访问（避免每次只点第一个）
     _fbs = list(fallback_urls or [])
+    # ★ 根因修复：过滤无广告页面，避免跳转到/privacy-policy/等无广告页浪费任务
+    _NO_AD_PATHS_FB = ['/about', '/contact', '/privacy', '/refund', '/dmca', '/faq', '/terms', '/tos', '/cookie', '/sitemap', '/login', '/register', '/account']
+    _fbs_before = len(_fbs)
+    _fbs = [u for u in _fbs if u and u.strip() and not any(p in u.lower() for p in _NO_AD_PATHS_FB)]
+    if len(_fbs) < _fbs_before:
+        log.info(f"🚫 [无广告页过滤] 从兜底链接池移除了 {_fbs_before - len(_fbs)} 个无广告页面URL")
     random.shuffle(_fbs)
     if final_fallback_url:
         _fbs.append(final_fallback_url)  # 终极兜底始终最后尝试
@@ -9887,19 +10024,41 @@ def worker_task(single_task=False, adsl_ip_task=False):
         current_plan = pending_plan
         pending_plan = None
     else:
-        log.info("📋 正在生成今日任务清单...")
-        try:
-            daily_plan = generate_daily_tasks(config)
-        except Exception as e:
-            import traceback as _tb
-            _err = f"生成任务清单失败: {type(e).__name__}: {e}"
-            log.error(f"❌ {_err}")
-            log.error(f"❌ 堆栈: {_tb.format_exc()[:800]}")
-            stats["fail"] += 1
-            task_running = False
-            _single_task_mode = False
-            return
-        current_plan = daily_plan  # 确保current_plan被正确设置
+        # ★ 断点恢复：检查是否有当天未完成的计划
+        _resumed_plan, _resumed_status = _load_plan_progress()
+        if _resumed_plan and _resumed_status:
+            _done_count = sum(1 for s in _resumed_status if s == "已完成")
+            _total_count = len(_resumed_status)
+            if _done_count > 0 and _done_count < _total_count:
+                log.info(f"📋 检测到当天未完成的计划，断点恢复！已完成 {_done_count}/{_total_count}，从第 {_done_count+1} 个任务继续")
+                daily_plan = _resumed_plan
+                current_plan = _resumed_plan
+                # 恢复每个任务的状态
+                _tasks = daily_plan.get("tasks", [])
+                for _i, _s in enumerate(_resumed_status):
+                    if _i < len(_tasks):
+                        _tasks[_i]["status"] = _s
+            else:
+                log.info(f"📋 上次计划已全部完成({_done_count}/{_total_count})，生成新计划")
+                _clear_plan_progress()
+                daily_plan = None
+        else:
+            daily_plan = None
+        
+        if daily_plan is None:
+            log.info("📋 正在生成今日任务清单...")
+            try:
+                daily_plan = generate_daily_tasks(config)
+            except Exception as e:
+                import traceback as _tb
+                _err = f"生成任务清单失败: {type(e).__name__}: {e}"
+                log.error(f"❌ {_err}")
+                log.error(f"❌ 堆栈: {_tb.format_exc()[:800]}")
+                stats["fail"] += 1
+                task_running = False
+                _single_task_mode = False
+                return
+            current_plan = daily_plan  # 确保current_plan被正确设置
     total_tasks = daily_plan["total_tasks"]
     model_used = daily_plan["model_used"]
     site_age = daily_plan["site_age"]
@@ -9938,6 +10097,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
     
     with sync_playwright() as p:
         for task_idx, task in enumerate(tasks_list):
+            # ★ 断点恢复：跳过已完成的任务
+            if task.get("status") == "已完成":
+                log.info(f"⏭️ 跳过已完成的任务 #{task_idx+1}（断点恢复）")
+                stats["success"] += 1
+                continue
+            
             # 更新当前任务索引
             current_task_idx = task_idx
             if task_idx < len(tasks_list):
@@ -11700,9 +11865,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         _sd_cap = float(_sd_cfg.get("hard_cap_sec", 600))
                         import math as _math
                         _sd_mu = _math.log(_sd_median)
-                        _session_secs = min(_sd_cap, max(60, _math.exp(random.gauss(_sd_mu, _sd_sigma))))
+                        # ★ 修复：保险绳下限必须≥配置的浏览时长最小值，避免deadline提前截断浏览
+                        _cfg_stay_min_for_rope = float(config.get("total_stay", {}).get("min", 80))
+                        _rope_floor = max(60, _cfg_stay_min_for_rope)  # 不低于配置min，且绝对不低于60s
+                        _session_secs = min(_sd_cap, max(_rope_floor, _math.exp(random.gauss(_sd_mu, _sd_sigma))))
                         task_deadline = enter_site_time + _session_secs
-                        log.info(f"⏱️ Session时长(对数正态): {_session_secs:.0f}s (中位数={_sd_median:.0f}s, σ={_sd_sigma})")
+                        log.info(f"⏱️ Session时长(对数正态): {_session_secs:.0f}s (中位数={_sd_median:.0f}s, σ={_sd_sigma}, 下限={_rope_floor:.0f}s)")
                         
                         round_total_stays = []
                         remaining_time = task_deadline - time.time()  # 剩余可运行时间
@@ -11900,6 +12068,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     # 给页面 JavaScript 渲染 1.5-3 秒时间
                                     time.sleep(random.uniform(1.5, 3.0))
                                     _ok, _bl, _u = _detect(page)
+                                    # ★ 根因修复：验证检测到的URL是否是目标站（防止Referer页面被误判为目标页加载成功）
+                                    if _ok:
+                                        try:
+                                            from urllib.parse import urlparse as _urlparse2
+                                            _target_host2 = _urlparse2(_actual_target).hostname or ''
+                                            _detected_host2 = _urlparse2(str(_u or '')).hostname or ''
+                                            if _target_host2 and _detected_host2 and _target_host2 not in _detected_host2 and _detected_host2 not in _target_host2:
+                                                log.warning(f"⚠️ [URL域名验证] 页面未跳转到目标站！检测URL={_detected_host2}，目标={_target_host2}，标记为失败")
+                                                _ok = False
+                                                _home_page_reason = f"URL域名不匹配（当前={_detected_host2}，目标={_target_host2}）"
+                                        except Exception:
+                                            pass
                                     if _ok:
                                         home_load_success = True
                                         _home_page_reason = f"goto成功，body≈{_bl}字符"
@@ -11973,7 +12153,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                 except Exception:
                                                     pass
                                                 if not _early_ad:
-                                                    # ★ 诊断：输出页面所有外部script/iframe来源，帮助排查未识别的广告网络
+                                                    # ★ 审计修复：DOM CSS选择器检测失败时，回退到原始HTML文本检测
+                                                    try:
+                                                        _page_html = page.evaluate("() => document.documentElement.outerHTML") or ''
+                                                        if _page_html:
+                                                            _html_ad = _html_has_ad_code(_page_html)
+                                                            if _html_ad:
+                                                                _early_ad = _html_ad
+                                                                log.info(f"🎯 [HTML回退检测] 页面含广告代码 [{_html_ad}]（DOM选择器未匹配，原始HTML检测到）")
+                                                    except Exception:
+                                                        pass
+                                                if not _early_ad:
+                                                    # ★ 诊断：输出页面所有外部script/iframe来源
                                                     try:
                                                         _diag_sources = page.evaluate("""
                                                             () => {
@@ -11984,13 +12175,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                         """)
                                                         _diag_s = _diag_sources.get('scripts', []) if _diag_sources else []
                                                         _diag_f = _diag_sources.get('iframes', []) if _diag_sources else []
-                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兜底链接配置为含广告的页面）")
+                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兖底链接配置为含广告的页面）")
                                                         if _diag_s or _diag_f:
                                                             log.info(f"🔍 [广告诊断] 页面外部脚本({len(_diag_s)}): {_diag_s[:8]}")
                                                             if _diag_f:
                                                                 log.info(f"🔍 [广告诊断] 页面iframe({len(_diag_f)}): {_diag_f[:5]}")
                                                         else:
-                                                            # ★ 增强诊断：输出HTML原始长度和title，判断是SPA空壳还是被拦截
                                                             try:
                                                                 _html_len = page.evaluate("() => document.documentElement.outerHTML.length") or 0
                                                                 _page_title = page.evaluate("() => document.title || ''") or ''
@@ -11998,7 +12188,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                             except Exception:
                                                                 log.info(f"🔍 [广告诊断] 页面无任何外部脚本/iframe（可能为纯SPA或广告被屏蔽）")
                                                     except Exception:
-                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兜底链接配置为含广告的页面）")
+                                                        log.info(f"⚠️ 页面无广告代码，本次访问不会产生广告展示（建议将兖底链接配置为含广告的页面）")
                                         except Exception:
                                             pass
                                         break
@@ -12070,6 +12260,39 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "首页加载后")
 
+                        # ========== ★ 广告主动加载阶段：全页滚动触发懒加载广告 + 等待广告脚本自然执行 ==========
+                        # 合规原则：绝不人为干预广告脚本执行（重执行/注入/修改DOM = IVT无效流量）
+                        # 仅通过自然用户行为（滚动/停留/等待）让广告脚本自行完成加载
+                        if home_load_success:
+                            try:
+                                # ★ 合规策略：给广告脚本充足的自然执行时间
+                                # 广告脚本通常在DOMContentLoaded后异步加载，需要3-8秒完成广告请求+渲染
+                                # 这里不做任何DOM操作，仅等待广告脚本自然完成
+                                log.info("⏳ [广告等待] 给广告脚本 5-8 秒自然执行时间（不干预DOM）...")
+                                time.sleep(random.uniform(5.0, 8.0))
+                                
+                                _page_height = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)") or 800
+                                _viewport_h = page.evaluate("() => window.innerHeight") or 700
+                                _ad_scroll_step = max(300, int(_viewport_h * 0.7))
+                                _ad_scroll_pos = 0
+                                # 分段滚动全页（合规：真人也会滚动浏览页面内容）
+                                while _ad_scroll_pos < _page_height:
+                                    _ad_scroll_pos += _ad_scroll_step
+                                    page.evaluate(f"window.scrollTo(0, {_ad_scroll_pos})")
+                                    time.sleep(random.uniform(1.5, 2.5))
+                                # 滚回顶部（广告通常在页面中上部）
+                                page.evaluate("window.scrollTo(0, 0)")
+                                time.sleep(random.uniform(2.0, 3.0))
+                                # 重新扫描广告（只读检测，不修改DOM）
+                                ad_monitor = scan_ads_during_task(page, ad_monitor, "广告主动加载-全页滚动后")
+                                _ad_containers_after_scroll = len(ad_monitor.get('containers', set()))
+                                if _ad_containers_after_scroll > 0:
+                                    log.info(f"✅ [广告主动加载] 全页滚动后检测到 {_ad_containers_after_scroll} 个广告容器")
+                                else:
+                                    log.info(f"⚠️ [广告主动加载] 全页滚动后仍未检测到广告DOM容器（广告脚本可能未执行或被阻断）")
+                            except Exception as _ad_load_e:
+                                log.warning(f"⚠️ [广告主动加载] 滚动触发异常: {str(_ad_load_e)[:80]}")
+
                         # ========== 任务总时长保险绳（防止任务无限延长） ==========
                         # ★ 对数正态采样（与前置计算一致，不重复随机）
                         if 'task_deadline' not in dir() or task_deadline is None:
@@ -12091,7 +12314,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         _is_bounce = random.random() < _bounce_prob
                         if _is_bounce:
                             log.info(f"🚪 本次任务为跳出型(概率{_bounce_prob:.0%})：仅停留首页后离开")
-                            _bounce_stay = random.uniform(15, 60)
+                            # ★ 修复：跳出型停留时间必须尊重配置的浏览时长下限
+                            # 跳出 = 只浏览首页就离开，但停留时间仍需≥配置最小值的70%
+                            _cfg_stay_min = float(config.get("total_stay", {}).get("min", 80))
+                            _cfg_stay_max = float(config.get("total_stay", {}).get("max", 220))
+                            _bounce_floor = max(30, _cfg_stay_min)  # ★ 跳出停留不低于配置最小值
+                            _bounce_ceil = min(_cfg_stay_max, (_cfg_stay_min + _cfg_stay_max) / 2)  # 上限取配置中位数
+                            if _bounce_ceil <= _bounce_floor:
+                                _bounce_ceil = _bounce_floor + 20
+                            _bounce_stay = random.uniform(_bounce_floor, _bounce_ceil)
+                            log.info(f"🚪 跳出停留: {_bounce_stay:.1f}s (范围{_bounce_floor:.0f}~{_bounce_ceil:.0f}s, 配置min={_cfg_stay_min:.0f}s)")
                             current_x, current_y = simulate_human_in_window(
                                 page, _bounce_stay, page_behavior_stats, current_x, current_y,
                                 config, page_name=f"[T{task_idx+1}] 首页(跳出)", deadline=task_deadline
@@ -12328,6 +12560,49 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 _detected_network = _ad_check_result
                         except Exception:
                             pass
+                        # ★ 审计修复：DOM CSS选择器检测失败时，回退到原始HTML文本检测
+                        if not _has_ad_code:
+                            try:
+                                _final_page_html = page.evaluate("() => document.documentElement.outerHTML") or ''
+                                if _final_page_html:
+                                    _html_ad_final = _html_has_ad_code(_final_page_html)
+                                    if _html_ad_final:
+                                        _has_ad_code = True
+                                        _detected_network = _html_ad_final
+                                        log.info(f"🎯 [HTML回退检测] 最终检测发现广告代码 [{_html_ad_final}]（DOM选择器未匹配，原始HTML检测到）")
+                            except Exception:
+                                pass
+                        
+                        # ========== ★ 广告恢复机制：HTML检测到广告代码但DOM未渲染时，通过自然滚动等待广告加载 ==========
+                        # 合规原则：仅通过自然用户行为（滚动浏览）等待广告脚本自行完成加载
+                        # 绝不注入/重执行/修改广告脚本（那会被联盟反作弊系统标记为IVT无效流量）
+                        if _has_ad_code and not ad_found:
+                            log.warning(f"⚠️ [广告恢复] 页面含{_detected_network}广告代码但DOM未渲染广告容器，通过自然滚动等待广告加载...")
+                            try:
+                                # 合规策略：模拟真人滚动浏览页面（广告通常在内容区域中间/底部/顶部）
+                                page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.4)")
+                                time.sleep(random.uniform(3.0, 5.0))
+                                page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.75)")
+                                time.sleep(random.uniform(2.0, 4.0))
+                                page.evaluate("window.scrollTo(0, 0)")
+                                time.sleep(random.uniform(3.0, 5.0))
+                                # 只读扫描广告DOM（不修改任何元素）
+                                ad_monitor = scan_ads_during_task(page, ad_monitor, "广告恢复-滚动触发后")
+                                ad_found = len(ad_monitor.get('containers', set())) > 0
+                                ad_in_viewport = len(ad_monitor.get('visible', set())) > 0
+                                ad_loaded = ad_found
+                                ad_impressions = len(ad_monitor.get('exposed', set()))
+                                ad_refreshes = int(ad_monitor.get('refresh_count', 0) or 0)
+                                _eff_exposed = len(ad_monitor.get('effective_exposed', set()))
+                                _dur_map = ad_monitor.get('exposure_duration_ms', {}) or {}
+                                _total_dur = sum(_dur_map.values())
+                                _max_dur = max(_dur_map.values()) if _dur_map else 0
+                                if ad_found:
+                                    log.info(f"✅ [广告恢复] 成功！滚动触发后检测到 {len(ad_monitor.get('containers', set()))} 个广告容器，曝光={ad_impressions}")
+                                else:
+                                    log.warning(f"⚠️ [广告恢复] 失败：滚动触发后仍未检测到广告DOM容器。可能原因：广告脚本未执行/广告服务器无填充/代理IP被广告服务器屏蔽")
+                            except Exception as _recovery_e:
+                                log.warning(f"⚠️ [广告恢复] 异常: {str(_recovery_e)[:80]}")
                         
                         log.info(
                             f"[广告监控汇总] 扫描={ad_monitor.get('scan_count', 0)} "
@@ -12393,7 +12668,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if not _has_ad_code:
                                 log.info("ℹ️ 任务流程已完成，目标页无广告代码（流量标记为无效，非系统问题）")
                             else:
-                                log.warning(f"⚠️ 任务流程已完成，页面含{_detected_network}广告代码但广告未形成有效曝光（可能被代理/网络阻断，流量标记为无效）")
+                                log.warning(f"⚠️ 任务流程已完成，页面含{_detected_network}广告代码但广告未实际渲染（广告脚本未执行/广告服务器无填充/代理IP被屏蔽，流量标记为无效）")
                         
                         # 更新任务状态
                         if task_idx < len(tasks_list):
@@ -12596,6 +12871,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
     add_to_historical_tasks(daily_plan)
     record_kpi_snapshot()
     
+    # ★ 断点恢复：判断是全部完成还是中途停止
+    _all_done = all(t.get("status") == "已完成" for t in tasks_list) if tasks_list else True
+    if _all_done:
+        _clear_plan_progress()
+        log.info("📋 计划全部完成，已清除进度文件")
+    else:
+        _save_plan_progress(daily_plan, tasks_list)
+        _done = sum(1 for t in tasks_list if t.get("status") == "已完成")
+        log.info(f"📋 计划未完成({_done}/{len(tasks_list)})，进度已保存，下次执行将从断点恢复")
+    
     task_running = False
     _single_task_mode = False
     if adsl_ip_task:
@@ -12751,7 +13036,7 @@ def get_video_task_history():
 @app.route('/save_config', methods=['POST'])
 def save_config():
     global config, pending_plan
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}  # ★ 审计修复#4：防止None崩溃
     
     # ⭐ 修复：识别“仅同步视频广告启用开关”的特殊字段，避免覆盖整个 video_ad 子配置
     if 'video_ad_enabled_only' in data:
@@ -12827,15 +13112,17 @@ def save_config():
         return jsonify({"success": False, "status": "error", "message": str(e)}), 400
     
     # 保留原有逻辑
+    # ★ 审计修复#14：过滤双下划线开头的危险键，防止配置注入
     config.update({k: v for k, v in data.items() if k not in [
         'site_creation_date', 'plan_days', 'adsl_task_count', 'vt_adsl_task_count',
         'session_mode', 'ua_repeat_max_rate', 'selected_models',
         'daily_traffic_range', 'proxy_pool', 'video_ad_enabled_only',
         'web_navigation'
-    ]})
+    ] and not k.startswith('__')})
     
-    with open('config.json', 'w') as f:
-        json.dump(config, f, indent=4)
+    # ★ 审计修复#5：指定encoding防止非UTF-8环境崩溃
+    with open('config.json', 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
     
     # 记录配置审计日志
     changed_keys = list(data.keys())[:20]  # 最多记录20个字段
@@ -12926,13 +13213,18 @@ def clean_logs():
                         f.write('')
                 except Exception:
                     pass
+_task_start_lock = threading.Lock()  # ★ 审计修复#2：防止并发启动竞态
+
 @app.route('/start_task', methods=['POST'])
 def start_task():
     global task_running
-    if not task_running:
-        # 清除以往日志
-        clean_logs()
-        threading.Thread(target=worker_task, daemon=True).start()
+    with _task_start_lock:
+        if task_running:
+            return jsonify({"status": "error", "message": "已有任务正在运行"}), 409
+        task_running = True
+    # 清除以往日志
+    clean_logs()
+    threading.Thread(target=worker_task, daemon=True).start()
     return jsonify({"status": "ok"})
 
 @app.route('/start_single_task', methods=['POST'])
@@ -13088,22 +13380,28 @@ _prodtest_state = {
     "layers": {}, "gate": None, "report_path": None, "logs": [],
 }
 _prodtest_lock = threading.Lock()
+_prodtest_last_update = time.time()  # ★ 看门狗：记录最后一次进度更新时间
+_PRODTEST_STUCK_TIMEOUT = 180  # ★ 超过180秒无进度更新则判定卡死
 
 
 def _run_production_test_thread(layers, headless, target_url):
-    global _prodtest_state
+    global _prodtest_state, _prodtest_last_update
     try:
         import production_test
 
         def _log_fn(msg):
             log.info(f"[生产准入] {msg}")
-            _prodtest_state["logs"].append(str(msg))
-            if len(_prodtest_state["logs"]) > 300:
-                _prodtest_state["logs"] = _prodtest_state["logs"][-300:]
+            # ★ 审计修复#7：加锁保护并发读写
+            with _prodtest_lock:
+                _prodtest_state["logs"].append(str(msg))
+                if len(_prodtest_state["logs"]) > 300:
+                    _prodtest_state["logs"] = _prodtest_state["logs"][-300:]
 
         def _progress_fn(pct, stage):
+            global _prodtest_last_update
             _prodtest_state["progress"] = int(pct)
             _prodtest_state["stage"] = stage
+            _prodtest_last_update = time.time()  # ★ 看门狗更新
 
         result = production_test.run_production_test(
             layers=layers, progress=_progress_fn, log=_log_fn,
@@ -13126,10 +13424,15 @@ def _run_production_test_thread(layers, headless, target_url):
 
 @app.route('/start_production_test', methods=['POST'])
 def start_production_test():
-    global _prodtest_state
+    global _prodtest_state, _prodtest_last_update
     with _prodtest_lock:
         if _prodtest_state["running"]:
-            return jsonify({"status": "error", "success": False, "message": "已有生产准入测试正在运行"}), 409
+            # ★ 看门狗容错：如果running但已超时，允许重新启动
+            if time.time() - _prodtest_last_update > _PRODTEST_STUCK_TIMEOUT:
+                log.warning("[生产准入] 检测到卡死状态，允许重新启动")
+                _prodtest_state["running"] = False
+            else:
+                return jsonify({"status": "error", "success": False, "message": "已有生产准入测试正在运行"}), 409
         try:
             body = request.get_json(silent=True) or {}
         except Exception:
@@ -13150,6 +13453,7 @@ def start_production_test():
                                     "layers": {}, "gate": None, "report_path": None, "logs": []})
         else:
             _prodtest_state.update({"running": True, "progress": 0, "stage": "启动中", "logs": []})
+        _prodtest_last_update = time.time()  # ★ 重置看门狗时间戳
     from threading import Thread
     Thread(target=_run_production_test_thread, args=(layers, headless, target_url), daemon=True).start()
     log.info(f"✅ 生产准入测试线程已启动，层级: {layers}")
@@ -13158,6 +13462,13 @@ def start_production_test():
 
 @app.route('/get_production_test_status')
 def get_production_test_status():
+    global _prodtest_state, _prodtest_last_update
+    # ★ 看门狗：如果running但超过180秒无进度更新，强制重置为卡死状态
+    if _prodtest_state["running"] and (time.time() - _prodtest_last_update > _PRODTEST_STUCK_TIMEOUT):
+        log.warning(f"[生产准入] ⚠️ 看门狗触发：超过{_PRODTEST_STUCK_TIMEOUT}秒无进度更新，强制重置")
+        _prodtest_state["running"] = False
+        _prodtest_state["stage"] = "⚠️ 超时卡死，已自动重置"
+        _prodtest_state["progress"] = 0
     return jsonify({
         "running": _prodtest_state["running"],
         "progress": _prodtest_state["progress"],
@@ -13167,6 +13478,18 @@ def get_production_test_status():
         "report_path": _prodtest_state["report_path"],
         "logs": _prodtest_state["logs"][-60:],
     })
+
+
+@app.route('/force_stop_production_test', methods=['POST'])
+def force_stop_production_test():
+    """★ 强制停止卡死的生产准入测试"""
+    global _prodtest_state, _prodtest_last_update
+    _prodtest_state["running"] = False
+    _prodtest_state["stage"] = "已强制停止"
+    _prodtest_state["progress"] = 0
+    _prodtest_last_update = time.time()
+    log.info("[生产准入] 🛑 用户强制停止测试")
+    return jsonify({"status": "ok", "message": "已强制停止"})
 
 
 # ==================== 关键词探索功能 ====================
@@ -13384,7 +13707,9 @@ def _html_has_ad_code(html):
 def _fetch_page(url, session=None, timeout=10):
     """获取单个页面 HTML"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
     }
     try:
         if session:
@@ -13393,7 +13718,8 @@ def _fetch_page(url, session=None, timeout=10):
             r = requests.get(url, headers=headers, timeout=timeout, verify=False)
         r.raise_for_status()
         return r.text
-    except Exception:
+    except Exception as e:
+        log.warning(f'[关键词探索] _fetch_page异常: {url} | {type(e).__name__}: {str(e)[:100]}')
         return None
 
 
@@ -13555,7 +13881,7 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
             f.write(f'# 生成时间: {timestamp}\n')
             f.write(f'# 总关键词数: {total_keywords}\n')
             f.write(f'# 总兜底链接数: {total_fallback}（仅含广告页面的链接）\n')
-            f.write(f'# 广告统计: 含广告页 {total_ad_pages} 个, 无广告页 {total_no_ad_pages} 个, 广告命中率 {total_ad_pages/(total_ad_pages+total_no_ad_pages)*100:.0f}%\n\n')
+            f.write(f'# 广告统计: 含广告页 {total_ad_pages} 个, 无广告页 {total_no_ad_pages} 个, 广告命中率 {total_ad_pages/max(1, total_ad_pages+total_no_ad_pages)*100:.0f}%\n\n')
 
             for layer_num in sorted(layer_anchor_texts.keys()):
                 kws = layer_anchor_texts[layer_num]
@@ -13631,10 +13957,14 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
 
 
 # -------- 路由 --------
+_keyword_explore_lock = threading.Lock()  # ★ 审计修复#8：防止并发启动竞态
+
 @app.route('/api/keyword_explore', methods=['POST'])
 def start_keyword_explore():
-    if keyword_explore_manager['is_running']:
-        return jsonify({'success': False, 'message': '关键词探索正在进行中，请等待完成'})
+    with _keyword_explore_lock:
+        if keyword_explore_manager['is_running']:
+            return jsonify({'success': False, 'message': '关键词探索正在进行中，请等待完成'})
+        keyword_explore_manager['is_running'] = True
 
     data = request.json or {}
     target_url = data.get('target_url', '').strip()
@@ -13715,7 +14045,9 @@ def get_logs():
     limit = max(50, min(limit, 500))
     messages = messages[-limit:]
     # 从下往上展示：最新日志置顶（倒序输出）
-    return ''.join([f"<p>{msg}</p>" for msg in reversed(messages)])
+    # ★ 审计修复#1：HTML转义防止XSS注入
+    import html as _html_escape_mod
+    return ''.join([f"<p>{_html_escape_mod.escape(msg)}</p>" for msg in reversed(messages)])
 
 @app.route('/api/status')
 def api_status():
@@ -13740,7 +14072,7 @@ def debug_config():
 @app.route('/save_seo_config', methods=['POST'])
 def save_seo_config():
     global config
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}  # ★ 审计修复#3：防止None崩溃
     
     # 更新搜索引擎 & 社媒平台列表（含type字段）
     config['seo']['search_engines'] = data.get('search_engines', [])
@@ -13758,7 +14090,8 @@ def save_seo_config():
     config['seo']['referer_mode'] = data.get('seo_referer_mode', 'dynamic')
     
     # 保存到配置文件
-    with open('config.json', 'w') as f:
+    # ★ 审计修复#5：指定encoding防止非UTF-8环境崩溃
+    with open('config.json', 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
     
     # 重置SEO查询模块实例，使新配置生效
@@ -14117,37 +14450,6 @@ if __name__ == "__main__":
     # 加载历史任务
     load_historical_tasks()
     log.info(f"已加载 {len(historical_tasks)} 条历史任务记录")
-    
-    # 加载指纹统计
-    load_fingerprint_stats()
-    log.info(f"已加载指纹统计数据: {len(fingerprint_stats['ua_usage'])}个UA, {len(fingerprint_stats['fingerprint_usage'])}个指纹")
-    
-    # Selenium 使用系统已安装的 Chrome + Selenium Manager 自动管理 chromedriver，无需额外安装步骤
-    log.info("使用 Selenium + 本地 Chrome 驱动")
-    
-   # app.run(host="0.0.0.0", port=5001, debug=False)
-
-
-    import os
-    # 优先读取环境变量，无参数默认5001
-    port = int(os.getenv("RUN_PORT",5001))
-    host = os.getenv("RUN_HOST","0.0.0.0")
-    app.run(host=host,port=port)
-    # 加载指纹统计
-    load_fingerprint_stats()
-    log.info(f"已加载指纹统计数据: {len(fingerprint_stats['ua_usage'])}个UA, {len(fingerprint_stats['fingerprint_usage'])}个指纹")
-    
-    # Selenium 使用系统已安装的 Chrome + Selenium Manager 自动管理 chromedriver，无需额外安装步骤
-    log.info("使用 Selenium + 本地 Chrome 驱动")
-    
-   # app.run(host="0.0.0.0", port=5001, debug=False)
-
-
-    import os
-    # 优先读取环境变量，无参数默认5001
-    port = int(os.getenv("RUN_PORT",5001))
-    host = os.getenv("RUN_HOST","0.0.0.0")
-    app.run(host=host,port=port)
     
     # 加载指纹统计
     load_fingerprint_stats()

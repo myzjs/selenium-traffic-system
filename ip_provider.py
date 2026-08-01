@@ -31,6 +31,9 @@ class IPProvider:
         self.proxy_pool = []
         self.current_proxy = None
         self._config = {}
+        # ★ 5.4 代理池监控：连续失败计数
+        self._consecutive_failures = 0
+        self._total_ips_used = 0
 
     def configure_proxy_api(self, proxy_pool: list, config: Dict = None, **kwargs):
         """配置代理API参数（兼容旧调用签名，忽略 vps_* 参数）"""
@@ -200,6 +203,9 @@ class IPProvider:
                     "proxy_password": proxy_password,
                     "ip_info": ip_info,
                 }
+                # ★ 5.4 成功时重置失败计数
+                self._consecutive_failures = 0
+                self._total_ips_used += 1
                 logger.info(f"[IPDeep] ✅ 代理获取成功: {proxy_host}:{proxy_port}, 出口IP: {exit_ip}")
                 return result
 
@@ -216,6 +222,10 @@ class IPProvider:
                 if attempt < max_retries - 1:
                     time.sleep(2)
 
+        # ★ 5.4 代理池监控告警：连续失败>=5次时输出WARNING
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 5:
+            logger.warning(f"⚠️ [IPDeep] 代理池可能耗尽！连续失败{self._consecutive_failures}次，请检查IPDeep配额")
         return {"success": False, "error": f"IPDeep API {max_retries}次尝试均失败"}
 
     def _get_ip_details(self, proxy_url: str) -> Dict:
@@ -269,9 +279,11 @@ class IPProvider:
                 logger.debug(f"[IP详情] {api['name']} 失败: {e}")
                 continue
 
-        logger.warning("[IP详情] 所有API失败，使用默认数据")
+        logger.warning("[IP详情] 所有API失败，无法获取出口IP信息")
+        # ★ 审计修复#10：所有API失败时不应返回success:True，避免下游用"未知"作为IP地址
         return {
-            "success": True,
+            "success": False,
+            "error": "所有IP详情API均不可达",
             "ip": "未知",
             "country": "United States",
             "country_code": "US",

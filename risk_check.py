@@ -1132,7 +1132,7 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     report["risk_calc"]["risk_reason_list"] = risk_detail
     report["risk_calc"]["detection_dimensions"] = {
         "自动化检测": "✅" if not (auto_probe.get("nav_webdriver") or pw_residuals) else "❌",
-        "指纹伪装": "✅" if canvas_data.get("has_noise_hook") and webgl_info.get("has_hook") else "⚠️",
+        "指纹伪装": "✅" if (canvas_data.get("has_noise_hook") and webgl_info.get("has_hook") and finger.get("battery_api_exist")) else "⚠️",
         "HTTP请求头": "✅" if header_deep.get("completeness_pct", 0) >= 90 and header_deep.get("ua_sec_ch_ua_version_match") else "⚠️",
         "设备一致性": "✅" if not dev_con.get("viewport_larger_than_screen") and hw_info.get("hc_reasonable") else "⚠️",
         "时区/地理": "✅" if tz_info.get("tz_match") else "❌",
@@ -1245,11 +1245,38 @@ _STEALTH_INIT_SCRIPT = r"""
             navigator.mediaDevices.enumerateDevices = _enumDev;
         }
     } catch(e) {}
-    // localStorage 随机化
+    // Battery API 注入（自动化浏览器默认禁用，必须mock）
+    try {
+        if (!('getBattery' in navigator)) {
+            const _batLevel = 0.35 + Math.random() * 0.65; // 0.35~1.0
+            const _batCharging = Math.random() > 0.5;
+            const _batMock = {
+                charging: _batCharging,
+                chargingTime: _batCharging ? 0 : Infinity,
+                dischargingTime: _batCharging ? Infinity : 3600 + Math.random() * 7200,
+                level: Math.round(_batLevel * 100) / 100,
+                onchargingchange: null,
+                onchargingtimechange: null,
+                ondischargingtimechange: null,
+                onlevelchange: null,
+                addEventListener: function(){},
+                removeEventListener: function(){},
+                dispatchEvent: function(){ return true; }
+            };
+            const _getBattery = function() { return Promise.resolve(_batMock); };
+            _maskNative(_getBattery, 'getBattery');
+            Object.defineProperty(navigator, 'getBattery', {get: () => _getBattery, configurable: true});
+        }
+    } catch(e) {}
+    // localStorage 随机化（无条件注入，确保至少3项）
     try {
         if (!localStorage.getItem('_app_cid')) { localStorage.setItem('_app_cid', String(Math.floor(Math.random()*1e10))+'.'+String(Math.floor(Math.random()*1e10))); }
         if (!localStorage.getItem('_app_pref')) { localStorage.setItem('_app_pref', 'theme=light'); }
         if (!localStorage.getItem('_app_sid')) { localStorage.setItem('_app_sid', Math.random().toString(36).slice(2)); }
+        // 额外cookie随机化标记（模拟真实用户cookie行为）
+        if (document.cookie.indexOf('_sess_') === -1) {
+            document.cookie = '_sess_=' + Math.random().toString(36).slice(2,10) + '; path=/; max-age=3600';
+        }
     } catch(e) {}
     // permissions.query 保护（减少CDP检测面）
     try {
