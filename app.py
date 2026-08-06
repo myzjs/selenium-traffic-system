@@ -10350,26 +10350,36 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                             # 点击前暂停，模拟人类思考时间
                             time.sleep(random.uniform(0.5, 1.0))
                             
-                            # 点击链接
-                            target_link.click()
+                            # ★ 点击链接（用 JS click 避免 Playwright 阻塞等待导航）
+                            try:
+                                page.evaluate("(el) => el.click()", target_link)
+                            except Exception:
+                                target_link.click(no_wait_after=True, timeout=5000)
                             log.info(f"✅ 点击包含 {text_list} 的链接成功！")
                             
-                            # 等待页面加载
+                            # 等待页面加载（带硬超时+保险绳检查）
                             _plw = config.get("page_load_wait", {"min": 1, "max": 8})
                             wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
-                            time.sleep(wait_load)
+                            _click_deadline = time.time() + 15  # 最多等15s
+                            while time.time() < _click_deadline:
+                                if not task_running:
+                                    log.warning("⛔ 点击后等待中任务被停止")
+                                    return False, current_x, current_y
+                                time.sleep(min(0.5, max(0, _click_deadline - time.time())))
                             try:
-                                page.wait_for_load_state('domcontentloaded', timeout=30000)
+                                page.wait_for_load_state('domcontentloaded', timeout=5000)
                             except Exception:
                                 log.warning("等待页面load状态超时，但继续执行...")
                             return True, current_x, current_y
                     except Exception as e:
                         log.debug(f"点击链接失败（带移动）: {str(e)}")
                 
-                # 兜底方案：直接导航到规范化的完整URL
+                # 兜底方案：直接导航到规范化的完整URL（带硬超时保护）
                 log.info(f"🚀 使用兜底方案：直接导航到 {target_href}")
                 try:
-                    page.goto(target_href, wait_until="domcontentloaded", timeout=30000)
+                    if not task_running:
+                        return False, current_x, current_y
+                    page.goto(target_href, wait_until="domcontentloaded", timeout=15000)
                     time.sleep(random.uniform(2, 3))
                     log.info(f"✅ 导航到 {target_href} 成功！")
                     return True, current_x, current_y
