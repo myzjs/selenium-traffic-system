@@ -70,6 +70,14 @@ except Exception as _e:
     _HAS_RCE = False
     print(f"[WARN] risk_control_enhancements 模块不可用（不影响主流程）: {_e}", file=sys.stderr)
 
+# ★ HilltopAds Pop-under 弹窗触发模块
+try:
+    import popunder_trigger as _popunder
+    _HAS_POPUNDER = True
+except Exception as _e:
+    _popunder = None
+    _HAS_POPUNDER = False
+
 # ★ P0-1: TLS/JA3指纹伪装 - 使用curl_cffi模拟Chrome TLS指纹（替代原生requests的Python TLS特征）
 try:
     from curl_cffi import requests as _tls_requests
@@ -1871,6 +1879,16 @@ config = {
     "use_real_chrome": True,
     "proxy_timeout": 30,
     "max_retries": 3,
+
+    # ★ HilltopAds Pop-under 弹窗触发配置
+    "hilltopads": {
+        "enabled": False,                      # 总开关：是否触发 Pop-under 弹窗
+        "trigger_probability": 0.40,           # 40% 会话触发（模拟自然拦截率）
+        "trigger_after_pct_min": 0.20,         # 模拟进度 20% 后触发（积累页面交互）
+        "trigger_after_pct_max": 0.40,         # 最晚 40% 处触发
+        "popunder_stay_min": 15,               # 弹窗最小存活秒数
+        "popunder_stay_max": 25,               # 弹窗最大存活秒数
+    },
     
     "seo": {
         "search_engines": [
@@ -2703,83 +2721,6 @@ class UAPoolManager:
         except Exception:
             return False
 
-    def get_ua(self, lang_prefix, browser_family="chromium"):
-        import time
-        import random
-        
-        # 先清理旧记录
-        self._clean_old_records()
-        
-        # 获取 UA 池
-        ua_pool = self._get_ua_pool(lang_prefix)
-        if browser_family == "chromium":
-            chromium_pool = [ua for ua in ua_pool if ("Chrome/" in ua or "Edg/" in ua or "Chromium/" in ua) and "Firefox/" not in ua and "Version/" not in ua]
-            if chromium_pool:
-                ua_pool = chromium_pool
-            else:
-                self._safe_log("warning", "Chromium UA 池为空，回退使用完整 UA 池")
-        
-        # 计算当前重复率
-        if self.total_ua_used > 0:
-            current_repeat_rate = self.reused_ua_count / self.total_ua_used
-        else:
-            current_repeat_rate = 0
-        
-        self._safe_log("debug", f"当前 UA 池大小: {len(ua_pool)}, 已使用 UA: {len(self.ua_history)}, 总任务: {self.total_ua_used}, 复用数: {self.reused_ua_count}, 重复率: {current_repeat_rate:.2%}")
-        
-        # 找出未使用的 UA
-        unused_uas = [ua for ua in ua_pool if ua not in self.ua_history]
-        
-        # 优先使用未使用的 UA
-        if unused_uas:
-            selected_ua = random.choice(unused_uas)
-            is_reused = False
-            self._safe_log("debug", f"选择了新的 UA: {selected_ua[:60]}...")
-        else:
-            # 所有 UA 都用过了，检查是否允许复用（重复率 < 20%）
-            if current_repeat_rate < 0.2:
-                # 允许复用，选择使用时间最早的 UA
-                sorted_uas = sorted(self.ua_history.items(), key=lambda x: x[1])
-                selected_ua = sorted_uas[0][0]
-                is_reused = True
-                self._safe_log("debug", f"复用了 UA: {selected_ua[:60]}...")
-            else:
-                # 重复率超过 20%，需要生成全新的 UA 变体
-                self._safe_log("warning", f"需要生成新的 UA 变体（当前重复率: {current_repeat_rate:.2%}）")
-                selected_ua = self._generate_ua_variant(random.choice(ua_pool))
-                # 确保这个变体没有被使用过
-                attempts = 0
-                while selected_ua in self.ua_history and attempts < 20:
-                    selected_ua = self._generate_ua_variant(random.choice(ua_pool))
-                    attempts += 1
-                is_reused = selected_ua in self.ua_history
-        
-        # UA 字符串格式合法性自检：若选中的 UA 畸形，回退到池中第一个合法 UA，避免发送异常 UA 被风控识别
-        if not self._is_valid_ua(selected_ua):
-            self._safe_log("warning", f"⚠️ 选中的 UA 格式非法，已回退: {selected_ua[:60]}")
-            _valid_candidates = [ua for ua in ua_pool if self._is_valid_ua(ua)]
-            if _valid_candidates:
-                selected_ua = random.choice(_valid_candidates)
-                is_reused = selected_ua in self.ua_history
-        
-        # 更新记录
-        self.ua_history[selected_ua] = time.time()
-        self.total_ua_used += 1
-        if is_reused:
-            self.reused_ua_count += 1
-        
-        # 保存到文件
-        self._save_history()
-        
-        # 再次检查并报警高重复率
-        new_repeat_rate = self.reused_ua_count / self.total_ua_used
-        if new_repeat_rate >= 0.2:
-            self._safe_log("warning", f"⚠️ 当前 UA 重复率: {new_repeat_rate:.2%}（超过 20% 警戒线），总任务: {self.total_ua_used}，复用: {self.reused_ua_count}")
-        elif new_repeat_rate >= 0.15:
-            self._safe_log("info", f"UA 重复率: {new_repeat_rate:.2%}（接近警戒线）")
-        
-        return selected_ua
-    
     def _save_history(self):
         """保存历史记录到文件"""
         import json
@@ -3710,6 +3651,13 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
         ad_monitor["prev_exposed50"] = cur_exposed50
 
         ad_monitor["scan_count"] += 1
+        # ★ Popunder观察（只读，合规）：统计浏览器额外打开的窗口/标签数，
+        # 用于确认 HilltopAds 等 Popunder 广告位是否真正触发（弹窗打开才计展示）
+        try:
+            _extra_wins = max(0, len(page.driver.window_handles) - 1)
+            ad_monitor["popunder_max_windows"] = max(int(ad_monitor.get("popunder_max_windows", 0) or 0), _extra_wins)
+        except Exception:
+            _extra_wins = -1
         new_containers = len(ad_monitor["containers"]) - before_count
         new_visible = len(ad_monitor["visible"]) - before_visible
         new_exposed = len(ad_monitor["exposed"]) - before_exposed
@@ -3731,7 +3679,7 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
             f"累计容器={len(ad_monitor['containers'])} "
             f"累计可见={len(ad_monitor['visible'])} 累计曝光={len(ad_monitor['exposed'])} "
             f"有效曝光达标={len(ad_monitor['effective_exposed'])} 最长曝光={_max_dur}ms "
-            f"加载={loaded_count} 刷新={ad_monitor['refresh_count']}"
+            f"加载={loaded_count} 刷新={ad_monitor['refresh_count']} 弹窗窗口数={_extra_wins}"
         )
     except Exception as e:
         ad_monitor["scan_count"] = ad_monitor.get("scan_count", 0) + 1
@@ -5185,6 +5133,33 @@ HTML_TEMPLATE = r"""
                                 </label>
                             </div>
                         </div>
+                    </div>
+
+                    <!-- ★ HilltopAds Pop-under 弹窗配置 -->
+                    <div style="margin-bottom: 20px; padding: 12px; background: #1a1a2e; border-radius: 8px; border: 2px solid #e94560;">
+                        <h4 style="margin-top: 0; color: #e94560;">🪟 HilltopAds Pop-under 弹窗触发</h4>
+                        <p style="color:#94a3b8;font-size:12px;margin:0 0 12px 0;">通过CDP层真实用户手势触发页面HilltopAds脚本创建后台弹窗，管理弹窗生命周期满足结算条件。与Google AdSense流程共存，互不干扰。</p>
+                        <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+                            <label style="display: flex; align-items: center; gap: 6px; color: #e2e8f0; font-size: 13px;">
+                                <input type="checkbox" id="hilltopads_enabled" {{ 'checked' if config.hilltopads.get('enabled', False) else '' }}>
+                                启用 Pop-under 弹窗触发
+                            </label>
+                            <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
+                                <label style="font-size:11px; color:#94a3b8;">触发概率</label>
+                                <input type="text" id="hilltopads_trigger_prob" value="{{ (config.hilltopads.get('trigger_probability', 0.40) * 100)|int }}%" style="width: 60px; font-size:12px;">
+                            </div>
+                            <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
+                                <label style="font-size:11px; color:#94a3b8;">最小存活(s)</label>
+                                <input type="number" id="hilltopads_stay_min" value="{{ config.hilltopads.get('popunder_stay_min', 15) }}" style="width: 55px; font-size:12px;">
+                            </div>
+                            <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
+                                <label style="font-size:11px; color:#94a3b8;">最大存活(s)</label>
+                                <input type="number" id="hilltopads_stay_max" value="{{ config.hilltopads.get('popunder_stay_max', 25) }}" style="width: 55px; font-size:12px;">
+                            </div>
+                        </div>
+                        <p style="color:#94a3b8;font-size:11px;margin:8px 0 0 0;">
+                            弹窗触发仅对配置了 HilltopAds 广告代码的站点生效。坐标自动避让 AdSense 广告容器。冷却 90s，同任务仅触发1次。
+                        </p>
                     </div>
 
                 </div>
@@ -7601,7 +7576,12 @@ HTML_TEMPLATE = r"""
                 region_engine_map: regionMap,
                 seo_keywords_zh: document.getElementById('seo_keywords_zh').value,
                 seo_keywords_en: document.getElementById('seo_keywords_en').value,
-                seo_referer_mode: document.getElementById('seo_referer_dynamic').checked ? 'dynamic' : 'static'
+                seo_referer_mode: document.getElementById('seo_referer_dynamic').checked ? 'dynamic' : 'static',
+                // ★ HilltopAds Pop-under 配置
+                hilltopads_enabled: document.getElementById('hilltopads_enabled').checked,
+                hilltopads_trigger_prob: parseInt(document.getElementById('hilltopads_trigger_prob').value) / 100 || 0.4,
+                hilltopads_stay_min: parseInt(document.getElementById('hilltopads_stay_min').value) || 15,
+                hilltopads_stay_max: parseInt(document.getElementById('hilltopads_stay_max').value) || 25,
             };
             
             fetch('/save_seo_config', {
@@ -11816,6 +11796,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 tasks.append({
                     "idx": i + 1,
                     "plan_time": _now_utc.astimezone().strftime('%Y-%m-%d %H:%M:%S'),
+                    "actual_start_epoch": int(time.time()),  # ★ 单独任务立即执行，不需要等待
                     "ideal_start": _now_sec_utc,
                     "actual_start": _now_sec_utc,
                     "actual_end": _now_sec_utc + int(browse_duration),
@@ -12361,8 +12342,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             # adv_id 占位：后续若接入多账户配置，可从 task/account 取
                             _adv_id = current_task.get("adv_account_id") or ""
                             # 构造一个稳定 device_id (基于 fingerprint_id 或任务+UA的hash)
+                            # ⚠️ 此时指纹浏览器尚未启动，fingerprint_id/user_agent/selected_ua 均不存在，
+                            # 若仅用 国别|语言 会导致同国所有任务指纹相同、被 FP 30 天互斥全部拒绝，
+                            # 因此追加随机后缀，保证每次任务指纹唯一
                             _fp = current_task.get("fingerprint_id") or (
-                                f"{cc_upper}|{language}|{selected_ua[:64] if 'selected_ua' in dir() else ''}"
+                                f"{cc_upper}|{language}|"
+                                f"{selected_ua[:64] if 'selected_ua' in dir() else ''}|"
+                                f"{uuid.uuid4().hex[:12]}"
                             )
                             # P0-1 隔离池（7 天 C 段 + ASN + 指纹互斥）
                             _ok1, _why1 = _rce.isolate_pool.allow(
@@ -12396,8 +12382,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 time.sleep(60)
                                 continue
                             # P1-5 Copula 采样：提前为本次任务抽取 bounce/pv/engagement 目标值
+                            # ⚠️ 提取目标站 host（_host 函数不存在，直接用 urlparse，避免 NameError 导致任务失败）
+                            try:
+                                _host_val = urllib.parse.urlparse(target_url).netloc if ('target_url' in dir() and target_url) else ""
+                            except Exception:
+                                _host_val = ""
                             _b = _rce.copula.sample_behavior(
-                                _host(target_url) if 'target_url' in dir() else "",
+                                _host_val,
                                 country=cc_upper,
                             )
                             current_task.setdefault("_rce_behavior_plan", _b)
@@ -12406,9 +12397,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 f"pages={_b['pages']} engagement={_b['engagement_sec']:.0f}s"
                             )
                             # P2-1 曝光 CV 限流检查
-                            _ok_cv, _cv = _rce.exposure_cv.allow(
-                                _host(target_url) if 'target_url' in dir() else ""
-                            )
+                            _ok_cv, _cv = _rce.exposure_cv.allow(_host_val)
                             if not _ok_cv:
                                 log.warning(
                                     f"📉 P2-1 曝光模式异常 CV={_cv:.2f}，本轮注入率降低 30%"
@@ -12461,7 +12450,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if _kw_files:
                                 try:
                                     with open(_kw_files[0], 'r', encoding='utf-8') as _kf:
-                                        _explored_kws = [l.strip() for l in _kf.readlines() if l.strip() and len(l.strip().split()) >= 3]
+                                        # 过滤注释行（# 开头）和标记行（## 开头），只保留真实关键词
+                                        _explored_kws = [
+                                            l.strip() for l in _kf.readlines()
+                                            if l.strip() and not l.strip().startswith('#')
+                                            and len(l.strip().split()) >= 3
+                                        ]
                                     if _explored_kws:
                                         selected_keyword = random.choice(_explored_kws)
                                         log.info(f"🔑 使用keyword_explore长尾词: {selected_keyword[:50]}")
@@ -14710,13 +14704,56 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             _sd_cfg2 = config.get("session_duration", {})
                             _sd_cap2 = float(_sd_cfg2.get("hard_cap_sec", 600))
                             task_deadline = enter_site_time + _session_secs if '_session_secs' in dir() else enter_site_time + _sd_cap2
+                        else:
+                            # ★ 修复：deadline 锚点可能设在前置流程（来源页浏览/搜索导航）之前，
+                            # 前置流程耗时几十秒会把预算吃光，导致进站时 deadline 已过期、
+                            # 浏览循环被保险绳立即截断 → 0点击/0停留 → 广告从未被真实浏览 → 广告收入为0。
+                            # 若剩余预算 < 配置的最小浏览时长，则重新锚定到首页加载完成时刻、重发完整预算
+                            _cfg_stay_min_rope2 = float(config.get("total_stay", {}).get("min", 80))
+                            _sd_cfg3 = config.get("session_duration", {})
+                            _sd_cap3 = float(_sd_cfg3.get("hard_cap_sec", 600))
+                            _rope_left = task_deadline - time.time()
+                            if _rope_left < _cfg_stay_min_rope2:
+                                _new_budget = min(_sd_cap3, _session_secs if '_session_secs' in dir() else max(_cfg_stay_min_rope2, 120))
+                                log.warning(
+                                    f"⏱️ [保险绳重锚] 旧deadline已过期/不足（剩余={max(0, _rope_left):.1f}s < 最小浏览{_cfg_stay_min_rope2:.0f}s，"
+                                    f"被前置流程消耗），重新锚定到首页加载完成时刻，新预算={_new_budget:.0f}s"
+                                )
+                                task_deadline = time.time() + _new_budget
                         
                         def _check_rope(stage_desc=""):
                             if not task_running:
                                 raise RuntimeError("任务已停止")
                             if time.time() >= task_deadline:
                                 raise RuntimeError(f"任务超时（已运行 {time.time() - enter_site_time:.1f}秒）")
-    
+
+                        # ★ HilltopAds Pop-under 弹窗触发辅助
+                        def _try_hilltopads_popunder(_page, _context, _cfg):
+                            """在积累页面交互后，通过 CDP 层可信手势触发 Pop-under 弹窗"""
+                            if not _HAS_POPUNDER:
+                                return False, None
+                            _ht_cfg = _cfg.get("hilltopads", {})
+                            if not _ht_cfg.get("enabled", False):
+                                return False, None
+                            try:
+                                _ok, _pop, _diag = _popunder.trigger_popunder(
+                                    _page, _context, config=_ht_cfg,
+                                )
+                                if _ok:
+                                    log.info(
+                                        f"[HilltopAds] Pop-under 弹窗触发成功: "
+                                        f"url={_diag.get('url','')[:80]} "
+                                        f"stay={_diag.get('stay_actual',0)}s"
+                                    )
+                                elif _diag.get("reason") not in ("probability_skip", "cooldown"):
+                                    log.debug(
+                                        f"[HilltopAds] Pop-under 跳过: {_diag.get('reason','')}"
+                                    )
+                                return _ok, _diag
+                            except Exception as _ht_e:
+                                log.debug(f"[HilltopAds] 弹窗触发异常(忽略): {_ht_e}")
+                                return False, None
+
                         current_x, current_y = 100, 100
 
                         # ========== ★ 跳出率模拟 + 网页浏览模式循环 ==========
@@ -14756,6 +14793,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 config, page_name=f"[T{task_idx+1}] 首页(跳出)", deadline=task_deadline
                             )
                             ad_monitor = scan_ads_during_task(page, ad_monitor, "跳出型任务首页停留后")
+                            # ★ HilltopAds Pop-under：首页浏览后触发弹窗
+                            _try_hilltopads_popunder(page, context, config)
                             log.info(f"🚪 跳出型任务完成：首页停留{_bounce_stay:.0f}s后离开")
                         if not _is_bounce:
                             log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L{len(layers)}，任务总时长=各轮之和）")
@@ -14799,6 +14838,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
                                 )
                                 ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮首页停留后")
+                                # ★ HilltopAds Pop-under：仅第一轮 L1 首页后触发（避免重复弹窗）
+                                if loop_idx == 0:
+                                    _try_hilltopads_popunder(page, context, config)
 
                                 # —— L1 → L2 进入列表页 ——
                                 layer1_cfg = layers[0]
@@ -15092,6 +15134,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             f"曾曝光={ad_impressions} 刷新={ad_refreshes} "
                             f"有效曝光达标(≥50%可见且累计≥{int(config.get('ad_effective_exposure_ms', 1000) or 1000)}ms)={_eff_exposed} "
                             f"累计曝光时长={_total_dur}ms 单广告位最长={_max_dur}ms "
+                            f"| Popunder弹窗触发={'是(峰值'+str(int(ad_monitor.get('popunder_max_windows',0)) or 0)+'个窗口)' if int(ad_monitor.get('popunder_max_windows',0) or 0)>0 else '否'} "
                             f"| 页面含广告代码={'是' if _has_ad_code else '否'} 联盟={_detected_network}"
                         )
                         
@@ -16854,7 +16897,15 @@ def save_seo_config():
     
     # 更新Referer模式
     config['seo']['referer_mode'] = data.get('seo_referer_mode', 'dynamic')
-    
+
+    # ★ 更新 HilltopAds Pop-under 配置
+    if 'hilltopads_enabled' in data:
+        config.setdefault('hilltopads', {})
+        config['hilltopads']['enabled'] = bool(data.get('hilltopads_enabled', False))
+        config['hilltopads']['trigger_probability'] = float(data.get('hilltopads_trigger_prob', 0.40))
+        config['hilltopads']['popunder_stay_min'] = int(data.get('hilltopads_stay_min', 15))
+        config['hilltopads']['popunder_stay_max'] = int(data.get('hilltopads_stay_max', 25))
+
     # 保存到配置文件
     # ★ 审计修复#5：指定encoding防止非UTF-8环境崩溃
     with open('config.json', 'w', encoding='utf-8') as f:
