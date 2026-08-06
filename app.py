@@ -20,7 +20,7 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "2.5.8"
+APP_VERSION = "3.5.9"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -61,6 +61,41 @@ from ip_info_resolver import resolve_ip_info
 import ip_provider as _ip_provider
 from local_proxy_relay import start_relay as _start_proxy_relay, stop_relay as _stop_proxy_relay
 
+# ★ 风控增强模块（P0 / P1 / P2 统一整改落地）— 最小侵入式接入
+try:
+    import risk_control_enhancements as _rce
+    _HAS_RCE = True
+except Exception as _e:
+    _rce = None  # type: ignore[assignment]
+    _HAS_RCE = False
+    print(f"[WARN] risk_control_enhancements 模块不可用（不影响主流程）: {_e}", file=sys.stderr)
+
+# ★ P0-1: TLS/JA3指纹伪装 - 使用curl_cffi模拟Chrome TLS指纹（替代原生requests的Python TLS特征）
+try:
+    from curl_cffi import requests as _tls_requests
+    _TLS_IMPERSONATE = "chrome"  # 模拟Chrome 120+ TLS/JA3指纹
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _tls_requests = requests  # 回退到原生requests
+    _TLS_IMPERSONATE = None
+    _HAS_CURL_CFFI = False
+
+def tls_safe_get(url, **kwargs):
+    """TLS指纹安全的GET请求（JA3指纹=Chrome，避免Python-requests被识别）"""
+    if _HAS_CURL_CFFI:
+        kwargs.setdefault("impersonate", _TLS_IMPERSONATE)
+        kwargs.setdefault("timeout", 30)
+        return _tls_requests.get(url, **kwargs)
+    return requests.get(url, **kwargs)
+
+def tls_safe_post(url, **kwargs):
+    """TLS指纹安全的POST请求"""
+    if _HAS_CURL_CFFI:
+        kwargs.setdefault("impersonate", _TLS_IMPERSONATE)
+        kwargs.setdefault("timeout", 30)
+        return _tls_requests.post(url, **kwargs)
+    return requests.post(url, **kwargs)
+
 _xvfb_process = None
 _xvfb_lock = threading.Lock()
 
@@ -83,6 +118,7 @@ _atexit.register(_cleanup_xvfb)
 COUNTRY_TIMEZONE_MAP = {
     # 原有国家
     "US": "America/New_York",      # 美国 - 纽约
+    "CA": "America/Toronto",       # 加拿大 - 多伦多
     "GB": "Europe/London",         # 英国 - 伦敦
     "DE": "Europe/Berlin",         # 德国 - 柏林
     "FR": "Europe/Paris",          # 法国 - 巴黎
@@ -94,6 +130,15 @@ COUNTRY_TIMEZONE_MAP = {
     "ID": "Asia/Jakarta",          # 印度尼西亚 - 雅加达
     "AU": "Australia/Sydney",      # 澳大利亚 - 悉尼
     "NZ": "Pacific/Auckland",      # 新西兰 - 奥克兰
+    "CN": "Asia/Shanghai",         # 中国 - 上海
+    "IE": "Europe/Dublin",         # 爱尔兰 - 都柏林
+    "IN": "Asia/Kolkata",          # 印度 - 加尔各答
+    "MY": "Asia/Kuala_Lumpur",     # 马来西亚
+    "PH": "Asia/Manila",           # 菲律宾
+    "ZA": "Africa/Johannesburg",   # 南非
+    "KR": "Asia/Seoul",            # 韩国
+    "BR": "America/Sao_Paulo",     # 巴西
+    "MX": "America/Mexico_City",   # 墨西哥
 }
 
 def get_timezone_for_country(country_code):
@@ -155,6 +200,98 @@ def get_available_proxies(proxy_pool):
                 f"⏰ 代理 {country_code} 不在工作时间，跳过"
             )
     return available_proxies
+
+# ========== 网络RTT延迟抖动仿真 ==========
+def simulate_rtt_jitter(base_ms=50, jitter_ms=30):
+    """模拟真实网络RTT延迟抖动（正态分布，模拟真实网络波动）。
+    用于在关键网络操作前插入随机延迟，避免机器式零延迟特征。
+    base_ms: 基础延迟（毫秒），jitter_ms: 抖动幅度（毫秒）
+    """
+    import math
+    # 对数正态分布模拟RTT：中位数=base_ms，偶尔出现高延迟尖峰
+    rtt = max(5, min(500, math.exp(random.gauss(math.log(max(1, base_ms)), 0.4))))
+    rtt += random.uniform(0, jitter_ms)  # 额外抖动
+    time.sleep(rtt / 1000.0)
+    return rtt
+
+
+# ========== 城市→经纬度映射（用于geolocation注入） ==========
+# 全球主要城市坐标（±0.05°随机抖动，模拟GPS精度误差）
+CITY_COORDINATES = {
+    # 北美
+    "new york": (40.7128, -74.0060), "los angeles": (34.0522, -118.2437),
+    "chicago": (41.8781, -87.6298), "houston": (29.7604, -95.3698),
+    "phoenix": (33.4484, -112.0740), "philadelphia": (39.9526, -75.1652),
+    "san antonio": (29.4241, -98.4936), "san diego": (32.7157, -117.1611),
+    "dallas": (32.7767, -96.7970), "miami": (25.7617, -80.1918),
+    "atlanta": (33.7490, -84.3880), "boston": (42.3601, -71.0589),
+    "seattle": (47.6062, -122.3321), "denver": (39.7392, -104.9903),
+    "toronto": (43.6532, -79.3832), "vancouver": (49.2827, -123.1207),
+    "montreal": (45.5017, -73.5673), "calgary": (51.0447, -114.0719),
+    "ottawa": (45.4215, -75.6972), "edmonton": (53.5461, -113.4938),
+    # 欧洲
+    "london": (51.5074, -0.1278), "paris": (48.8566, 2.3522),
+    "berlin": (52.5200, 13.4050), "madrid": (40.4168, -3.7038),
+    "rome": (41.9028, 12.4964), "amsterdam": (52.3676, 4.9041),
+    "brussels": (50.8503, 4.3517), "vienna": (48.2082, 16.3738),
+    "dublin": (53.3498, -6.2603), "stockholm": (59.3293, 18.0686),
+    "oslo": (59.9139, 10.7522), "copenhagen": (55.6761, 12.5683),
+    "helsinki": (60.1699, 24.9384), "warsaw": (52.2297, 21.0122),
+    "prague": (50.0755, 14.4378), "budapest": (47.4979, 19.0402),
+    "lisbon": (38.7223, -9.1393), "athens": (37.9838, 23.7275),
+    "moscow": (55.7558, 37.6173), "zurich": (47.3769, 8.5417),
+    # 亚太
+    "tokyo": (35.6762, 139.6503), "seoul": (37.5665, 126.9780),
+    "shanghai": (31.2304, 121.4737), "beijing": (39.9042, 116.4074),
+    "hong kong": (22.3193, 114.1694), "taipei": (25.0330, 121.5654),
+    "singapore": (1.3521, 103.8198), "sydney": (-33.8688, 151.2093),
+    "melbourne": (-37.8136, 144.9631), "auckland": (-36.8485, 174.7633),
+    "mumbai": (19.0760, 72.8777), "delhi": (28.6139, 77.2090),
+    "bangkok": (13.7563, 100.5018), "jakarta": (-6.2088, 106.8456),
+    "kuala lumpur": (3.1390, 101.6869), "manila": (14.5995, 120.9842),
+    # 其他
+    "sao paulo": (-23.5505, -46.6333), "mexico city": (19.4326, -99.1332),
+    "buenos aires": (-34.6037, -58.3816), "johannesburg": (-26.2041, 28.0473),
+    "cairo": (30.0444, 31.2357), "lagos": (6.5244, 3.3792),
+    "dubai": (25.2048, 55.2708), "istanbul": (41.0082, 28.9784),
+}
+
+
+def get_geolocation_for_ip(ip_info):
+    """根据IP信息生成带抖动的地理坐标（模拟GPS精度误差±0.02-0.08°）。
+    返回 {"latitude": float, "longitude": float, "accuracy": int} 或 None。
+    """
+    if not ip_info:
+        return None
+    city = (ip_info.get("city") or "").strip().lower()
+    region = (ip_info.get("region") or "").strip().lower()
+    # 尝试城市匹配
+    coords = CITY_COORDINATES.get(city)
+    if not coords and region:
+        coords = CITY_COORDINATES.get(region)
+    if not coords:
+        # 回退：根据国家代码给一个粗略坐标
+        cc = (ip_info.get("country_code") or "").upper()
+        _country_centers = {
+            "US": (39.8283, -98.5795), "CA": (56.1304, -106.3468),
+            "GB": (55.3781, -3.4360), "DE": (51.1657, 10.4515),
+            "FR": (46.2276, 2.2137), "JP": (36.2048, 138.2529),
+            "AU": (-25.2744, 133.7751), "SG": (1.3521, 103.8198),
+            "HK": (22.3193, 114.1694), "KR": (35.9078, 127.7669),
+            "IN": (20.5937, 78.9629), "BR": (-14.2350, -51.9253),
+        }
+        coords = _country_centers.get(cc)
+    if not coords:
+        return None
+    # 添加随机抖动（±0.02-0.08°，模拟GPS精度误差约2-8km）
+    jitter_lat = random.uniform(-0.08, 0.08)
+    jitter_lng = random.uniform(-0.08, 0.08)
+    accuracy = random.randint(50, 500)  # GPS精度50-500米
+    return {
+        "latitude": round(coords[0] + jitter_lat, 6),
+        "longitude": round(coords[1] + jitter_lng, 6),
+        "accuracy": accuracy
+    }
 
 # ========== 流量模型函数 ==========
 def clamp_hour(h):
@@ -859,19 +996,19 @@ def generate_daily_tasks_legacy(cfg):
         local_datetime = utc_datetime.astimezone(local_tz)
         local_tp = (local_datetime - today_local_start).total_seconds()
         
-        # 任务间隔（增强随机性：非线性抖动 + 偶尔分心暂停）
+        # 任务间隔（增强随机性：非线性抖动 + 偶尔分心暂停 + 高熵随机源）
         if is_first:
             task_gap = 0
         else:
-            base_gap = random.uniform(interval_cfg["min"], interval_cfg["max"])
+            base_gap = _secure_rng.uniform(interval_cfg["min"], interval_cfg["max"])
             # 10% 概率出现"分心暂停"（模拟用户去倒水、看手机等）
-            if random.random() < 0.10:
-                base_gap += random.uniform(30, 120)
+            if _secure_rng.random() < 0.10:
+                base_gap += _secure_rng.uniform(30, 120)
             # 5% 概率出现"短暂快速操作"（模拟用户快速连续浏览）
-            elif random.random() < 0.05:
+            elif _secure_rng.random() < 0.05:
                 base_gap = max(3, base_gap * 0.3)
             # 添加 ±15% 高斯微抖动
-            task_gap = max(2, base_gap * (1 + random.gauss(0, 0.15)))
+            task_gap = max(2, base_gap * (1 + _secure_rng.gauss(0, 0.15)))
         is_first = False
         
         # 顺延冲突处理：确保任务不会重叠（使用本地时间）
@@ -1095,6 +1232,10 @@ def generate_daily_tasks(cfg):
         if day_idx == 0:
             remain_ratio = max(0.0, (day_end_sec - available_start) / 86400.0)
             planned_for_day = int(round(full_day_tasks * remain_ratio))
+            # ★ 第一天最低保底：即使晚间生成计划，也保证至少20%日任务量或12个任务
+            _min_first_day = max(12, int(round(full_day_tasks * 0.20)))
+            if planned_for_day < _min_first_day and remain_ratio > 0:
+                planned_for_day = _min_first_day
             if full_day_tasks > 0 and remain_ratio > 0 and planned_for_day < 1:
                 planned_for_day = 1
         else:
@@ -1253,27 +1394,109 @@ def bezier_curve(p0, p1, p2, t):
     return x, y
 
 def human_mouse_move(page, start_x, start_y, end_x, end_y, config):
-    """使用贝塞尔曲线模拟真人鼠标移动"""
-    # 生成随机控制点，制造自然的弯曲
-    control_x = random.uniform(min(start_x, end_x), max(start_x, end_x))
-    control_y = random.uniform(min(start_y, end_y) - 100, max(start_y, end_y) + 100)
+    """★ P0-4: 多段三次贝塞尔曲线 + 生理微颤 + 速度钟形曲线（对抗ML轨迹分类器）"""
+    import math as _m
+    _sec = globals().get('_secure_rng') or random
     
-    # 从配置中随机取步数
-    steps = get_random_int(config["mouse_move_steps"])
+    dist = _m.hypot(end_x - start_x, end_y - start_y)
+    if dist < 3:
+        page.mouse.move(end_x, end_y)
+        return
     
-    for i in range(steps + 1):
-        t = i / steps
-        # 使用 ease-out 缓动函数，模拟真人鼠标先快后慢的特点
-        eased_t = 1 - math.pow(1 - t, 3)
+    # 根据距离决定分段数（短距离2段，长距离3-4段）
+    n_segments = max(2, min(4, int(dist / 150) + 1))
+    
+    # 生成中间路径点（每段终点）
+    waypoints = [(start_x, start_y)]
+    for i in range(1, n_segments):
+        ratio = i / n_segments
+        # 基础线性插值 + 垂直偏移（制造S形/弧形轨迹）
+        bx = start_x + (end_x - start_x) * ratio
+        by = start_y + (end_y - start_y) * ratio
+        # 垂直方向偏移（最大偏移量随距离增大）
+        perp_offset = _sec.gauss(0, dist * 0.08)
+        angle = _m.atan2(end_y - start_y, end_x - start_x) + _m.pi / 2
+        bx += perp_offset * _m.cos(angle)
+        by += perp_offset * _m.sin(angle)
+        waypoints.append((bx, by))
+    waypoints.append((end_x, end_y))
+    
+    # 总步数基于距离（Fitts定律）
+    total_steps = max(12, min(int(config.get("mouse_move_steps", {}).get("max", 250)), int(dist / 3)))
+    steps_per_seg = total_steps // n_segments
+    
+    # 速度钟形曲线参数（先加速后减速，峰值在30%-40%处）
+    peak_ratio = _sec.uniform(0.25, 0.40)
+    
+    # 生理微颤参数（8-12Hz人手自然震颤）
+    tremor_freq = _sec.uniform(8.0, 12.0)  # Hz
+    tremor_amp_x = _sec.uniform(0.3, 1.2)  # px
+    tremor_amp_y = _sec.uniform(0.3, 1.2)  # px
+    tremor_phase_x = _sec.uniform(0, 2 * _m.pi)
+    tremor_phase_y = _sec.uniform(0, 2 * _m.pi)
+    
+    t_start = time.time()
+    pause_prob = get_random_value(config.get("bezier_pause_prob", {"min": 0.05, "max": 0.2}))
+    
+    for seg_idx in range(n_segments):
+        p0 = waypoints[seg_idx]
+        p3 = waypoints[seg_idx + 1]
+        # 三次贝塞尔控制点（制造每段内的自然弯曲）
+        seg_dist = _m.hypot(p3[0] - p0[0], p3[1] - p0[1])
+        ctrl_spread = seg_dist * _sec.uniform(0.2, 0.45)
+        seg_angle = _m.atan2(p3[1] - p0[1], p3[0] - p0[0])
+        p1 = (
+            p0[0] + ctrl_spread * _m.cos(seg_angle + _sec.gauss(0, 0.3)),
+            p0[1] + ctrl_spread * _m.sin(seg_angle + _sec.gauss(0, 0.3))
+        )
+        p2 = (
+            p3[0] - ctrl_spread * _m.cos(seg_angle + _sec.gauss(0, 0.3)),
+            p3[1] - ctrl_spread * _m.sin(seg_angle + _sec.gauss(0, 0.3))
+        )
         
-        x, y = bezier_curve((start_x, start_y), (control_x, control_y), (end_x, end_y), eased_t)
-        page.mouse.move(x, y)
-        
-        # 随机小停顿，模拟真人移动时的微小停顿（使用配置参数）
-        pause_prob = get_random_value(config["bezier_pause_prob"])
-        if random.random() < pause_prob:
-            pause_time = get_random_value(config["mouse_move_pause"])
-            time.sleep(pause_time)
+        for s in range(steps_per_seg):
+            # 全局进度（0→1）
+            global_t = (seg_idx * steps_per_seg + s) / total_steps
+            # 局部进度（段内0→1）
+            local_t = s / max(1, steps_per_seg - 1)
+            
+            # 速度钟形曲线映射（非匀速）
+            if global_t < peak_ratio:
+                eased = (global_t / peak_ratio) ** 0.6  # 加速段
+            else:
+                eased = 1.0 - ((1.0 - global_t) / (1.0 - peak_ratio)) ** 1.8  # 减速段（更慢）
+            eased = max(0.0, min(1.0, eased))
+            # 将eased映射回local_t
+            local_eased = eased * n_segments - seg_idx
+            local_eased = max(0.0, min(1.0, local_eased))
+            
+            # 三次贝塞尔插值
+            t = local_eased
+            mt = 1 - t
+            bx = mt**3 * p0[0] + 3*mt**2*t * p1[0] + 3*mt*t**2 * p2[0] + t**3 * p3[0]
+            by = mt**3 * p0[1] + 3*mt**2*t * p1[1] + 3*mt*t**2 * p2[1] + t**3 * p3[1]
+            
+            # ★ 生理微颤（8-12Hz正弦叠加，幅度随速度变化）
+            elapsed = time.time() - t_start
+            speed_factor = _m.sin(global_t * _m.pi)  # 中间快两端慢
+            tremor_x = tremor_amp_x * speed_factor * _m.sin(2 * _m.pi * tremor_freq * elapsed + tremor_phase_x)
+            tremor_y = tremor_amp_y * speed_factor * _m.sin(2 * _m.pi * tremor_freq * elapsed + tremor_phase_y)
+            
+            mx = int(bx + tremor_x + _sec.gauss(0, 0.3))
+            my = int(by + tremor_y + _sec.gauss(0, 0.3))
+            page.mouse.move(mx, my)
+            
+            # 步间等待（速度钟形：中间快、两端慢）
+            base_pause = config.get("mouse_move_pause", {}).get("min", 0.008)
+            speed_mod = 1.5 - speed_factor  # 两端慢
+            time.sleep(max(0.004, base_pause * speed_mod * _sec.uniform(0.7, 1.3)))
+            
+            # 随机微停顿（模拟人类视觉校准）
+            if _sec.random() < pause_prob * 0.3:
+                time.sleep(_sec.uniform(0.05, 0.2))
+    
+    # 终点精确到位
+    page.mouse.move(int(end_x), int(end_y))
 
 QA_SESSION_DIR = "qa_sessions"
 QA_AD_COOKIE_CLEANUP_DAYS = 7
@@ -1402,6 +1625,102 @@ def save_qa_storage_state(context, site_url, country, state_path, meta_path):
     log.info(f"[QA会话] 已保存第一方Cookie/localStorage: {meta['country']}/{meta['site_host']}")
 
 
+# ★ P2-9: 跨会话行为画像记忆（每个站点+国家维护独立的行为模式，跨任务复用）
+BEHAVIOR_PROFILE_DIR = "behavior_profiles"
+
+def _bp_path(site_url, country):
+    """Per-site行为画像文件路径"""
+    import os
+    site = _qa_safe_name(_qa_site_host(site_url))
+    cc = _qa_safe_name((country or "US").upper())
+    os.makedirs(os.path.join(os.getcwd(), BEHAVIOR_PROFILE_DIR), exist_ok=True)
+    return os.path.join(os.getcwd(), BEHAVIOR_PROFILE_DIR, f"{site}_{cc}.json")
+
+def load_behavior_profile(site_url, country):
+    """加载跨会话行为画像（滚动偏好/点击热区/停留时长分布）"""
+    path = _bp_path(site_url, country)
+    profile = _qa_load_json(path, None)
+    if profile is None:
+        # 初始化默认画像
+        profile = {
+            "created_at": time.time(),
+            "visit_count": 0,
+            "avg_stay_sec": 0,
+            "preferred_scroll_depth": 0.5,  # 0-1，页面滚动深度偏好
+            "click_heatzone": "content_center",  # 点击热区偏好
+            "preferred_content_types": [],  # 偏好的内容类型
+            "scroll_speed_preference": "medium",  # slow/medium/fast
+            "last_visit_at": 0,
+            "total_pages_viewed": 0,
+        }
+    return profile
+
+def save_behavior_profile(site_url, country, stats, profile):
+    """任务结束后更新行为画像（指数移动平均，越新权重越大）"""
+    import os
+    path = _bp_path(site_url, country)
+    alpha = 0.3  # EMA系数（新数据占30%权重）
+    
+    profile["visit_count"] = profile.get("visit_count", 0) + 1
+    profile["last_visit_at"] = time.time()
+    profile["total_pages_viewed"] = profile.get("total_pages_viewed", 0) + stats.get("pages_viewed", 1)
+    
+    # 更新平均停留时长（EMA）
+    cur_stay = stats.get("total_stay", 0)
+    if cur_stay > 0:
+        old_stay = profile.get("avg_stay_sec", 0)
+        profile["avg_stay_sec"] = old_stay * (1 - alpha) + cur_stay * alpha if old_stay > 0 else cur_stay
+    
+    # 更新滚动深度偏好
+    scroll_dist = stats.get("scroll_distance", 0)
+    if scroll_dist > 0:
+        # 估算滚动深度（假设页面高度~3000px）
+        est_depth = min(1.0, scroll_dist / 3000.0)
+        old_depth = profile.get("preferred_scroll_depth", 0.5)
+        profile["preferred_scroll_depth"] = old_depth * (1 - alpha) + est_depth * alpha
+    
+    # 更新点击热区偏好
+    clicks = stats.get("clicks", 0)
+    if clicks > 0:
+        zones = ["content_center", "sidebar", "navigation", "footer"]
+        # 简化：根据点击次数判断活跃度
+        if clicks > 5:
+            profile["click_heatzone"] = "content_center"
+    
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def apply_behavior_profile_to_config(profile, config):
+    """将行为画像应用到当前任务配置（微调行为参数，制造跨会话一致性）
+    ★ 返回深拷贝，不修改原始config，防止全局配置污染"""
+    import copy as _copy_bp
+    if not profile or profile.get("visit_count", 0) < 2:
+        return _copy_bp.deepcopy(config)  # 数据不足时返回副本
+    
+    config = _copy_bp.deepcopy(config)  # ★ 在副本上操作
+    # 根据历史停留时长微调本次停留范围
+    avg_stay = profile.get("avg_stay_sec", 0)
+    if avg_stay > 30:
+        # 老用户停留更久（模拟熟悉网站的浏览习惯）
+        stay_cfg = config.get("total_stay", {"min": 120, "max": 300})
+        config["total_stay"] = {
+            "min": max(stay_cfg.get("min", 120), int(avg_stay * 0.8)),
+            "max": max(stay_cfg.get("max", 300), int(avg_stay * 1.3))
+        }
+    
+    # 根据滚动深度偏好微调滚动配置
+    depth = profile.get("preferred_scroll_depth", 0.5)
+    if depth > 0.7:
+        config["scroll_pixels"] = {"min": 300, "max": 1200}  # 深度阅读者滚动更多
+    elif depth < 0.3:
+        config["scroll_pixels"] = {"min": 100, "max": 500}  # 浅层浏览者滚动少
+    
+    return config
+
+
 app = Flask(__name__)
 # ★ 5.3 日志轮转：RotatingFileHandler（maxBytes=10MB, backupCount=5，总占用≤50MB）
 from logging.handlers import RotatingFileHandler as _RFH
@@ -1455,6 +1774,10 @@ _th_z.Timer(1800, _schedule_cleanup).start()
 # ========== Flask 安全配置 ==========
 import secrets
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+
+# ★ 高熵随机源（PDF风控要求：关键风控参数必须使用密码学安全随机数，而非伪随机）
+# secrets.SystemRandom() 基于 os.urandom()，提供不可预测的随机数
+_secure_rng = secrets.SystemRandom()
 
 # ========== HTTP Basic Auth 中间件（已禁用）==========
 # from functools import wraps
@@ -1523,7 +1846,7 @@ config = {
     "page_load_wait": {"min": 1, "max": 8},
     "scroll_pixels": {"min": 200, "max": 1000},
     "scroll_wait": {"min": 0.5, "max": 5},
-    "ad_click_prob": {"min": 0.005, "max": 0.05},
+    "ad_click_prob": {"min": 0.01, "max": 0.03},
     "ad_click_wait": {"min": 2, "max": 20},
     "random_click_count": {"min": 3, "max": 10},
     "random_click_wait": {"min": 0.5, "max": 3},
@@ -1774,9 +2097,9 @@ class IPSessionManager:
         import json
         self.session_file = "ip_session_history.json"
         self.session_history = self._load_session_history()
-        self.max_session_duration = 300  # 5分钟
+        self.max_session_duration = 600  # 10分钟（PDF风控要求≥10分钟，动态IP有效时长5-10分钟超时销毁）
         self.max_daily_visits = 4       # 24小时内不超过4次访问
-        self.daily_window = 86400       # 24小时
+        self.daily_window = 86400       # 24小时精确去重
         
     def _load_session_history(self):
         """加载会话历史记录"""
@@ -1870,11 +2193,22 @@ class IPSessionManager:
 ip_session_manager = IPSessionManager()
 
 class UAPoolManager:
-    """UA 池管理器，负责 24 小时内的 UA 去重（与 IP 去重窗口对齐）"""
-    
+    """UA 池管理器（P2-1：按国家+24小时段缓存7天，避免"同一国家每任务换UA"造成指纹瀑布异常）
+
+    策略：
+    - bucket_key = {country_code.upper()}|{YYYY-MM-DD_HH}（小时分段，模拟真实UA在短时间内不会抖动）
+    - 同一 bucket 在 7 天内始终命中同一个 UA（主 UA），重复率受 ua_repeat_max_rate 约束；
+      当命中次数 / 该 bucket 总使用次数 超过重复率上限，才在同语言池内重新挑一个。
+    - 7 天窗口：超过 7 天的 bucket 记录自动丢弃（重启/进程存活期间均生效）。
+    - 跨进程持久化：UA_BUCKET_FILE 落盘，下次启动加载，保证 VPS 重启后仍延续同一"国家-时间段 UA"。
+    """
+
     UA_HISTORY_FILE = "ua_usage_history.json"
+    UA_BUCKET_FILE = "ua_country_hour_buckets.json"
     WINDOW_HOURS = 24
-    
+    # P2-1 新增：bucket 级缓存有效期（天），与 country_host_7d 会话策略一致
+    BUCKET_MAX_DAYS = 7
+
     def _safe_log(self, level, message):
         """安全记录日志，log 不可用时回退到 print"""
         try:
@@ -1996,7 +2330,16 @@ class UAPoolManager:
         self.ua_history = {}  # {ua: last_used_timestamp}
         self.total_ua_used = 0
         self.reused_ua_count = 0
-        
+        # P2-1: 国家+小时段的 UA bucket 缓存，结构：
+        # { "<CC>|<YYYY-MM-DD_HH>": {"ua": str, "created_at": ts, "hits": int, "total": int} }
+        self.ua_buckets = {}
+        self._bucket_lock = None
+        try:
+            import threading
+            self._bucket_lock = threading.Lock()
+        except Exception:
+            self._bucket_lock = None
+
         # 加载 fake_useragent 作为补充
         try:
             from fake_useragent import UserAgent
@@ -2005,7 +2348,7 @@ class UAPoolManager:
         except Exception as e:
             self._safe_log("warning", f"fake_useragent 加载失败: {e}，仅使用基础库")
             self.ua_generator = None
-        
+
         # 从文件加载历史记录
         if os.path.exists(self.UA_HISTORY_FILE):
             try:
@@ -2018,6 +2361,214 @@ class UAPoolManager:
             except Exception as e:
                 self._safe_log("error", f"加载 UA 历史记录失败: {e}")
                 self.ua_history = {}
+
+        # P2-1：加载 UA bucket 缓存（跨进程延续）
+        if os.path.exists(self.UA_BUCKET_FILE):
+            try:
+                with open(self.UA_BUCKET_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f) or {}
+                now = time.time()
+                cutoff = now - self.BUCKET_MAX_DAYS * 86400
+                cleaned = {}
+                for k, v in raw.items():
+                    try:
+                        if not isinstance(v, dict):
+                            continue
+                        if float(v.get("created_at", 0) or 0) < cutoff:
+                            continue
+                        if not v.get("ua"):
+                            continue
+                        cleaned[k] = v
+                    except Exception:
+                        continue
+                self.ua_buckets = cleaned
+                self._safe_log("info", f"UA bucket 缓存加载成功，当前 {len(self.ua_buckets)} 个（国家+小时段）")
+            except Exception as e:
+                self._safe_log("warning", f"加载 UA bucket 缓存失败: {e}")
+                self.ua_buckets = {}
+
+    def _bucket_key(self, country_code, for_date=None):
+        """生成 bucket key: {CC}|{YYYY-MM-DD_HH}"""
+        import datetime
+        cc = ((country_code or "xx").split("-")[0] or "xx").upper()[:8]
+        now = for_date or datetime.datetime.now()
+        try:
+            hh = now.strftime("%H")
+            d = now.strftime("%Y-%m-%d")
+        except Exception:
+            d = datetime.datetime.now().strftime("%Y-%m-%d")
+            hh = datetime.datetime.now().strftime("%H")
+        return f"{cc}|{d}_{hh}"
+
+    def _save_buckets(self):
+        import json
+        import os
+        try:
+            # 持久化前清理过期记录（> BUCKET_MAX_DAYS 天）
+            now = time.time()
+            cutoff = now - self.BUCKET_MAX_DAYS * 86400
+            cleaned = {}
+            with self._lock_bucket():
+                for k, v in self.ua_buckets.items():
+                    try:
+                        if float(v.get("created_at", 0) or 0) >= cutoff:
+                            cleaned[k] = v
+                    except Exception:
+                        continue
+                self.ua_buckets = cleaned
+                payload = json.dumps(self.ua_buckets, ensure_ascii=False, indent=2)
+            with open(self.UA_BUCKET_FILE, "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception as e:
+            self._safe_log("debug", f"保存 UA bucket 缓存失败: {e}")
+
+    def _lock_bucket(self):
+        class _NoopLock:
+            def __enter__(self): return self
+            def __exit__(self, exc_type, exc, tb): return False
+        return self._bucket_lock if self._bucket_lock is not None else _NoopLock()
+
+    def _pick_from_pool_original(self, lang_prefix, browser_family):
+        """沿用原有的"UA池 + 去重 + 重复率管控"逻辑，作为 bucket 缺失时的 UA 抽取器。
+
+        注意：与原始 get_ua 完全等价，但不保存历史（由调用方统一在 bucket 层记录）。
+        同时把全局重复率阈值从硬编码 0.2 改为读取 config.ua_repeat_max_rate（默认 0.2）。
+        """
+        import time
+        import random
+        self._clean_old_records()
+        ua_pool = self._get_ua_pool(lang_prefix)
+        if browser_family == "chromium":
+            chromium_pool = [ua for ua in ua_pool if ("Chrome/" in ua or "Edg/" in ua or "Chromium/" in ua) and "Firefox/" not in ua and "Version/" not in ua]
+            if chromium_pool:
+                ua_pool = chromium_pool
+            else:
+                self._safe_log("warning", "Chromium UA 池为空，回退使用完整 UA 池")
+        if self.total_ua_used > 0:
+            current_repeat_rate = self.reused_ua_count / self.total_ua_used
+        else:
+            current_repeat_rate = 0
+        try:
+            max_rate = max(0.0, min(1.0, float(globals().get("config", {}).get("ua_repeat_max_rate", 0.2) or 0.2)))
+        except Exception:
+            max_rate = 0.2
+        self._safe_log("debug", f"当前 UA 池大小: {len(ua_pool)}, 已使用 UA: {len(self.ua_history)}, 总任务: {self.total_ua_used}, 复用数: {self.reused_ua_count}, 重复率: {current_repeat_rate:.2%}, 阈值: {max_rate:.0%}")
+        unused_uas = [ua for ua in ua_pool if ua not in self.ua_history]
+        is_reused = False
+        if unused_uas:
+            selected_ua = random.choice(unused_uas)
+            is_reused = False
+            self._safe_log("debug", f"选择了新的 UA: {selected_ua[:60]}...")
+        else:
+            if current_repeat_rate < max_rate:
+                sorted_uas = sorted(self.ua_history.items(), key=lambda x: x[1])
+                selected_ua = sorted_uas[0][0]
+                is_reused = True
+                self._safe_log("debug", f"复用了 UA: {selected_ua[:60]}...")
+            else:
+                self._safe_log("warning", f"需要生成新的 UA 变体（当前重复率: {current_repeat_rate:.2%}，阈值: {max_rate:.0%}）")
+                selected_ua = self._generate_ua_variant(random.choice(ua_pool))
+                attempts = 0
+                while selected_ua in self.ua_history and attempts < 20:
+                    selected_ua = self._generate_ua_variant(random.choice(ua_pool))
+                    attempts += 1
+                is_reused = selected_ua in self.ua_history
+        if not self._is_valid_ua(selected_ua):
+            self._safe_log("warning", f"⚠️ 选中的 UA 格式非法，已回退: {selected_ua[:60]}")
+            _valid_candidates = [ua for ua in ua_pool if self._is_valid_ua(ua)]
+            if _valid_candidates:
+                selected_ua = random.choice(_valid_candidates)
+                is_reused = selected_ua in self.ua_history
+        self.ua_history[selected_ua] = time.time()
+        self.total_ua_used += 1
+        if is_reused:
+            self.reused_ua_count += 1
+        self._save_history()
+        new_repeat_rate = self.reused_ua_count / self.total_ua_used if self.total_ua_used > 0 else 0
+        if new_repeat_rate >= max_rate:
+            self._safe_log("warning", f"⚠️ 当前 UA 重复率: {new_repeat_rate:.2%}（超过阈值 {max_rate:.0%}），总任务: {self.total_ua_used}，复用: {self.reused_ua_count}")
+        elif new_repeat_rate >= max(max_rate - 0.05, 0.0):
+            self._safe_log("info", f"UA 重复率: {new_repeat_rate:.2%}（接近阈值 {max_rate:.0%}）")
+        return selected_ua
+
+    def get_ua(self, lang_prefix, browser_family="chromium", country_code=None):
+        """P2-1 升级版入口：优先按 {国家+小时段} 命中缓存 UA，否则回退原池逻辑并回填缓存。
+
+        参数:
+            country_code: 可选，传 fingerprint.country_code（如 US/JP/CN），不传则退化为原全局去重。
+        """
+        import time
+        if not country_code:
+            # 无国家信息 → 退化为原行为
+            return self._pick_from_pool_original(lang_prefix, browser_family)
+        bucket_key = self._bucket_key(country_code)
+        now = time.time()
+        with self._lock_bucket():
+            cached = self.ua_buckets.get(bucket_key)
+            need_new = True
+            if cached and isinstance(cached, dict):
+                try:
+                    if float(cached.get("created_at", 0) or 0) >= now - self.BUCKET_MAX_DAYS * 86400 and cached.get("ua"):
+                        need_new = False
+                except Exception:
+                    need_new = True
+            if not need_new:
+                # 命中 bucket，在阈值内优先复用
+                ua = cached["ua"]
+                total = int(cached.get("total", 0) or 0) + 1
+                hits = int(cached.get("hits", 0) or 0) + 1
+                cached["total"] = total
+                cached["hits"] = hits
+                # 在 ua_history 里也记一次（保证重复率数据一致）
+                is_reused = ua in self.ua_history
+                self.ua_history[ua] = now
+                self.total_ua_used += 1
+                if is_reused:
+                    self.reused_ua_count += 1
+                # 当该 bucket 重复率（hits/total）超过 ua_repeat_max_rate，则重抽一次降低同 bucket 命中
+                try:
+                    max_rate = max(0.0, min(1.0, float(globals().get("config", {}).get("ua_repeat_max_rate", 0.2) or 0.2)))
+                except Exception:
+                    max_rate = 0.2
+                if max_rate > 0 and total > 4 and (hits / total) > max_rate + 0.1:
+                    # 重复率过高，标记需要重新抽取并记录（不要直接删除，保留到下一个小时段自然过期）
+                    cached["over_rate"] = True
+                    self._safe_log(
+                        "info",
+                        f"[UA bucket] {bucket_key} 命中重复率 {hits/total:.2%} > 阈值+0.1，本次强制重抽（保留缓存避免抖动）"
+                    )
+                else:
+                    # 正常命中：落盘并返回
+                    try:
+                        self._save_history()
+                        # 间隔落盘 bucket（每 12 次命中或 5% 概率，避免频繁IO）
+                        if total % 12 == 0 or random.random() < 0.05:
+                            self._save_buckets()
+                    except Exception:
+                        pass
+                    return ua
+        # bucket 缺失/过期/超过重复率 → 走原 UA 池逻辑并回填 bucket
+        ua = self._pick_from_pool_original(lang_prefix, browser_family)
+        try:
+            with self._lock_bucket():
+                self.ua_buckets[bucket_key] = {
+                    "ua": ua,
+                    "created_at": now,
+                    "hits": 1,
+                    "total": 1,
+                    "lang_prefix": lang_prefix,
+                    "country": (country_code or "").upper()[:8],
+                }
+            # 异步/低概率落盘（避免高频 IO）
+            try:
+                import random as _r
+                if _r.random() < 0.3:
+                    self._save_buckets()
+            except Exception:
+                pass
+        except Exception as e:
+            self._safe_log("debug", f"回填 UA bucket 失败: {e}")
+        return ua
     
     def _generate_ua_variant(self, base_ua):
         """基于基础 UA 生成变体（修改版本号等）"""
@@ -2319,9 +2870,25 @@ def record_ad_click(n=1):
         return 0
 
 def daily_ad_click_limit_reached():
-    """是否已达今日单日点击上限（config.daily_ad_click_limit，0=不限）"""
+    """是否已达今日单日点击上限（config.daily_ad_click_limit={min,max}，每天随机选取上限值，0=不限）"""
     try:
-        limit = int(config.get("daily_ad_click_limit", 0) or 0)
+        cfg = config.get("daily_ad_click_limit", {"min": 0, "max": 0})
+        if isinstance(cfg, dict):
+            _min = int(cfg.get("min", 0) or 0)
+            _max = int(cfg.get("max", 0) or 0)
+        else:
+            # 兼容旧格式（单个整数）
+            _min = _max = int(cfg or 0)
+        if _max <= 0:
+            return False  # 0=不限
+        # 每天随机确定当日上限（缓存在fingerprint_stats中，同一天不变）
+        import datetime as _dt
+        today = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+        daily_limits = fingerprint_stats.setdefault("daily_ad_click_limits", {})
+        if today not in daily_limits:
+            daily_limits[today] = random.randint(_min, _max) if _min < _max else _max
+            save_fingerprint_stats()
+        limit = daily_limits[today]
         if limit <= 0:
             return False
         return get_daily_ad_clicks() >= limit
@@ -2426,7 +2993,33 @@ def video_interruptible_sleep(seconds, check_interval=0.5):
 
 
 def _human_model_supervisor_loop():
-    return  # 已禁用心跳监督，不再强制停止任何任务
+    """心跳监督线程：定期检查 last_heartbeat，超时则清除 running 标志位。"""
+    while True:
+        try:
+            human_model_stop_event.wait(timeout=8)
+        except Exception:
+            pass
+        if human_model_stop_event.is_set():
+            return
+        try:
+            with human_model_lock:
+                hb = human_model_state.get("last_heartbeat", 0)
+                running = human_model_state.get("running", False)
+                src = human_model_state.get("last_source", "")
+            if running and time.time() - hb > 30:
+                log.warning(
+                    f"[HumanModel] 心跳丢失超过30s(last_source={src})，"
+                    f"标记监督退出(任务侧检测后会重启)"
+                )
+                with human_model_lock:
+                    human_model_state["running"] = False
+                    human_model_state["last_error"] = f"heartbeat_timeout_from_{src}"
+            else:
+                continue
+        except Exception as _he:
+            log.debug(f"[HumanModel] supervisor 异常忽略: {_he}")
+        # 本轮超时处理完后再次 wait
+        human_model_stop_event.clear()
 
 
 def start_human_model(task_type):
@@ -2437,12 +3030,18 @@ def start_human_model(task_type):
             "task_type": task_type,
             "last_heartbeat": time.time(),
             "last_source": "start",
-            "last_error": ""
+            "last_error": "",
         })
     human_model_stop_event.clear()
-    if human_model_thread is None or not human_model_thread.is_alive():
-        human_model_thread = threading.Thread(target=_human_model_supervisor_loop, daemon=True)
-        human_model_thread.start()
+    need_start = False
+    with human_model_lock:
+        if human_model_thread is None or not human_model_thread.is_alive():
+            need_start = True
+    if need_start:
+        t = threading.Thread(target=_human_model_supervisor_loop, daemon=True)
+        t.start()
+        with human_model_lock:
+            human_model_thread = t
     log.info(f"[真人模型监督] 已启动: {task_type}")
 
 
@@ -2462,6 +3061,32 @@ def human_model_tick(source):
 
 
 def ensure_human_model_alive():
+    """保证真人模型心跳存在：心跳丢失>20s就自动重启 supervisor + 重设 running。
+
+    返回 True（调用方不用再判断），但日志会记录每次重启事件。
+    """
+    global human_model_thread
+    try:
+        with human_model_lock:
+            s = human_model_state
+            running = s.get("running", False)
+            if not running:
+                return True
+            hb = s.get("last_heartbeat", 0)
+        if time.time() - hb > 20:
+            log.warning("[HumanModel] 心跳丢失 20s，重启 supervisor 并重设 running=True")
+            human_model_stop_event.set()
+            time.sleep(0.6)
+            human_model_stop_event.clear()
+            with human_model_lock:
+                human_model_state["last_heartbeat"] = time.time()
+                human_model_state["running"] = True
+                human_model_state["last_source"] = "ensure_alive_reboot"
+                t = threading.Thread(target=_human_model_supervisor_loop, daemon=True)
+                t.start()
+                human_model_thread = t
+    except Exception as _e:
+        log.debug(f"[HumanModel] ensure_alive 异常忽略: {_e}")
     return True
 
 
@@ -2481,6 +3106,8 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
     """
     import time as _t
     import random as _rnd
+    # ★ 高熵随机源用于关键风控参数（动作选择、间隔计算）
+    _sec = globals().get('_secure_rng') or _rnd
 
     # 补全 stats 默认字段
     for _k in ("mouse_moves", "scrolls", "scroll_distance", "clicks",
@@ -2504,6 +3131,22 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
     click_count_cfg = config.get("random_click_count", {"min": 0, "max": 3})
     click_wait_cfg = config.get("random_click_wait", {"min": 0.5, "max": 2.0})
     page_load_cfg = config.get("page_load_wait", {"min": 1.0, "max": 3.0})
+    mouse_count_cfg = config.get("mouse_move_count", {"min": 2, "max": 20})
+
+    # ★ QA真人模型强度：调节动作频率和停顿
+    _profile = config.get("qa_human_profile", "standard")
+    if _profile == "light":
+        _action_gap_range = (1.5, 4.0)  # 动作间隔更长
+        _scroll_max = max(3, int(scroll_count_cfg.get("min", 2)))  # 滚动次数取下限
+        _mouse_max = max(2, int(mouse_count_cfg.get("min", 2)))  # 鼠标次数取下限
+    elif _profile == "heavy":
+        _action_gap_range = (0.3, 1.2)  # 动作间隔更短
+        _scroll_max = int(scroll_count_cfg.get("max", 10))  # 滚动次数取上限
+        _mouse_max = int(mouse_count_cfg.get("max", 20))  # 鼠标次数取上限
+    else:  # standard
+        _action_gap_range = (0.5, 2.0)
+        _scroll_max = _rnd.randint(int(scroll_count_cfg.get("min", 2)), int(scroll_count_cfg.get("max", 10)))
+        _mouse_max = _rnd.randint(int(mouse_count_cfg.get("min", 2)), int(mouse_count_cfg.get("max", 20)))
 
     # 页面加载后先等待（模拟真人反应）
     _init_wait = _rnd.uniform(page_load_cfg.get("min", 1.0), page_load_cfg.get("max", 3.0))
@@ -2521,11 +3164,18 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
     # 动作权重：滚动和鼠标为主，点击权重从配置读取（确保真人行为包含点击）
     _click_weight = max(2, int(click_count_cfg.get("min", 3)) // 2)  # 至少2，配置min=3→权重2
     _key_weight = max(1, _click_weight // 2)
+    # ★ 移动端手势检测：如果UA包含移动设备关键词，添加触摸手势动作
+    _is_mobile_context = any(kw in (page.context.options.get('user_agent', '') or '') for kw in ("Android", "Mobile", "iPhone", "iPad"))
+    _touch_actions = ["touch_swipe", "touch_tap"] if _is_mobile_context else []
+    if _is_mobile_context:
+        log.info(f"[真人模拟] 检测到移动端UA，启用触摸手势模拟（滑动/点击）")
     actions = (
         ["scroll"] * 4 +
         ["mouse"] * 4 +
         ["click"] * _click_weight +
-        ["key"] * _key_weight
+        ["key"] * _key_weight +
+        ["text_select"] * 2 +  # ★ 文字选中/复制/粘贴复合行为（PDF风控要求）
+        _touch_actions * 3  # ★ 移动端手势：滑动/点击（仅移动设备）
     )
 
     action_errors = 0
@@ -2533,6 +3183,16 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
     summary_interval = 6
     next_summary_at = summary_interval
     bezier_prob = _rnd.uniform(bezier_pause_cfg.get("min", 0.05), bezier_pause_cfg.get("max", 0.2))
+    # ★ 动作计数器：用于限制滚动/鼠标次数（从配置读取上限）
+    _scroll_done = 0
+    _mouse_done = 0
+    # ★ 疲劳模拟参数（PDF风控要求：长会话后期放缓操作速度/增加停顿，模拟人类疲劳）
+    # 疲劳系数：0.0（初始精力充沛）→ 1.0（极度疲劳），根据已运行时长/总时长比例计算
+    _fatigue_duration_threshold = 120.0  # 超过120秒后开始显现疲劳
+    _fatigue_max_multiplier = 2.5  # 最大停顿倍数（疲劳时停顿时间延长2.5倍）
+    _fatigue_speed_min = 0.4  # 最小速度系数（疲劳时鼠标/滚动速度降低到40%）
+    _fatigue_gap_multiplier = 1.0  # ★ 初始值（循环内会动态更新）
+    _fatigue_speed_factor = 1.0  # ★ 初始值（循环内会动态更新）
 
     while True:
         human_model_tick(page_name)
@@ -2542,19 +3202,28 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
         if remaining <= 0:
             break
         
-        # 动作间隔：0.5-2s
-        gap = min(remaining, _rnd.uniform(0.5, 2.0))
+        # 动作间隔：从配置读取（受qa_human_profile调节 + 疲劳系数延长）
+        gap = min(remaining, _rnd.uniform(_action_gap_range[0], _action_gap_range[1]) * _fatigue_gap_multiplier)
         _t.sleep(gap)
         stats["total_stay"] += gap
         if _t.time() >= window_end or not task_running:
             break
 
         loop_count += 1
-        action = _rnd.choice(actions)
+        action = _sec.choice(actions)  # ★ 高熵随机选择动作（防止伪随机被预测）
+        # ★ 疲劳系数计算：超过阈值后线性增长，0.0→1.0
+        _elapsed = _t.time() - start
+        _fatigue = max(0.0, min(1.0, (_elapsed - _fatigue_duration_threshold) / max(1.0, duration - _fatigue_duration_threshold))) if duration > _fatigue_duration_threshold else 0.0
+        # 疲劳影响：动作间隔延长、鼠标/滚动速度降低
+        _fatigue_gap_multiplier = 1.0 + _fatigue * (_fatigue_max_multiplier - 1.0)  # 1.0→2.5
+        _fatigue_speed_factor = 1.0 - _fatigue * (1.0 - _fatigue_speed_min)  # 1.0→0.4
         try:
             if action == "scroll":
-                # ★ 2.1 惯性滚动模型：初始速度v0，每帧衰减v*=0.88，模拟真人滚动惯性
-                _v0 = _rnd.uniform(300, 800)  # 初始速度 px/s
+                # ★ 滚动次数限制：达到配置上限后跳过
+                if _scroll_done >= _scroll_max:
+                    continue
+                # ★ 2.1 惯性滚动模型：初始速度v0从配置scroll_pixels读取
+                _v0 = _rnd.uniform(float(scroll_cfg.get("min", 200)), float(scroll_cfg.get("max", 1000)))  # 初始速度 px/s
                 _direction = -1 if _rnd.random() < 0.15 else 1
                 _inertia_js = """
                     (v0, direction) => {
@@ -2578,9 +3247,10 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                     _scrolled = page.evaluate(_inertia_js, [_v0, _direction])
                     _scrolled = int(abs(_scrolled or 0))
                 except Exception:
-                    _scrolled = _rnd.randint(100, 400)
+                    _scrolled = _rnd.randint(int(scroll_cfg.get("min", 100)), int(scroll_cfg.get("max", 800)))
                     page.evaluate(f"window.scrollBy(0, {_scrolled * _direction})")
                 stats["scrolls"] += 1
+                _scroll_done += 1
                 stats["scroll_distance"] += _scrolled
                 # 滚动后等待（从配置读取）
                 _sw = min(window_end - _t.time(), _rnd.uniform(scroll_wait_cfg.get("min", 0.5), scroll_wait_cfg.get("max", 2.0)))
@@ -2588,6 +3258,9 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                     _t.sleep(_sw)
                     stats["total_stay"] += _sw
             elif action == "mouse":
+                # ★ 鼠标移动次数限制：达到配置上限后跳过
+                if _mouse_done >= _mouse_max:
+                    continue
                 # ★ 2.4 注意力热区模型：鼠标目标不再完全随机，按热区权重采样
                 _hotzone = _rnd.random()
                 if _hotzone < 0.40:  # 内容区域中心偏上(40%)
@@ -2605,11 +3278,13 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                 else:  # 随机(15%)
                     tx = _rnd.randint(50, 1150)
                     ty = _rnd.randint(50, 750)
-                # ★ 2.2 Fitts定律：距离越远步数越多（模拟真人远距离移动更谨慎）
+                # ★ 2.2 步数从配置mouse_move_steps读取（Fitts定律作为微调因子）
                 import math as _math_f
                 _dist_f = _math_f.hypot(tx - current_x, ty - current_y)
-                steps = max(8, int(_math_f.log2(_dist_f / 10 + 1) * 10))
-                steps = min(steps, 60)  # 上限60步
+                _fitts_factor = max(0.5, min(1.5, _math_f.log2(_dist_f / 100 + 1)))  # 距离微调±50%
+                _cfg_steps = _rnd.randint(int(mouse_steps_cfg.get("min", 50)), int(mouse_steps_cfg.get("max", 250)))
+                steps = max(8, int(_cfg_steps * _fitts_factor))
+                steps = min(steps, int(mouse_steps_cfg.get("max", 250)))  # 上限从配置读取
                 # 生成随机控制点，制造自然弯曲
                 ctrl_x = _rnd.uniform(min(current_x, tx), max(current_x, tx))
                 ctrl_y = _rnd.uniform(min(current_y, ty) - 80, max(current_y, ty) + 80)
@@ -2629,14 +3304,15 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                     mx = int(bx + _rnd.randint(-2, 2))
                     my = int(by + _rnd.randint(-2, 2))
                     page.mouse.move(mx, my)
-                    # 每步等待从配置读取
-                    _step_wait = _rnd.uniform(mouse_pause_cfg.get("min", 0.01), mouse_pause_cfg.get("max", 0.1))
+                    # 每步等待从配置读取（受疲劳系数影响：疲劳时步间等待延长）
+                    _step_wait = _rnd.uniform(mouse_pause_cfg.get("min", 0.01), mouse_pause_cfg.get("max", 0.1)) / max(0.1, _fatigue_speed_factor)
                     _t.sleep(_step_wait)
                     # 贝塞尔暂停概率
                     if _rnd.random() < bezier_prob:
                         _t.sleep(_rnd.uniform(0.1, 0.4))
                 current_x, current_y = tx, ty
                 stats["mouse_moves"] += 1
+                _mouse_done += 1
                 # ★ 2.4 阅读停顿：每3-5次鼠标移动后插入1-4s停顿
                 if stats["mouse_moves"] % _rnd.randint(3, 5) == 0:
                     _read_pause = _rnd.uniform(1.0, 4.0)
@@ -2661,6 +3337,130 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                 key = _rnd.choice(["PageDown", "PageUp", "ArrowDown", "ArrowUp", "End", "Home", "Space"])
                 page.keyboard.press(key)
                 stats["key_presses"] += 1
+            elif action == "text_select":
+                # ★ 文字选中/复制/粘贴复合行为（模拟真人阅读时选中文字、复制、偶尔粘贴）
+                try:
+                    _select_js = """
+                    () => {
+                        // 查找页面中的可见文本节点（p, span, div, li, td, h1-h6, a）
+                        const textEls = document.querySelectorAll('p, span, li, td, h1, h2, h3, h4, h5, h6, a, blockquote');
+                        const candidates = [];
+                        for (const el of textEls) {
+                            const text = (el.textContent || '').trim();
+                            if (text.length >= 20 && text.length <= 500) {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width > 50 && rect.height > 10 && rect.top > 0 && rect.top < window.innerHeight) {
+                                    candidates.push({el, text, rect});
+                                }
+                            }
+                        }
+                        if (candidates.length === 0) return null;
+                        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+                        const text = chosen.text;
+                        // 随机选取文字的一个子串（模拟拖拽选中）
+                        const start = Math.floor(Math.random() * Math.max(1, text.length - 10));
+                        const selLen = Math.min(text.length - start, Math.floor(Math.random() * 40) + 5);
+                        // 创建Range并选中
+                        const range = document.createRange();
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        try {
+                            const walker = document.createTreeWalker(chosen.el, NodeFilter.SHOW_TEXT);
+                            let node, charCount = 0, startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+                            while ((node = walker.nextNode())) {
+                                const nodeLen = node.textContent.length;
+                                if (!startNode && charCount + nodeLen > start) {
+                                    startNode = node;
+                                    startOffset = start - charCount;
+                                }
+                                if (charCount + nodeLen >= start + selLen) {
+                                    endNode = node;
+                                    endOffset = start + selLen - charCount;
+                                    break;
+                                }
+                                charCount += nodeLen;
+                            }
+                            if (startNode && endNode) {
+                                range.setStart(startNode, startOffset);
+                                range.setEnd(endNode, Math.min(endOffset, endNode.textContent.length));
+                                sel.addRange(range);
+                                return {success: true, selected: text.substring(start, start + selLen)};
+                            }
+                        } catch(e) {}
+                        return null;
+                    }
+                    """
+                    _sel_result = page.evaluate(_select_js)
+                    if _sel_result and _sel_result.get("success"):
+                        stats.setdefault("text_selections", 0)
+                        stats["text_selections"] += 1
+                        # 模拟真人选中后短暂停顿（阅读选中内容）
+                        _t.sleep(_rnd.uniform(0.3, 1.2))
+                        # 复制 (Ctrl+C / Cmd+C)
+                        page.keyboard.press("Control+c")
+                        _t.sleep(_rnd.uniform(0.2, 0.8))
+                        # 30%概率执行粘贴（模拟真人复制后粘贴到搜索框等）
+                        if _rnd.random() < 0.3:
+                            # 尝试找到页面搜索框并粘贴
+                            _paste_js = """
+                            () => {
+                                const inputs = document.querySelectorAll('input[type="text"], input[type="search"], input:not([type]), textarea');
+                                for (const inp of inputs) {
+                                    const rect = inp.getBoundingClientRect();
+                                    if (rect.width > 80 && rect.height > 15 && rect.top > 0 && rect.top < window.innerHeight) {
+                                        inp.focus();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }
+                            """
+                            _found_input = page.evaluate(_paste_js)
+                            if _found_input:
+                                page.keyboard.press("Control+v")
+                                _t.sleep(_rnd.uniform(0.5, 1.5))
+                                # 粘贴后清空（避免影响页面状态）
+                                page.keyboard.press("Control+a")
+                                page.keyboard.press("Backspace")
+                except Exception:
+                    pass  # 文字选中失败不影响任务流程
+            elif action == "touch_swipe":
+                # ★ 移动端触摸手势：滑屏（模拟手指上下滑动浏览）
+                try:
+                    _sx = _rnd.randint(100, 500)
+                    _sy = _rnd.randint(200, 600)
+                    _ex = _sx + _rnd.randint(-50, 50)  # 水平微偏
+                    _ey = _sy + _rnd.choice([-1, 1]) * _rnd.randint(100, 300)  # 上下滑动100-300px
+                    # Playwright touch: 使用 page.touchscreen 或 mouse 模拟
+                    page.mouse.move(_sx, _sy)
+                    page.mouse.down()
+                    # 分步滑动（模拟手指滑动轨迹）
+                    _steps = _rnd.randint(5, 15)
+                    for _i in range(_steps):
+                        _t_val = (_i + 1) / _steps
+                        _cx = _sx + (_ex - _sx) * _t_val + _rnd.uniform(-2, 2)
+                        _cy = _sy + (_ey - _sy) * _t_val + _rnd.uniform(-2, 2)
+                        page.mouse.move(_cx, _cy)
+                        _t.sleep(_rnd.uniform(0.01, 0.03))
+                    page.mouse.up()
+                    stats.setdefault("touch_gestures", 0)
+                    stats["touch_gestures"] += 1
+                    _t.sleep(_rnd.uniform(0.3, 0.8))  # 滑动后等待
+                except Exception:
+                    pass
+            elif action == "touch_tap":
+                # ★ 移动端触摸手势：轻触点击（模拟手指点击）
+                try:
+                    _tx = _rnd.randint(100, 600)
+                    _ty = _rnd.randint(100, 800)
+                    page.mouse.move(_tx, _ty)
+                    _t.sleep(_rnd.uniform(0.05, 0.15))  # 短暂停顿
+                    page.mouse.click(_tx, _ty)
+                    stats.setdefault("touch_gestures", 0)
+                    stats["touch_gestures"] += 1
+                    _t.sleep(_rnd.uniform(0.3, 1.0))
+                except Exception:
+                    pass
         except Exception:
             action_errors += 1
 
@@ -2745,10 +3545,10 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
                 'script[src*="taboola"]',
                 'script[src*="outbrain"]',
                 // HilltopAds/EvaDav 投放域名（随机域名，通过白名单确认）
-                'script[src*="curoax"]',
-                'script[src*="pufted"]',
-                'iframe[src*="bony-teaching"]',
-                'script[src*="untimely-hello"]',
+                'script[src*="curoax"]', 'iframe[src*="curoax"]',
+                'script[src*="pufted"]', 'iframe[src*="pufted"]',
+                'iframe[src*="bony-teaching"]', 'script[src*="bony-teaching"]',
+                'script[src*="untimely-hello"]', 'iframe[src*="untimely-hello"]',
                 // Ezoic / Mediavine / AdThrive / Raptive
                 'script[src*="ezoic"]',
                 'script[src*="ezoicnet"]',
@@ -2939,6 +3739,241 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
     return ad_monitor
 
 
+# ★ 广告点击风控：任务级冷却时间 + 广告去重
+_ad_click_last_ts = 0  # 上次广告点击时间戳（全局，跨任务冷却）
+_ad_click_cooldown = 180  # 冷却时间（秒），同一IP/会话两次点击间隔至少3分钟
+_ad_clicked_positions = set()  # 当前任务已点击的广告坐标key（任务结束后清空）
+
+def reset_ad_click_tracking():
+    """每个新任务开始时调用，清空任务级去重记录"""
+    global _ad_clicked_positions
+    _ad_clicked_positions = set()
+
+def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
+    """★ 广告点击核心函数：按配置概率随机点击可见广告。
+    在每次 scan_ads_during_task 之后调用，实现“检测到广告→概率点击”闭环。
+    返回 (clicked: bool, current_x, current_y)
+    """
+    global _ad_click_last_ts, _ad_clicked_positions
+    try:
+        # 1. 每日上限检查
+        if daily_ad_click_limit_reached():
+            return False, current_x, current_y
+
+        # 1.5 ★ 风控冷却：两次广告点击间隔至少3分钟（模拟真人不会连续点击广告）
+        _now = time.time()
+        if _now - _ad_click_last_ts < _ad_click_cooldown:
+            return False, current_x, current_y
+
+        # 1.6 ★ P1-5: 广告交互前停留≥8秒（模拟阅读行为，防止页面刚加载就点广告）
+        _ad_min_page_stay = config.get("ad_min_page_stay", 8.0)  # 最少停留秒数
+        try:
+            _page_load_ts = page.evaluate("performance.timing.navigationStart || performance.timeOrigin") or 0
+            if _page_load_ts > 0:
+                _page_stay_sec = (_now * 1000 - _page_load_ts) / 1000.0  # 转换为秒
+                if _page_stay_sec < _ad_min_page_stay:
+                    log.debug(f"[广告点击][风控] 页面停留仅{_page_stay_sec:.1f}s < {_ad_min_page_stay}s，延迟点击")
+                    return False, current_x, current_y
+        except Exception:
+            pass  # 获取navigationStart失败不阻断流程
+
+        # 2. 概率掷骰
+        ad_click_prob_cfg = config.get("ad_click_prob", {"min": 0.005, "max": 0.05})
+        prob = random.uniform(float(ad_click_prob_cfg.get("min", 0.005)), float(ad_click_prob_cfg.get("max", 0.05)))
+        if random.random() >= prob:
+            return False, current_x, current_y
+
+        # 3. 通过JS查找当前视口内可见的广告元素及其坐标
+        ad_positions = page.evaluate("""
+        () => {
+            const selectors = [
+                'ins.adsbygoogle', '.adsbygoogle',
+                '[id*="google_ads_iframe"]', 'iframe[src*="googlesyndication"]',
+                'iframe[src*="doubleclick"]', '[data-ad-client]', '[data-ad-slot]',
+                'iframe[src*="hilltopads"]', 'iframe[src*="propellerads"]',
+                'iframe[src*="evadav"]', 'iframe[src*="mgid"]',
+                'iframe[src*="taboola"]', 'iframe[src*="outbrain"]',
+                'iframe[src*="ad-maven"]', 'iframe[src*="/ads/"]',
+                'iframe[src*="/adserve/"]', 'iframe[src*="/adserver/"]',
+                // ★ HilltopAds/EvaDav 随机投放域名（必须同时覆盖 script 和 iframe）
+                'iframe[src*="curoax"]', 'iframe[src*="pufted"]',
+                'iframe[src*="bony-teaching"]', 'iframe[src*="untimely-hello"]',
+                '[class*="ad-container"]', '[class*="ad-wrapper"]', '[class*="ad-unit"]',
+                '[id*="ad-container"]', '[id*="ad-wrapper"]',
+                'iframe[width="728"][height="90"]', 'iframe[width="300"][height="250"]',
+                'iframe[width="160"][height="600"]', '[data-zone]', '[data-adzone]'
+            ];
+            const vw = window.innerWidth || 1920;
+            const vh = window.innerHeight || 1080;
+            const seen = new Set();
+            const results = [];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                    if (seen.has(el)) return;
+                    seen.add(el);
+                    const r = el.getBoundingClientRect();
+                    const w = Math.round(r.width || 0);
+                    const h = Math.round(r.height || 0);
+                    if (w < 50 || h < 50) return;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return;
+                    // 必须在视口内
+                    if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return;
+                    results.push({
+                        x: Math.round(r.left + w * (0.3 + Math.random() * 0.4)),
+                        y: Math.round(r.top + h * (0.3 + Math.random() * 0.4)),
+                        w: w, h: h
+                    });
+                });
+            }
+            // 跨域iframe兆底检测
+            if (results.length === 0) {
+                const _nonAd = ['youtube','vimeo','dailymotion','twitter','facebook','instagram','recaptcha','hcaptcha','disqus','paypal'];
+                document.querySelectorAll('iframe').forEach(el => {
+                    if (seen.has(el)) return;
+                    const src = (el.getAttribute('src') || '').toLowerCase();
+                    if (!src || src === 'about:blank') return;
+                    if (_nonAd.some(d => src.includes(d))) return;
+                    try { if (new URL(src, location.href).hostname === location.hostname) return; } catch(e){}
+                    const r = el.getBoundingClientRect();
+                    const w = Math.round(r.width || 0);
+                    const h = Math.round(r.height || 0);
+                    if (w < 160 || h < 90) return;
+                    if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return;
+                    seen.add(el);
+                    results.push({
+                        x: Math.round(r.left + w * (0.3 + Math.random() * 0.4)),
+                        y: Math.round(r.top + h * (0.3 + Math.random() * 0.4)),
+                        w: w, h: h
+                    });
+                });
+            }
+            return results;
+        }
+        """)
+
+        if not ad_positions or len(ad_positions) == 0:
+            log.debug(f"[广告点击][{stage}] 概率命中但无可见广告元素")
+            return False, current_x, current_y
+
+        # 4. ★ 风控去重：过滤已点击过的广告位置（同一任务内不重复点击同一广告位）
+        _unclicked = [a for a in ad_positions if f"{a['x']//50}:{a['y']//50}" not in _ad_clicked_positions]
+        if not _unclicked:
+            log.debug(f"[广告点击][{stage}] 所有可见广告均已点击过，跳过")
+            return False, current_x, current_y
+
+        # 5. 随机选择一个广告
+        target_ad = random.choice(_unclicked)
+        ad_x = target_ad["x"]
+        ad_y = target_ad["y"]
+        # 记录已点击位置（50px粒度去重）
+        _ad_clicked_positions.add(f"{ad_x//50}:{ad_y//50}")
+        log.info(f"🎯 [广告点击][{stage}] 概率命中(prob={prob:.4f})，发现{len(ad_positions)}个可见广告，准备点击({ad_x},{ad_y})")
+
+        # 5. 贝塞尔曲线移动鼠标到广告位置
+        try:
+            human_mouse_move(page, current_x, current_y, ad_x, ad_y, config)
+            current_x, current_y = ad_x, ad_y
+        except Exception:
+            page.mouse.move(ad_x, ad_y)
+            current_x, current_y = ad_x, ad_y
+
+        # 6. ★ P1-5增强: 广告前阅读模拟（真人在点击广告前会先阅读周围内容）
+        # 先在广告附近区域滚动/停留，模拟“看到广告”的过程
+        _pre_read_time = random.uniform(2.0, 5.0)  # 阅读周围内容 2-5秒
+        time.sleep(_pre_read_time)
+        # 微观犹豫（真人看到广告后的停顿）
+        time.sleep(random.uniform(0.5, 1.5))
+
+        # 7. 记录点击前标签页数
+        _context = page.context
+        _pages_before = len(_context.pages)
+
+        # P0-3 广告素材语义相似度检查
+        if _HAS_RCE:
+            try:
+                _page_title = ''
+                try:
+                    _page_title = page.title() or ''
+                except Exception:
+                    pass
+                _h1_text = ''
+                try:
+                    _h1_text = page.evaluate("() => { const h1 = document.querySelector('h1'); return h1 ? h1.textContent.trim().substring(0,200) : ''; }") or ''
+                except Exception:
+                    pass
+                _landing_text = (_page_title + ' ' + _h1_text).strip()
+                if _landing_text:
+                    _ok_s, _s, _why = _rce.semantic_sim.allow(
+                        creative_text=(f"ad_{stage}" if stage else "ad"),
+                        landing_text=_landing_text,
+                    )
+                    if not _ok_s:
+                        log.warning(f"⛔ P0-3 语义不匹配(score={_s:.3f}<0.62)，跳过此广告: {_why[:100]}")
+                        return False, current_x, current_y
+            except Exception as _rce_e:
+                log.debug(f"P0-3 语义检查异常(忽略): {_rce_e}")
+
+        # 8. 点击广告
+        try:
+            page.mouse.click(ad_x, ad_y)
+        except Exception:
+            pass
+
+        _today_clicks = record_ad_click(1)
+        _ad_click_last_ts = time.time()  # ★ 更新冷却时间戳
+        log.info(f"🖱️ [广告点击] 已执行点击（今日累计 {_today_clicks} 次，冷却{_ad_click_cooldown}s）")
+
+        # 9. 点击后等待
+        ad_click_wait_cfg = config.get("ad_click_wait", {"min": 2, "max": 20})
+        _click_wait = random.uniform(float(ad_click_wait_cfg.get("min", 2)), float(ad_click_wait_cfg.get("max", 20)))
+        time.sleep(_click_wait)
+
+        # 10. 检测新标签页（广告落地页）
+        try:
+            _pages_after = _context.pages
+            if len(_pages_after) > _pages_before:
+                _landing_page = _pages_after[-1]
+                _lp_url = ""
+                try:
+                    _lp_url = _landing_page.url or ""
+                except Exception:
+                    pass
+                log.info(f"🛬 [广告点击] 落地页已打开: {_lp_url[:100]}")
+                # 落地页停留
+                _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                _lp_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
+                time.sleep(_lp_load)
+                import math as _math_lp
+                _lp_stay = max(15, min(90, _math_lp.exp(random.gauss(_math_lp.log(25), 0.5))))
+                # 落地页滚动
+                for _i in range(random.randint(1, 3)):
+                    try:
+                        _landing_page.evaluate(f"window.scrollBy(0, {random.randint(int(config.get('scroll_pixels', {}).get('min', 200)), int(config.get('scroll_pixels', {}).get('max', 1000)))}")
+                        time.sleep(random.uniform(1.5, 4.0))
+                    except Exception:
+                        break
+                _elapsed = _lp_load + 7.5
+                _remaining = max(0, _lp_stay - _elapsed)
+                if _remaining > 0:
+                    time.sleep(_remaining)
+                log.info(f"🛬 [广告点击] 落地页浏览完成（停留≈{_lp_stay:.1f}s），关闭")
+                try:
+                    _landing_page.close()
+                except Exception:
+                    pass
+        except Exception as _lp_err:
+            log.debug(f"[广告点击] 落地页处理异常: {str(_lp_err)[:80]}")
+
+        return True, current_x, current_y
+
+    except Exception as e:
+        log.debug(f"[广告点击][{stage}] 异常(忽略): {type(e).__name__}: {str(e)[:80]}")
+        return False, current_x, current_y
+
+
 def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config):
     """
     执行完整搜索引擎搜索跳转流程（带真人模拟），支持所有搜索引擎
@@ -3020,7 +4055,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         seo_query = get_seo_query()
         selected_engine = seo_query.get_engine_by_id(selected_engine_id)
         if not selected_engine:
-            log.warning(f"[真搜索] 找不到引擎配置，直接访问目标页")
+            log.warning(f"[真搜索] 找不到引擎配置，搜索跳转失败")
             return False, current_x, current_y
         
         # ★ 社媒平台不走真搜索流程（无搜索框/结果页），直接返回让Referer流程处理
@@ -3032,7 +4067,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         engine_url = selected_engine.get("url")
         homepage_url = seo_query.get_engine_homepage(engine_url)
         if not homepage_url:
-            log.warning(f"[真搜索] 提取主页失败，直接访问目标页")
+            log.warning(f"[真搜索] 提取主页失败，搜索跳转失败")
             return False, current_x, current_y
 
         # 获取该引擎的选择器（无则用通用兜底）
@@ -3045,8 +4080,12 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         log.info(f"🔍 [真搜索] 访问搜索引擎主页: {homepage_url}")
         
         # 2. 访问搜索引擎主页
-        page.goto(homepage_url, timeout=60000, wait_until="networkidle")
-        time.sleep(random.uniform(1.5, 3.0))
+        simulate_rtt_jitter(base_ms=80, jitter_ms=40)  # ★ RTT仿真：模拟真实网络延迟
+        try:
+            _hard_timeout_goto(page, homepage_url, timeout=60, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
 
         # 2.5 在搜索引擎主页加入真人模拟窗口
         homepage_duration = random.uniform(1.5, 4.0)
@@ -3074,12 +4113,12 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         try:
             search_box = page.wait_for_selector(search_selector, timeout=15000)
         except Exception as e:
-            log.warning(f"[真搜索] 定位搜索框失败: {str(e)[:100]}，直接访问目标页")
+            log.warning(f"[真搜索] 定位搜索框失败: {str(e)[:100]}，搜索跳转失败")
             return False, current_x, current_y
 
         # 5. 移动鼠标到搜索框、点击
         if not search_box:
-            log.warning("[真搜索] 搜索框元素为None，直接访问目标页")
+            log.warning("[真搜索] 搜索框元素为None，搜索跳转失败")
             return False, current_x, current_y
         try:
             search_box.scroll_into_view_if_needed(timeout=5000)
@@ -3151,9 +4190,8 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         log.info(f"🔍 [真搜索] 执行搜索")
         page.keyboard.press("Enter")
         time.sleep(random.uniform(0.5, 1.5))
-        # 等待搜索结果页
-        page.wait_for_load_state("networkidle", timeout=60000)
-        time.sleep(random.uniform(1.5, 3.5))
+        # 等待搜索结果页（networkidle → _safe_page_wait）
+        _safe_page_wait(page, min_wait=1.5, max_wait=3.5, ad_wait=False)
 
         # 9. 新增：在搜索结果页加入真人模拟窗口！
         results_duration = random.uniform(3.0, 6.0)
@@ -3205,23 +4243,22 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             else:
                 target_link_found.click()
             
-            # 11. 等待跳转到目标页
-            page.wait_for_load_state("networkidle", timeout=90000)
-            time.sleep(random.uniform(1.2, 2.5))
+            # 11. 等待跳转到目标页（networkidle → _safe_page_wait，目标站启用ad_wait）
+            _safe_page_wait(page, min_wait=2.0, max_wait=4.5, ad_wait=True)
             current_url = page.url
             log.info(f"🔍 [真搜索] 当前URL: {current_url[:100]}")
             if target_host in current_url:
                 log.info(f"✅ [真搜索] 成功跳转到目标页！")
                 return True, current_x, current_y
             else:
-                log.warning(f"[真搜索] 跳转后URL不匹配，直接导航目标页")
+                log.warning(f"[真搜索] 跳转后URL不匹配，搜索跳转失败")
                 return False, current_x, current_y
         else:
-            log.warning(f"[真搜索] 搜索结果页没找到目标链接，直接访问目标页")
+            log.warning(f"[真搜索] 搜索结果页没找到目标链接，搜索跳转失败")
             return False, current_x, current_y
 
     except Exception as e:
-        log.warning(f"[真搜索] 流程异常: {str(e)[:180]}，直接访问目标页")
+        log.warning(f"[真搜索] 流程异常: {str(e)[:180]}，搜索跳转失败")
         return False, current_x, current_y
 
 
@@ -3543,7 +4580,7 @@ HTML_TEMPLATE = r"""
         .log-success { color: #00ff00; }
         .log-error { color: #ff0000; }
         .log-info { color: #87ceeb; }
-        .log-task-separator { color: #ff3333; font-style: italic; font-weight: 900; font-size: 18px; display: block; text-align: center; }
+        .log-task-separator { color: #ff0000; font-style: italic; font-weight: 900; font-size: 27px; display: block; text-align: center; }
         .log-web-round { color: #ffd700; font-style: italic; font-weight: 700; display: block; }
         .log-video-round { color: #1e40ff; font-style: italic; font-weight: 700; display: block; }
         
@@ -3557,7 +4594,7 @@ HTML_TEMPLATE = r"""
         <!-- 顶部栏 -->
         <div class="top-bar">
             <!-- 蓝框 - 系统名称 -->
-            <div class="system-name">Selenium流量系统 <span style="font-size:12px;color:#aaa;font-weight:normal;">v{{ APP_VERSION }}</span></div>
+            <div class="system-name">Selenium流量系统 <span style="font-size:12px;color:#aaa;font-weight:normal;">v{{ APP_VERSION }}</span>{% if VPS_HOST %} <span style="font-size:12px;color:#7fd4ff;font-weight:normal;margin-left:6px;">VPS: {{ VPS_HOST }}</span>{% endif %}</div>
             
             <!-- 运行模式区域 -->
             <div class="button-panel">
@@ -3784,6 +4821,13 @@ HTML_TEMPLATE = r"""
                                 <input type="number" step="0.1" id="ad_click_wait_max" value="{{ config.ad_click_wait.max }}">
                             </div>
                         </div>
+                        <div class="form-group">
+                            <label>每日广告点击上限（0=不限，建议5~10，每天随机取值）</label>
+                            <div class="input-group">
+                                <input type="number" id="daily_ad_click_limit_min" value="{{ config.get('daily_ad_click_limit', {}).get('min', 0) if config.get('daily_ad_click_limit') is mapping else 0 }}">
+                                <input type="number" id="daily_ad_click_limit_max" value="{{ config.get('daily_ad_click_limit', {}).get('max', 0) if config.get('daily_ad_click_limit') is mapping else 0 }}">
+                            </div>
+                        </div>
                     </div>
                     <div>
                         <div class="form-group">
@@ -3870,6 +4914,34 @@ HTML_TEMPLATE = r"""
                         <button class="btn" id="btn-execute-plan" onclick="executePlan()" style="background: #8b5cf6; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">▶️ 执行计划</button>
                         <button class="btn" id="btn-clear-plan" onclick="clearPlan()" style="background: #f97316; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">🗑️ 清除计划</button>
                         <button class="btn" onclick="stopTask()" style="background: #ef4444; color: white; padding: 5.4px 14.4px; font-size: 12.6px;">⏹️ 停止任务</button>
+                    </div>
+                    <!-- 🛡️ Dwell Monitor Guardian：实时守护面板（增强版：状态灯 + 告警 + 健康度指标 + 恢复按钮） -->
+                    <div id="dm-panel" style="margin-bottom: 12px; padding: 12px; background: linear-gradient(90deg,#1f2937,#111827); border: 1px solid #374151; border-radius: 8px;">
+                        <!-- 第1行：标题 + 控制按钮 + 状态灯 -->
+                        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;">
+                            <span style="color:#e5e7eb; font-weight: 600; font-size: 13px;">🛡️ 停留/跳出率 实时守护</span>
+                            <span id="dm-status-light" style="display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #6b7280; box-shadow: 0 0 6px #6b7280;" title="未启动"></span>
+                            <span id="dm-status-text" style="color:#9ca3af; font-size: 12px;">未启动</span>
+                            <button class="btn" id="btn-dm-start" onclick="toggleDwellMonitor(true)" style="background:#059669; color:white; padding:5px 12px; font-size:12px;">▶️ 启动守护</button>
+                            <button class="btn" id="btn-dm-stop" onclick="toggleDwellMonitor(false)" style="background:#7f1d1d; color:white; padding:5px 12px; font-size:12px;">⏹ 停止守护</button>
+                            <button class="btn" id="btn-dm-resume" onclick="resumeTaskFromMonitor()" style="background:#2563eb; color:white; padding:5px 12px; font-size:12px; display:none;">🔄 恢复任务</button>
+                            <label style="color:#9ca3af; font-size: 11px; display:inline-flex; align-items:center; gap:4px; margin-left: auto;">
+                                <input type="checkbox" id="dm-no-pause" style="width:auto;">仅报警不暂停
+                            </label>
+                        </div>
+                        <!-- 第2行：健康度指标 -->
+                        <div id="dm-metrics" style="display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: #d1d5db; margin-bottom: 6px;">
+                            <span>📊 平均停留: <b id="dm-avg-dwell" style="color:#60a5fa;">--</b>s</span>
+                            <span>📈 跳出率: <b id="dm-bounce-rate" style="color:#fbbf24;">--</b>%</span>
+                            <span>🔴 CRIT: <b id="dm-crit-count" style="color:#f87171;">0</b></span>
+                            <span>🟡 WARN: <b id="dm-warn-count" style="color:#fbbf24;">0</b></span>
+                            <span>🟢 OK: <b id="dm-ok-count" style="color:#34d399;">0</b></span>
+                            <span id="dm-consec-crit" style="display:none;">⚡ 连续CRIT: <b style="color:#ef4444;">0</b></span>
+                        </div>
+                        <!-- 第3行：最近3条告警 -->
+                        <div id="dm-alerts-box" style="font-size: 11px; color: #9ca3af; max-height: 72px; overflow-y: auto; background: #0f172a; border-radius: 4px; padding: 4px 8px;">
+                            <span style="color:#6b7280;">等待监控启动...</span>
+                        </div>
                     </div>
                     <!-- 基础配置 -->
                     <div style="margin-bottom: 8px; padding: 8px; background: #2a2a2a; border-radius: 8px;">
@@ -4257,7 +5329,7 @@ HTML_TEMPLATE = r"""
                             <thead style="position:sticky; top:0; background:#1a1a2e;">
                                 <tr>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">序号</th>
-                                    <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">开始时间</th>
+                                    <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">开始时间(北京)</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">当地时间</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">预估时长</th>
                                     <th style="padding:6px; text-align:left; border-bottom:1px solid #444;">结束时间</th>
@@ -4506,6 +5578,7 @@ HTML_TEMPLATE = r"""
                         min: parseFloat(document.getElementById('ad_click_wait_min').value),
                         max: parseFloat(document.getElementById('ad_click_wait_max').value)
                     },
+                    daily_ad_click_limit: {min: parseInt((document.getElementById('daily_ad_click_limit_min') || {value:'0'}).value) || 0, max: parseInt((document.getElementById('daily_ad_click_limit_max') || {value:'0'}).value) || 0},
                     random_click_count: {
                         min: parseInt(document.getElementById('random_click_count_min').value),
                         max: parseInt(document.getElementById('random_click_count_max').value)
@@ -4663,6 +5736,72 @@ HTML_TEMPLATE = r"""
                 ip_proxy_api: ipProxyApi,
                 ip_proxy_user: ipProxyUser,
                 ip_proxy_pwd: ipProxyPwd,
+
+                // ★ 模型Tab完整字段（修复：之前缺失导致保存无效）
+                ad_stay_time: {
+                    min: parseFloat(document.getElementById('ad_stay_time_min').value) || 3,
+                    max: parseFloat(document.getElementById('ad_stay_time_max').value) || 40
+                },
+                page_load_wait: {
+                    min: parseFloat(document.getElementById('page_load_wait_min').value) || 1,
+                    max: parseFloat(document.getElementById('page_load_wait_max').value) || 8
+                },
+                scroll_pixels: {
+                    min: parseInt(document.getElementById('scroll_pixels_min').value) || 200,
+                    max: parseInt(document.getElementById('scroll_pixels_max').value) || 1000
+                },
+                scroll_wait: {
+                    min: parseFloat(document.getElementById('scroll_wait_min').value) || 0.5,
+                    max: parseFloat(document.getElementById('scroll_wait_max').value) || 5
+                },
+                ad_click_prob: {
+                    min: parseFloat(document.getElementById('ad_click_prob_min').value) || 0.005,
+                    max: parseFloat(document.getElementById('ad_click_prob_max').value) || 0.05
+                },
+                ad_click_wait: {
+                    min: parseFloat(document.getElementById('ad_click_wait_min').value) || 2,
+                    max: parseFloat(document.getElementById('ad_click_wait_max').value) || 20
+                },
+                daily_ad_click_limit: {
+                    min: parseInt((document.getElementById('daily_ad_click_limit_min') || {value:'0'}).value) || 0,
+                    max: parseInt((document.getElementById('daily_ad_click_limit_max') || {value:'0'}).value) || 0
+                },
+                random_click_count: {
+                    min: parseInt(document.getElementById('random_click_count_min').value) || 3,
+                    max: parseInt(document.getElementById('random_click_count_max').value) || 10
+                },
+                random_click_wait: {
+                    min: parseFloat(document.getElementById('random_click_wait_min').value) || 0.5,
+                    max: parseFloat(document.getElementById('random_click_wait_max').value) || 3
+                },
+                mouse_move_count: {
+                    min: parseInt(document.getElementById('mouse_move_count_min').value) || 2,
+                    max: parseInt(document.getElementById('mouse_move_count_max').value) || 20
+                },
+                mouse_move_steps: {
+                    min: parseInt(document.getElementById('mouse_move_steps_min').value) || 50,
+                    max: parseInt(document.getElementById('mouse_move_steps_max').value) || 250
+                },
+                mouse_move_wait: {
+                    min: parseFloat(document.getElementById('mouse_move_wait_min').value) || 0.1,
+                    max: parseFloat(document.getElementById('mouse_move_wait_max').value) || 1
+                },
+                scroll_count: {
+                    min: parseInt(document.getElementById('scroll_count_min').value) || 2,
+                    max: parseInt(document.getElementById('scroll_count_max').value) || 10
+                },
+                bezier_pause_prob: {
+                    min: parseFloat(document.getElementById('bezier_pause_prob_min').value) || 0.05,
+                    max: parseFloat(document.getElementById('bezier_pause_prob_max').value) || 0.2
+                },
+                mouse_move_pause: {
+                    min: parseFloat(document.getElementById('mouse_move_pause_min').value) || 0.01,
+                    max: parseFloat(document.getElementById('mouse_move_pause_max').value) || 0.1
+                },
+                task_interval: {
+                    min: parseFloat(document.getElementById('task_interval_min').value) || 10,
+                    max: parseFloat(document.getElementById('task_interval_max').value) || 60
+                },
 
                 web_navigation: {
                     loop_count: {
@@ -5323,6 +6462,152 @@ HTML_TEMPLATE = r"""
             });
         }
 
+        // ========== 🛡️ Dwell Monitor Guardian：增强版（状态灯 + 健康指标 + 告警展示 + 恢复任务） ==========
+        let _dm_poll_timer = null;
+
+        function _dmRenderStatus(payload) {
+            const running = !!payload.running;
+            const s = payload.snapshot || {};
+            const alerts = payload.alerts || [];
+
+            // ---- 状态灯 ----
+            const light = document.getElementById('dm-status-light');
+            const statusText = document.getElementById('dm-status-text');
+            const resumeBtn = document.getElementById('btn-dm-resume');
+            if (light && statusText) {
+                if (!running) {
+                    light.style.background = '#6b7280';
+                    light.style.boxShadow = '0 0 6px #6b7280';
+                    light.title = '未启动';
+                    statusText.textContent = '未启动';
+                    statusText.style.color = '#9ca3af';
+                    if (resumeBtn) resumeBtn.style.display = 'none';
+                } else if ((s.crit || 0) > 0) {
+                    light.style.background = '#ef4444';
+                    light.style.boxShadow = '0 0 10px #ef4444';
+                    light.title = '异常：存在 CRITICAL 告警';
+                    statusText.textContent = '异常 (CRIT=' + (s.crit||0) + ')';
+                    statusText.style.color = '#ef4444';
+                    if (resumeBtn) resumeBtn.style.display = 'inline-block';
+                } else if ((s.warn || 0) > 0) {
+                    light.style.background = '#fbbf24';
+                    light.style.boxShadow = '0 0 10px #fbbf24';
+                    light.title = '警告：存在 WARNING 告警';
+                    statusText.textContent = '警告 (WARN=' + (s.warn||0) + ')';
+                    statusText.style.color = '#fbbf24';
+                    if (resumeBtn) resumeBtn.style.display = 'inline-block';
+                } else {
+                    light.style.background = '#10b981';
+                    light.style.boxShadow = '0 0 10px #10b981';
+                    light.title = '正常运行';
+                    statusText.textContent = '正常 (pid=' + (payload.pid || '?') + ')';
+                    statusText.style.color = '#10b981';
+                    if (resumeBtn) resumeBtn.style.display = 'none';
+                }
+            }
+
+            // ---- 健康度指标 ----
+            const avgDwell = document.getElementById('dm-avg-dwell');
+            const bounceRate = document.getElementById('dm-bounce-rate');
+            const critCount = document.getElementById('dm-crit-count');
+            const warnCount = document.getElementById('dm-warn-count');
+            const okCount = document.getElementById('dm-ok-count');
+            const consecCrit = document.getElementById('dm-consec-crit');
+            if (avgDwell) avgDwell.textContent = (s.avg_dwell_last120 || 0).toFixed(0);
+            if (bounceRate) bounceRate.textContent = (s.win_bounce_pct || 0).toFixed(1);
+            if (critCount) { critCount.textContent = s.crit || 0; critCount.style.color = (s.crit||0) > 0 ? '#f87171' : '#d1d5db'; }
+            if (warnCount) { warnCount.textContent = s.warn || 0; warnCount.style.color = (s.warn||0) > 0 ? '#fbbf24' : '#d1d5db'; }
+            if (okCount) okCount.textContent = s.ok || 0;
+            if (consecCrit) {
+                const cc = payload.consecutive_crit || 0;
+                if (cc > 0) {
+                    consecCrit.style.display = 'inline';
+                    consecCrit.querySelector('b').textContent = cc;
+                } else {
+                    consecCrit.style.display = 'none';
+                }
+            }
+
+            // ---- 最近3条告警 ----
+            const alertsBox = document.getElementById('dm-alerts-box');
+            if (alertsBox) {
+                if (!running) {
+                    alertsBox.innerHTML = '<span style="color:#6b7280;">等待监控启动...</span>';
+                } else if (alerts.length === 0) {
+                    alertsBox.innerHTML = '<span style="color:#34d399;">✅ 无告警记录</span>';
+                } else {
+                    const recent = alerts.slice(-3).reverse();
+                    alertsBox.innerHTML = recent.map(function(a) {
+                        const sevColor = a.severity === 'CRITICAL' ? '#ef4444' : (a.severity === 'DEGRADE' ? '#c084fc' : (a.severity === 'WARNING' ? '#fbbf24' : '#9ca3af'));
+                        const sevBadge = '[' + (a.severity || '?').substring(0,4) + ']';
+                        return '<div style="margin-bottom:2px;"><span style="color:' + sevColor + '; font-weight:600;">' + sevBadge + '</span> <span style="color:#9ca3af;">' + (a.ts||'').substring(11,19) + '</span> ' + (a.title||'').substring(0,60) + '</div>';
+                    }).join('');
+                }
+            }
+        }
+
+        async function refreshDwellMonitorStatus() {
+            try {
+                const r = await fetch('/dwell_monitor/status');
+                const j = await r.json();
+                _dmRenderStatus(j);
+            } catch (_) {
+                const statusText = document.getElementById('dm-status-text');
+                if (statusText) { statusText.textContent = '获取状态失败'; statusText.style.color = '#f87171'; }
+            }
+        }
+
+        async function toggleDwellMonitor(startFlag) {
+            const noPause = document.getElementById('dm-no-pause') ? document.getElementById('dm-no-pause').checked : false;
+            try {
+                const url = startFlag ? '/dwell_monitor/start' : '/dwell_monitor/stop';
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({no_auto_pause: noPause})
+                });
+                const data = await resp.json();
+                if (!data.success) {
+                    alert('操作失败: ' + (data.message || '未知错误'));
+                    return;
+                }
+                if (startFlag) {
+                    if (_dm_poll_timer) clearInterval(_dm_poll_timer);
+                    _dm_poll_timer = setInterval(refreshDwellMonitorStatus, 3000);
+                    setTimeout(refreshDwellMonitorStatus, 300);
+                } else {
+                    if (_dm_poll_timer) { clearInterval(_dm_poll_timer); _dm_poll_timer = null; }
+                    setTimeout(refreshDwellMonitorStatus, 300);
+                }
+                alert(startFlag ? '已启动停留/跳出率监控守护' : '已停止停留/跳出率监控守护');
+            } catch (e) {
+                alert('操作异常: ' + e);
+            }
+        }
+
+        async function resumeTaskFromMonitor() {
+            // 先尝试 /start_task 恢复任务（无专用 /resume_task 路由时使用 start_task）
+            try {
+                const resp = await fetch('/start_task', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status === 'ok') {
+                    alert('任务已恢复运行');
+                    location.reload();
+                } else if (data.status === 'error' && data.message && data.message.indexOf('已有任务') >= 0) {
+                    alert('任务已在运行中，无需恢复');
+                } else {
+                    alert('恢复任务: ' + JSON.stringify(data));
+                }
+            } catch (e) {
+                alert('恢复任务失败: ' + e);
+            }
+        }
+
+        // 页面加载时检查并尝试拉状态
+        document.addEventListener('DOMContentLoaded', function() {
+            setTimeout(refreshDwellMonitorStatus, 600);
+        });
+
         function resetConfig() {
             resetDefaults('all');
         }
@@ -5385,16 +6670,31 @@ HTML_TEMPLATE = r"""
         }
 
         // 刷新日志窗口（供定时轮询和手动刷新复用）
+        let _lastLogHTML = '';  // 缓存上次日志内容，避免无变化时重绘闪烁
         function refreshLogBox() {
             const logModeEl = document.querySelector('input[name="log_mode"]:checked');
             const logMode = logModeEl ? logModeEl.value : 'test';
-            return fetch('/get_logs?mode=' + encodeURIComponent(logMode) + '&limit=500').then(r => r.text()).then(html => {
+            return fetch('/get_logs?mode=' + encodeURIComponent(logMode) + '&limit=500').then(r => {
+                if (!r.ok) return null;  // HTTP错误时不更新
+                return r.text();
+            }).then(html => {
+                if (html === null) return;  // 请求失败，保留当前内容
                 const logBox = document.getElementById('logBox');
                 const autoScrollCheckbox = document.getElementById('autoScroll');
                 const filterSelect = document.getElementById('logFilter');
                 const isAutoScroll = autoScrollCheckbox ? autoScrollCheckbox.checked : true;
                 
                 if (logBox) {
+                    // ★ 防闪烁：内容未变化时跳过DOM更新
+                    if (html === _lastLogHTML) {
+                        return;  // 日志无变化，不重绘
+                    }
+                    // ★ 防闪烁：返回空内容时不清空已有日志
+                    if (!html && logBox.innerHTML) {
+                        return;
+                    }
+                    _lastLogHTML = html;
+                    
                     // 更新日志内容，接口和前端双重限制日志行数，避免 DOM 过大卡死
                     if (isAutoScroll) {
                         logBox.innerHTML = html;
@@ -5414,7 +6714,7 @@ HTML_TEMPLATE = r"""
                         filterLogs();
                     }
                 }
-            });
+            }).catch(() => {});  // 网络异常静默忽略，保留当前日志
         }
 
         // 更新日志
@@ -5474,7 +6774,7 @@ HTML_TEMPLATE = r"""
                         
                         const statusInfo = `
                             <div style="display:flex; flex-direction:column; gap:2px;">
-                                <div><span style="color:#888;">计划:</span> <span style="color:#00aaff; font-weight:bold;">${task.idx}/${websiteStatus.total_tasks}</span> <span style="color:#888;">时间:</span> <span>${task.plan_time || '-'}</span></div>
+                                <div><span style="color:#888;">计划:</span> <span style="color:#00aaff; font-weight:bold;">${task.idx}/${websiteStatus.total_tasks}</span> <span style="color:#888;">时间:</span> <span>${task.plan_time || '-'} (北京时间)</span></div>
                                 <div><span style="color:#888;">代理:</span> <span>${task.proxy_country || '-'}</span> <span style="color:#888;">开始:</span> <span>${task.start_time || '-'}</span> <span style="color:#888;">状态:</span> <span style="color:${statusColor}; font-weight:bold;">${statusText}</span></div>
                             </div>
                         `;
@@ -5529,7 +6829,7 @@ HTML_TEMPLATE = r"""
                     statusItems[3].querySelector('.stat-number').textContent = status.fail;
                 }
             });
-        }, 1000);
+        }, 2000);  // ★ 2秒轮询（原1秒太频繁导致闪烁）
         
         function addEngine() {
             const container = document.getElementById('engines-container');
@@ -6588,6 +7888,66 @@ def page_body_text_content(page, default=""):
         return default
 
 
+import threading as _watchdog_threading
+
+
+def _safe_page_wait(page, min_wait=2.5, max_wait=5.5, ad_wait=False, deadline=None):
+    """替代 wait_until='networkidle'（AdSense页面永远达不到，会卡死）。
+
+    策略：domcontentloaded + 温和随机等待；若目标站包含广告，则额外等广告元素最多 4s。
+    """
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=45000)
+    except Exception as _e:
+        log.debug(f"[_safe_page_wait] domcontentloaded 等待放弃: {type(_e).__name__}")
+    t = random.uniform(min_wait, max_wait)
+    if deadline:
+        t = min(t, max(0.5, deadline - time.time()))
+    if t > 0:
+        time.sleep(t)
+    if ad_wait:
+        try:
+            page.wait_for_selector(
+                "ins.adsbygoogle, [data-ad-client], .ad-container, [class*='adsbygoogle'], [id*='ad-wrapper']",
+                timeout=4000,
+            )
+        except Exception:
+            pass
+
+
+def _hard_timeout_goto(page, url, timeout=60, **kwargs):
+    """page.goto 的硬超时封装（避免低质量代理在 SSL connect 阶段卡死）。
+
+    Playwright/Selenium 的 timeout 参数只约束"完成度"；代理 TCP/SSL 握手失败时
+    底层可能不触发 timeout，这里用线程 join 做真正的兜底 kill。
+    """
+    result = [None]
+    exc = [None]
+
+    def _run():
+        try:
+            # 把软超时也传进去（但硬超时 = timeout + 8 秒兜底）
+            if "timeout" not in kwargs:
+                kwargs["timeout"] = timeout * 1000
+            result[0] = page.goto(url, **kwargs)
+        except Exception as e:
+            exc[0] = e
+
+    worker = _watchdog_threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout + 8)
+    if worker.is_alive():
+        log.error(f"🚫 [_hard_timeout_goto] 硬超时({timeout + 8}s)：{str(url)[:120]}，尝试关闭页面兜底")
+        try:
+            page.close()
+        except Exception:
+            pass
+        raise TimeoutError(f"page.goto 硬超时: {str(url)[:120]}")
+    if exc[0]:
+        raise exc[0]
+    return result[0]
+
+
 def page_has_meaningful_content(page, min_chars=30):
     """
     温和地判断页面是否加载出了内容：
@@ -6670,8 +8030,16 @@ def is_cloudflare_challenge(page):
                 ];
                 return challengeSelectors.some(selector => document.querySelector(selector) !== null);
             }
-        """, default=False)
-        return bool(has_cloudflare_challenge)
+        """, default="false")
+        try:
+            if isinstance(has_cloudflare_challenge, bool):
+                return has_cloudflare_challenge
+            if isinstance(has_cloudflare_challenge, str):
+                _s = has_cloudflare_challenge.strip().lower()
+                return _s == "true" or _s == "1"
+            return bool(has_cloudflare_challenge)
+        except Exception:
+            return False
     except Exception as e:
         log.debug(f"检测Cloudflare验证挑战时出错: {e}")
         return False
@@ -6698,8 +8066,8 @@ def solve_cloudflare_challenge(page):
         except Exception:
             pass
             
-        # 等待验证过程完成
-        page.wait_for_load_state("networkidle", timeout=60000)
+        # 等待验证过程完成（networkidle → _safe_page_wait）
+        _safe_page_wait(page, min_wait=3.0, max_wait=6.0, ad_wait=False)
         
         # 检查是否还有挑战
         if is_cloudflare_challenge(page):
@@ -6847,30 +8215,65 @@ def qa_infer_platform_from_ua(user_agent):
 
 
 def qa_log_fingerprint_ip_consistency(ip_info, fingerprint):
+    """QA指纹与IP一致性校验（阻断式：不一致时返回False，调用方必须拒绝该IP）"""
     country_code = (ip_info or {}).get("country_code") or "未知"
+    ip_timezone = (ip_info or {}).get("timezone") or ""
+    ip_language = (ip_info or {}).get("language") or ""
     expected_tz = get_timezone_for_country(country_code) if country_code != "未知" else None
     expected_lang = qa_country_language_default(country_code)
     actual_lang = fingerprint.get("language")
     actual_tz = fingerprint.get("timezone")
     ua = fingerprint.get("user_agent", "")
     platform = fingerprint.get("platform", "")
+
+    # ★ 严格一致性判定
+    tz_ok = bool(actual_tz) and bool(ip_timezone) and actual_tz == ip_timezone
+    lang_ok = bool(actual_lang) and bool(ip_language) and actual_lang == ip_language
+    # 时区与国家的交叉校验：指纹时区必须属于该国家的合理时区
+    tz_country_ok = True
+    if expected_tz and actual_tz:
+        # 允许同国家多时区（如US有4个），但绝不允许跨洲
+        from ip_info_resolver import COUNTRY_TO_TIMEZONE as _CC_TZ
+        _valid_tz = _CC_TZ.get(country_code, expected_tz)
+        tz_country_ok = (actual_tz == _valid_tz) or (actual_tz == expected_tz)
+        # 额外：如果IP返回的时区与指纹时区一致，也通过
+        if not tz_country_ok and ip_timezone == actual_tz:
+            tz_country_ok = True
+
     checks = {
         "country": country_code,
         "timezone_expected": expected_tz,
         "timezone_actual": actual_tz,
-        "timezone_ok": bool(expected_tz and actual_tz == expected_tz) or bool(actual_tz),
+        "timezone_ip": ip_timezone,
+        "timezone_ok": tz_ok,
+        "tz_country_ok": tz_country_ok,
         "language_expected": expected_lang,
         "language_actual": actual_lang,
+        "language_ip": ip_language,
+        "language_ok": lang_ok,
         "language_prefix_ok": (actual_lang or "").split("-")[0] == expected_lang.split("-")[0],
         "ua_family_ok": ("Chrome/" in ua or "Edg/" in ua or "Chromium/" in ua) and "Firefox/" not in ua and "Version/" not in ua,
         "platform_ok": qa_infer_platform_from_ua(ua) == platform,
         "resolution": fingerprint.get("resolution"),
     }
-    log.info(
-        f"[QA一致性] country={checks['country']} lang={actual_lang}/{expected_lang} "
-        f"tz={actual_tz}/{expected_tz} ua_chromium={checks['ua_family_ok']} "
-        f"platform={platform} platform_ok={checks['platform_ok']} resolution={checks['resolution']}"
-    )
+
+    # ★ 阻断判定：时区或语言与IP信息不一致 → 拒绝
+    all_ok = tz_ok and lang_ok and tz_country_ok
+    if not all_ok:
+        log.error(
+            f"🚫 [QA一致性] 指纹与IP不一致！拒绝该IP！"
+            f" country={country_code}, "
+            f"tz: 指纹={actual_tz} vs IP={ip_timezone} (ok={tz_ok}), "
+            f"lang: 指纹={actual_lang} vs IP={ip_language} (ok={lang_ok}), "
+            f"tz_country_ok={tz_country_ok}"
+        )
+    else:
+        log.info(
+            f"[QA一致性] ✅ country={country_code} lang={actual_lang}/{expected_lang} "
+            f"tz={actual_tz}/{expected_tz} ua_chromium={checks['ua_family_ok']} "
+            f"platform={platform} platform_ok={checks['platform_ok']} resolution={checks['resolution']}"
+        )
+    checks["all_consistent"] = all_ok
     return checks
 
 
@@ -6911,9 +8314,17 @@ def generate_fingerprint(ip_info):
     # 常用时区到语言映射需在语言反查前初始化，避免局部变量未绑定
     timezone_lang_map = {
         "Europe/London": "en-GB", "Europe/Paris": "fr-FR", "Europe/Berlin": "de-DE",
+        "Europe/Dublin": "en-IE", "Europe/Madrid": "es-ES", "Europe/Rome": "it-IT",
+        "Europe/Moscow": "ru-RU", "Europe/Amsterdam": "nl-NL",
         "America/New_York": "en-US", "America/Chicago": "en-US", "America/Denver": "en-US", "America/Los_Angeles": "en-US",
-        "Asia/Shanghai": "zh-CN", "Asia/Tokyo": "ja-JP", "Asia/Singapore": "en-SG", "Asia/Hong_Kong": "zh-HK",
-        "Asia/Jakarta": "id-ID", "Australia/Sydney": "en-AU", "Pacific/Auckland": "en-NZ"
+        "America/Toronto": "en-CA", "America/Vancouver": "en-CA",
+        "America/Sao_Paulo": "pt-BR", "America/Mexico_City": "es-MX",
+        "Asia/Shanghai": "zh-CN", "Asia/Tokyo": "ja-JP", "Asia/Seoul": "ko-KR",
+        "Asia/Singapore": "en-SG", "Asia/Hong_Kong": "zh-HK", "Asia/Taipei": "zh-TW",
+        "Asia/Jakarta": "id-ID", "Asia/Kolkata": "en-IN", "Asia/Bangkok": "th-TH",
+        "Australia/Sydney": "en-AU", "Australia/Melbourne": "en-AU",
+        "Pacific/Auckland": "en-NZ",
+        "Africa/Johannesburg": "en-ZA", "Africa/Lagos": "en-NG", "Africa/Cairo": "ar-EG"
     }
 
     # ---- 2. 语言：优先 ip_info.language，其次时区反查，均失败则返回 None ----
@@ -7015,9 +8426,31 @@ def generate_fingerprint(ip_info):
         "America/Fortaleza": "pt-BR"
     }
     
-    # 根据语言前缀选择 User-Agent（使用 UA 池管理器）
+    # 根据语言前缀选择 User-Agent（使用 UA 池管理器 P2-1：国家+小时段缓存7天）
     lang_prefix = ip_language.split("-")[0]
-    user_agent = ua_pool_manager.get_ua(lang_prefix, browser_family="chromium")
+    # P2-1：country_code 优先从 ip_info.country_code 取（如 US/JP/CN/...），
+    #       若缺失则从 ip_language / ip_timezone 推导，保证 UA 按 {国家+小时段} 命中同一个 UA。
+    _country_for_ua = (ip_info or {}).get("country_code")
+    if not _country_for_ua:
+        try:
+            # 从 BCP47 语言推导（en-US → US, zh-CN → CN, ja-JP → JP）
+            _split = (ip_language or "").split("-")
+            if len(_split) >= 2 and len(_split[-1]) == 2:
+                _country_for_ua = _split[-1].upper()
+        except Exception:
+            _country_for_ua = None
+    if not _country_for_ua:
+        # 再兜底：从 timezone 反向到国家（使用 COUNTRY_TIMEZONE_MAP 的反向映射）
+        try:
+            _rev = {}
+            for _cc, _tz in COUNTRY_TIMEZONE_MAP.items():
+                if isinstance(_tz, str):
+                    _rev.setdefault(_tz, _cc.upper())
+            if ip_timezone and ip_timezone in _rev:
+                _country_for_ua = _rev[ip_timezone]
+        except Exception:
+            _country_for_ua = None
+    user_agent = ua_pool_manager.get_ua(lang_prefix, browser_family="chromium", country_code=_country_for_ua)
     platform = qa_infer_platform_from_ua(user_agent)
     
     # 根据语言选择字体列表
@@ -7038,6 +8471,15 @@ def generate_fingerprint(ip_info):
     ]
     _gpu_vendor, _gpu_renderer = random.choice(_gpu_combos)
     
+    # P2-2 指纹独立种子（不再共享 random 状态）
+    if _HAS_RCE:
+        _fp_id = ip_info.get('country_code', 'XX') if isinstance(ip_info, dict) else 'XX'
+        if 'user_agent' in dir() and user_agent:
+            _fp_id = f"{_fp_id}|{user_agent[:32]}"
+        canvas_noise_seed = _rce.fingerprint_seed.get(_fp_id)
+    else:
+        canvas_noise_seed = random.randint(1, 2**31 - 1)
+    
     return {
         "fingerprint_id": str(uuid.uuid4()),
         "user_agent": user_agent,
@@ -7049,7 +8491,7 @@ def generate_fingerprint(ip_info):
         "webgl": uuid.uuid4().hex,
         "webgl_vendor": _gpu_vendor,
         "webgl_renderer": _gpu_renderer,
-        "canvas_noise_seed": random.randint(1, 2**31 - 1),
+        "canvas_noise_seed": canvas_noise_seed,
         "fonts": fonts_shuffled,
         "platform": platform,
         "hardware_concurrency": random.choice([4, 8, 12, 16]),
@@ -7130,22 +8572,25 @@ def simulate_human_behavior(page, ad_selector, config):
             behavior_stats["waits"] += 1
             behavior_stats["total_stay"] += int(wait_time * 1000)  # 转换为毫秒
     
-    # 4. 模拟页面滚动（观看过程中可能会滚动页面）
+    # 4. 模拟页面滚动（观看过程中可能会滚动页面）★ 从配置读取参数
     log.info("📜 模拟页面滚动")
-    scroll_count = random.randint(0, 2)  # 随机滚动0-2次
+    _scroll_cfg = config.get("scroll_pixels", {"min": 200, "max": 1000})
+    _scroll_wait_cfg = config.get("scroll_wait", {"min": 0.5, "max": 5})
+    _scroll_count_cfg = config.get("scroll_count", {"min": 2, "max": 10})
+    scroll_count = min(random.randint(0, max(2, int(_scroll_count_cfg.get("min", 2)))), 3)
     for _ in range(scroll_count):
-        scroll_amount = random.randint(-200, 200)
+        scroll_amount = random.randint(-int(_scroll_cfg.get("max", 1000)) // 2, int(_scroll_cfg.get("max", 1000)) // 2)
         page.evaluate(f"window.scrollBy(0, {scroll_amount})")
         behavior_stats["scrolls"] += 1
         behavior_stats["scroll_distance"] += abs(scroll_amount)
-        wait_time = random.uniform(0.5, 1.5)
+        wait_time = random.uniform(float(_scroll_wait_cfg.get("min", 0.5)), float(_scroll_wait_cfg.get("max", 5)))
         time.sleep(wait_time)
         behavior_stats["waits"] += 1
         behavior_stats["total_stay"] += int(wait_time * 1000)  # 转换为毫秒
     
     # 5. 模拟鼠标移动到随机位置（使用贝塞尔曲线）
     log.info("🖱️ 随机移动鼠标")
-    mouse_move_count = random.randint(2, 5)
+    mouse_move_count = random.randint(int(config.get("mouse_move_count", {}).get("min", 2)), int(config.get("mouse_move_count", {}).get("max", 20)))
     for _ in range(mouse_move_count):
         target_x = random.randint(100, 1800)
         target_y = random.randint(100, 900)
@@ -7156,7 +8601,8 @@ def simulate_human_behavior(page, ad_selector, config):
         current_x, current_y = target_x, target_y
         behavior_stats["mouse_moves"] += 1
         
-        move_wait = random.uniform(0.5, 1.5)
+        _mouse_wait_cfg = config.get("mouse_move_wait", {"min": 0.1, "max": 1.0})
+        move_wait = random.uniform(float(_mouse_wait_cfg.get("min", 0.1)), float(_mouse_wait_cfg.get("max", 1.0)))
         time.sleep(move_wait)
         behavior_stats["waits"] += 1
         behavior_stats["total_stay"] += int(move_wait * 1000)  # 转换为毫秒
@@ -7183,80 +8629,221 @@ def simulate_human_behavior(page, ad_selector, config):
     if ad_elements:
         ad_element = random.choice(ad_elements)
         try:
-            # === 自然滚动到广告位置（渐进式，模拟用户边读内容边往下翻） ===
+            # ============================================================
+            # ★ P0-1 重写：广告点击前摇（真人浏览路径，避免"直奔广告"）
+            # 顺序：1. 在正文段落停留阅读 → 2. 滚动到广告露出上边缘 → 3. 鼠标路过广告外侧 →
+            #       4. 回扫到广告 → 5. 凝视微抖动 → 6. ActiveView可见性校验 → 7. click
+            # ============================================================
+            # 1) 先在正文其他内容区停留（模拟先看正文，广告是顺带看到的）
+            _anchors_raw = page_eval(page, """() => {
+              try {
+                const arr = Array.from(document.querySelectorAll(
+                  'article p, main p, .content p, .entry-content p, section p, [class*="post"] p'
+                ));
+                return arr.slice(0, 10).map(p => {
+                  const r = p.getBoundingClientRect();
+                  return r.width > 100 && r.height > 15
+                    ? {x: r.x + r.width*0.5, y: r.y + r.height*0.5}
+                    : null;
+                }).filter(Boolean);
+              } catch(e){ return []; }
+            }""", default=[])
+            read_anchors = []
             try:
-                ad_box_raw = ad_element.bounding_box()
-                if ad_box_raw:
-                    # 分 2~4 次渐进滚动到广告附近（而不是一步到位）
-                    _scroll_steps = random.randint(2, 4)
-                    for _si in range(_scroll_steps):
-                        _step_px = random.randint(150, 450)
-                        page.evaluate(f"window.scrollBy(0, {_step_px})")
-                        behavior_stats["scrolls"] += 1
-                        behavior_stats["scroll_distance"] += _step_px
-                        # 每次滚动后“阅读”停顿
-                        _read_pause = random.uniform(0.8, 2.5)
-                        time.sleep(_read_pause)
-                        behavior_stats["waits"] += 1
-                        behavior_stats["total_stay"] += int(_read_pause * 1000)
-                    # 最后确保广告可见
-                    ad_element.scroll_into_view_if_needed()
-                    behavior_stats["scrolls"] += 1
+                if isinstance(_anchors_raw, list):
+                    read_anchors = [a for a in _anchors_raw if isinstance(a, dict) and "x" in a and "y" in a]
             except Exception:
-                ad_element.scroll_into_view_if_needed()
-                behavior_stats["scrolls"] += 1
-            
-            # 获取广告元素的中心位置
-            box = ad_element.bounding_box()
+                read_anchors = []
+            _used_anchor_count = 0
+            if len(read_anchors) >= 2:
+                _k = min(4, len(read_anchors))
+                _sample_n = random.randint(2, _k)
+                import random as _r_a
+                for rp in _r_a.sample(read_anchors, k=_sample_n):
+                    tx = int(rp.get('x', 500)); ty = int(rp.get('y', 400))
+                    human_mouse_move(page, current_x, current_y, tx, ty, config)
+                    current_x, current_y = tx, ty
+                    _rp = random.uniform(2.5, 7.0)
+                    time.sleep(_rp)
+                    behavior_stats["total_stay"] += int(_rp * 1000)
+                    _used_anchor_count += 1
+            else:
+                # 兜底：在 (200,300)~(1400,900) 随机停留 2~4 处
+                for _ in range(random.randint(2, 4)):
+                    tx, ty = random.randint(200, 1400), random.randint(300, 900)
+                    human_mouse_move(page, current_x, current_y, tx, ty, config)
+                    current_x, current_y = tx, ty
+                    time.sleep(random.uniform(2.0, 5.5))
+
+            ad_box_pre = None
+            try:
+                ad_box_pre = ad_element.bounding_box()
+            except Exception:
+                ad_box_pre = None
+            # 2) 滚动到广告上方 80~150px（只露出广告上边缘，像真人自然滚动那样慢慢进入视野）
+            if ad_box_pre:
+                try:
+                    target_top = max(0, int(ad_box_pre["y"]) - random.randint(80, 150))
+                    page.evaluate(f"window.scrollTo(0, {target_top})")
+                    time.sleep(random.uniform(2.5, 9.0))
+                    # 再慢慢滚 1~2 次 30~80px，让广告自然入视
+                    for _ in range(random.randint(1, 2)):
+                        pxs = random.randint(30, 80)
+                        page.evaluate(f"window.scrollBy(0, {pxs})")
+                        time.sleep(random.uniform(0.8, 2.5))
+                except Exception:
+                    pass
+
+            # 再次获取广告 box（滚动后位置改变）
+            box = None
+            try:
+                box = ad_element.bounding_box()
+            except Exception:
+                box = None
+            ad_center_x = current_x
+            ad_center_y = current_y
             if box:
-                # 不精确瞄准中心，添加随机偏移（模拟人类视觉焦点不精确）
                 ad_center_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
                 ad_center_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-                
-                # 使用贝塞尔曲线移动到广告附近
-                human_mouse_move(page, current_x, current_y, ad_center_x, ad_center_y, config)
-                current_x, current_y = ad_center_x, ad_center_y
-                
-                # 微观犹豫：人类看到广告后会有短暂停顿（0.3~1.2s）
-                _hesitation = random.uniform(0.3, 1.2)
-                time.sleep(_hesitation)
-                behavior_stats["total_stay"] += int(_hesitation * 1000)
-            
-            # 在广告区域停留
+                # 3) 鼠标先从阅读点移动到广告"外侧"（路过效果），再回扫到广告
+                side = random.choice(["left", "right", "bottom"])
+                if side == "left":
+                    pass_x = box["x"] - random.randint(60, 120)
+                    pass_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                elif side == "right":
+                    pass_x = box["x"] + box["width"] + random.randint(60, 120)
+                    pass_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+                else:
+                    pass_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+                    pass_y = box["y"] + box["height"] + random.randint(60, 120)
+                human_mouse_move(page, current_x, current_y, int(pass_x), int(pass_y), config)
+                current_x, current_y = int(pass_x), int(pass_y)
+                time.sleep(random.uniform(0.35, 1.1))  # 路过的短暂停顿
+                # 4) 回扫到广告中心
+                human_mouse_move(page, current_x, current_y, int(ad_center_x), int(ad_center_y), config)
+                current_x, current_y = int(ad_center_x), int(ad_center_y)
+
+            # 5) 凝视阶段：1.5~3.5s 内 ±4px 微抖动（模拟眼球带动鼠标）
+            _gaze_start = time.time()
+            _gaze_dur = random.uniform(1.5, 3.5)
+            while time.time() - _gaze_start < _gaze_dur:
+                try:
+                    page.mouse.move(
+                        int(ad_center_x + random.randint(-4, 4)),
+                        int(ad_center_y + random.randint(-4, 4)),
+                        steps=random.randint(3, 8),
+                    )
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.15, 0.4))
+            behavior_stats["total_stay"] += int(_gaze_dur * 1000)
+
+            # ★ ad_stay_time 不再让鼠标钉死在广告上（100%机器人特征）
+            # 改为：鼠标离开广告区到下方正文继续阅读，期间累计 ad_stay（表示用户把广告留在视野里阅读正文）
             ad_stay_time = get_random_value(config["ad_stay_time"])
-            time.sleep(ad_stay_time)
-            behavior_stats["ad_stay"] = int(ad_stay_time * 1000)  # 转换为毫秒
+            _ad_stay_end = time.time() + ad_stay_time
+            _away_targets = [
+                (int(ad_center_x) + random.randint(-80, -20), int(ad_center_y) + random.randint(80, 160)),
+                (int(ad_center_x) + random.randint(20, 80), int(ad_center_y) + random.randint(140, 220)),
+            ]
+            away_x, away_y = random.choice(_away_targets)
+            human_mouse_move(page, current_x, current_y, away_x, away_y, config)
+            current_x, current_y = away_x, away_y
+            while time.time() < _ad_stay_end:
+                _chunk = min(random.uniform(1.5, 3.5), _ad_stay_end - time.time())
+                if _chunk > 0:
+                    time.sleep(_chunk)
+                # 偶尔微移
+                if random.random() < 0.3:
+                    try:
+                        page.mouse.move(
+                            current_x + random.randint(-12, 12),
+                            current_y + random.randint(-12, 12),
+                            steps=random.randint(2, 6),
+                        )
+                    except Exception:
+                        pass
+            behavior_stats["ad_stay"] = int(ad_stay_time * 1000)
             behavior_stats["total_stay"] += int(ad_stay_time * 1000)
-            
+
             # 模拟点击广告的概率
             ad_click_prob = get_random_value(config["ad_click_prob"])
             if random.random() < ad_click_prob:
                 # 单日点击上限校验（跨任务/跨会话持久化）
                 if daily_ad_click_limit_reached():
-                    log.warning(f"🚫 今日广告点击已达上限({config.get('daily_ad_click_limit')})，本次跳过点击")
+                    _dl = fingerprint_stats.get('daily_ad_click_limits', {}).get(_today_key(), '?')
+                    log.warning(
+                        f"🚫 今日广告点击已达上限(当日上限={_dl}，已点击={get_daily_ad_clicks()})，本次跳过点击")
                     raise StopIteration
+
+                # ★ P1-3：ActiveView 可见性校验（≥50% 面积 + ≥1s 可见），不达标跳过点击
+                _sel_js = config.get("ad_selector", ".ad-container, [class*='ad'], [id*='ad']")
+                _visible_ms = 0
+                try:
+                    _visible_ms_raw = page_eval(page, f"""() => {{
+                      return new Promise(function(resolve) {{
+                        try {{
+                          const sel = {json.dumps(_sel_js)};
+                          const el = document.querySelector(sel) || (document.querySelectorAll(sel) && document.querySelectorAll(sel)[0]);
+                          if (!el) return resolve(0);
+                          let seen = 0; let i = 0; const MAX = 12;
+                          const iv = setInterval(() => {{
+                            try {{
+                              const r = el.getBoundingClientRect();
+                              const vx = Math.max(0, Math.min(r.width, window.innerWidth - r.x));
+                              const vy = Math.max(0, Math.min(r.height, window.innerHeight - r.y));
+                              const ratio = (vx*vy) / Math.max(1, r.width*r.height);
+                              if (ratio >= 0.5) seen += 100; else seen = 0;
+                              if (seen >= 1000 || ++i > MAX) {{ clearInterval(iv); resolve(seen); return; }}
+                            }} catch(_) {{ clearInterval(iv); resolve(seen); return; }}
+                          }}, 100);
+                          setTimeout(() => {{ clearInterval(iv); resolve(seen); }}, 1400);
+                        }} catch(_) {{ resolve(0); }}
+                      }});
+                    }}""", default="0")
+                    try:
+                        _visible_ms = int(_visible_ms_raw)
+                    except Exception:
+                        _visible_ms = 0
+                except Exception:
+                    _visible_ms = 0
+                if _visible_ms < 800:
+                    log.warning(
+                        f"🚫 广告可见性不足(可见{_visible_ms}ms，未达ActiveView ≥50%且≥1s)，跳过点击")
+                    raise StopIteration
+
                 # 记录点击前的页面数量，用于检测广告落地页新标签（Playwright API）
                 _context = page.context
                 _pages_before = len(_context.pages)
 
-                # 鼠标已通过贝塞尔曲线移动到广告中心，用 CDP 真实鼠标点击（失败降级元素 click）
+                # 鼠标回到广告中心（微偏移），然后 click
                 try:
-                    page.mouse.click(ad_center_x, ad_center_y)
+                    final_cx = int(ad_center_x + random.randint(-6, 6))
+                    final_cy = int(ad_center_y + random.randint(-6, 6))
+                    page.mouse.move(final_cx, final_cy, steps=random.randint(6, 14))
+                    time.sleep(random.uniform(0.2, 0.6))
+                    page.mouse.click(final_cx, final_cy)
+                    current_x, current_y = final_cx, final_cy
                 except Exception:
-                    ad_element.click(force=True)
+                    try:
+                        ad_element.click(force=True)
+                    except Exception:
+                        pass
                 behavior_stats["clicks"] += 1
                 _today_clicks = record_ad_click(1)
-                log.info(f"🖱️ 广告点击已记录（今日累计 {_today_clicks} 次）")
+                log.info(f"🖱️ 广告点击已记录（今日累计 {_today_clicks} 次，可见{_visible_ms}ms）")
                 
                 ad_click_wait = get_random_value(config["ad_click_wait"])
                 time.sleep(ad_click_wait)
                 behavior_stats["waits"] += 1
                 behavior_stats["total_stay"] += int(ad_click_wait * 1000)
-
+                # 标记：本任务流程发生过"广告点击→新标签打开落地页→关闭返回原站"
+                did_return_after_ad = False
                 # ========== 广告点击后落地页真人行为（Playwright：检测新标签页→停留→滚动→关闭） ==========
                 try:
                     _pages_after = _context.pages
-                    if len(_pages_after) > _pages_before:
+                    _opened_new = len(_pages_after) > _pages_before
+                    if _opened_new:
                         _landing_page = _pages_after[-1]  # 最新打开的标签页
                         _lp_url = ""
                         try:
@@ -7271,14 +8858,16 @@ def simulate_human_behavior(page, ad_selector, config):
                         import math as _math_lp
                         _lp_stay = max(15, min(90, _math_lp.exp(random.gauss(_math_lp.log(25), 0.5))))
                         # 落地页滚动浏览（1~3 次）
-                        _lp_scrolls = random.randint(1, 3)
+                        _lp_scrolls = random.randint(1, max(1, min(3, int(config.get("scroll_count", {}).get("min", 2)))))
                         for _i in range(_lp_scrolls):
                             try:
-                                _dist = random.randint(200, 700)
+                                _lp_sp = config.get("scroll_pixels", {"min": 200, "max": 1000})
+                                _dist = random.randint(int(_lp_sp.get("min", 200)), int(_lp_sp.get("max", 1000)))
                                 _landing_page.evaluate(f"window.scrollBy(0, {_dist})")
                                 behavior_stats["scrolls"] += 1
                                 behavior_stats["scroll_distance"] += _dist
-                                time.sleep(random.uniform(1.5, 4.0))
+                                _lp_sw = config.get("scroll_wait", {"min": 0.5, "max": 5})
+                                time.sleep(random.uniform(float(_lp_sw.get("min", 0.5)), float(_lp_sw.get("max", 5))))
                             except Exception:
                                 break
                         # 落地页剩余停留时间
@@ -7300,10 +8889,89 @@ def simulate_human_behavior(page, ad_selector, config):
                             _landing_page.close()
                         except Exception:
                             pass
+                        # ★ 关闭落地页后，激活标记位，随后会执行"原站续读 15~40s"（P2-3）
+                        did_return_after_ad = True
                 except Exception as _lp_err:
                     log.debug(f"落地页行为处理异常（忽略）: {type(_lp_err).__name__}: {str(_lp_err)[:80]}")
         except Exception:
             pass
+    # 未命中任何广告点击分支：复位标记（避免外层误触发原站续读）
+    try:
+        did_return_after_ad = bool(did_return_after_ad) if "did_return_after_ad" in locals() else False
+    except Exception:
+        did_return_after_ad = False
+
+    # ========== ★ P2-3：落地页关闭后"原站续读 15~40s"（降低跳出率，Google Ads 会跟踪 bounce rate） ==========
+    # 真实用户：点完广告若内容不吸引，会关掉新标签回到原站继续看下文/相关推荐/底部评论；
+    # 机器人：点完广告直接 close 当前页（100%跳出，被 Ads Invalid Traffic 直接判定）
+    # 逻辑：仅在"发生过广告点击后原站仍然有效"时执行，通过 did_return_after_ad 标志位判断。
+    try:
+        if did_return_after_ad:
+            _after_stay = random.uniform(15, 40)
+            _t0_after = time.time()
+            log.info(f"🪂 P2-3：广告落地页已关闭，回到原站续读 {_after_stay:.1f}s（降低跳出率）")
+            # 1) 回扫到正文中部（模拟"回到刚才的位置继续看"）
+            try:
+                _mid_y_raw = page_eval(page, """() => {
+                  try {
+                    const ps = Array.from(document.querySelectorAll(
+                      'article p, main p, .entry-content p, [class*="content"] p, section p'
+                    ));
+                    if (ps && ps.length) {
+                      const idx = Math.max(0, Math.floor(ps.length * 0.5) - 1);
+                      const r = ps[idx].getBoundingClientRect();
+                      return Math.max(0, window.scrollY + r.top - 120);
+                    }
+                    const h = (document.body && document.body.scrollHeight) ? document.body.scrollHeight : 0;
+                    return h > 0 ? Math.max(0, Math.floor(h * 0.45)) : 0;
+                  } catch(e){ return 0; }
+                }""", default="0")
+                try:
+                    _mid_y = 0
+                    if isinstance(_mid_y_raw, (int, float)):
+                        _mid_y = int(_mid_y_raw)
+                    elif isinstance(_mid_y_raw, str):
+                        _mid_y = int(_mid_y_raw) if _mid_y_raw.strip() else 0
+                except Exception:
+                    _mid_y = 0
+                if _mid_y > 0:
+                    page.evaluate(f"window.scrollTo(0, {_mid_y})")
+            except Exception:
+                pass
+            # 2) 在正文 2~4 个位置停留阅读
+            try:
+                _read_spots = max(2, min(4, int(config.get("scroll_count", {}).get("min", 2))))
+            except Exception:
+                _read_spots = 2
+            _chunk = _after_stay / max(1, _read_spots + 2)
+            for _sp in range(_read_spots):
+                try:
+                    tx = max(50, min(1800, int(current_x) + random.randint(-120, 160)))
+                    ty = max(80, min(950, int(current_y) + random.randint(-120, 160)))
+                    human_mouse_move(page, current_x, current_y, tx, ty, config)
+                    current_x, current_y = tx, ty
+                except Exception:
+                    pass
+                try:
+                    px = random.randint(60, 140)
+                    page.evaluate(f"window.scrollBy(0, {px})")
+                except Exception:
+                    pass
+                time.sleep(max(0.5, _chunk + random.uniform(-0.6, 0.9)))
+                behavior_stats["total_stay"] += int(max(0.5, _chunk) * 1000)
+            # 3) 剩余时间自然阅读 + 偶尔向上滚动一下（回看一段）
+            _remain = max(0, _after_stay - (time.time() - _t0_after))
+            if random.random() < 0.4:
+                try:
+                    page.evaluate(f"window.scrollBy(0, -{random.randint(40, 100)})")
+                except Exception:
+                    pass
+            if _remain > 0:
+                time.sleep(_remain)
+                behavior_stats["total_stay"] += int(_remain * 1000)
+            log.info(f"🪂 原站续读完成（≈{_after_stay:.1f}s）")
+    except Exception as _after_read_err:
+        log.debug(f"原站续读阶段异常（忽略）: {type(_after_read_err).__name__}: {str(_after_read_err)[:80]}")
     
     # 随机点击页面其他位置（使用贝塞尔曲线移动过去）
     random_click_count = get_random_int(config["random_click_count"])
@@ -7485,16 +9153,19 @@ def navigate_vids_st_to_video(page, config, video_url):
     
     try:
         # 访问主页
-        page.goto("https://vids.st", timeout=60000)
-        page.wait_for_load_state("networkidle", timeout=30000)
-        
+        try:
+            _hard_timeout_goto(page, "https://vids.st", timeout=60, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
+
         # 查找导航菜单或视频列表
         # 查找视频链接或相关导航
         if page.query_selector('a[href*="/videos"]'):
             page.click('a[href*="/videos"]')
             log.info("✅ 点击视频导航菜单")
-            page.wait_for_load_state("networkidle", timeout=30000)
-            
+            _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
+
             # 在视频列表中查找目标视频
             # 这里只是一个示例，实际需要根据网站结构调整
             video_links = page.query_selector_all('a[href*="/v/"]')
@@ -7502,22 +9173,31 @@ def navigate_vids_st_to_video(page, config, video_url):
                 log.info(f"✅ 在视频列表中找到 {len(video_links)} 个视频")
                 # 可以尝试点击与目标视频相关的链接
                 # 或者直接跳转到目标视频页面
-                page.goto(video_url, timeout=60000)
-                page.wait_for_load_state("networkidle", timeout=30000)
+                try:
+                    _hard_timeout_goto(page, video_url, timeout=60, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
                 log.info("✅ 成功导航到视频页面")
                 return True
             else:
                 log.warning("⚠️ 在视频列表中未找到视频")
                 # 直接访问视频页面
-                page.goto(video_url, timeout=60000)
-                page.wait_for_load_state("networkidle", timeout=30000)
+                try:
+                    _hard_timeout_goto(page, video_url, timeout=60, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
                 return True
         else:
             log.warning("⚠️ 未找到视频导航菜单，直接访问视频页面")
-            page.goto(video_url, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
+            try:
+                _hard_timeout_goto(page, video_url, timeout=60, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
             return True
-            
+
     except Exception as e:
         log.error(f"❌ 导航到视频页面失败: {e}")
         return False
@@ -7544,12 +9224,8 @@ def simulate_vids_st_login(page, config):
         log.error(f"❌ 访问登录页面失败: {e}")
         return False
     
-    # 等待页面加载
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception as e:
-        log.error(f"❌ 登录页面加载超时: {e}")
-        return False
+    # 等待页面加载（networkidle → _safe_page_wait）
+    _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
     
     # 尝试查找登录表单
     try:
@@ -7567,9 +9243,9 @@ def simulate_vids_st_login(page, config):
                 page.click('button[type="submit"]')
                 log.info("✅ 点击登录按钮")
                 
-                # 等待登录完成
-                page.wait_for_load_state("networkidle", timeout=30000)
-                
+                # 等待登录完成（networkidle → _safe_page_wait）
+                _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
+
                 # 检查是否登录成功（通过检查是否有用户信息或仪表盘）
                 if page.query_selector('a[href="/dashboard"]') or page.query_selector('a[href="/profile"]'):
                     log.info("✅ 登录成功")
@@ -7649,33 +9325,63 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             navigate_success = navigate_vids_st_to_video(page, config, video_url)
             if not navigate_success:
                 log.warning("⚠️ 导航失败，但继续尝试直接访问视频页面")
-                page.goto(video_url, timeout=60000)
-                page.wait_for_load_state("networkidle", timeout=30000)
+                try:
+                    _hard_timeout_goto(page, video_url, timeout=60, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
         else:
             log.info(f"正在访问视频页面...")
-            page.goto(video_url, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
+            try:
+                _hard_timeout_goto(page, video_url, timeout=60, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=False)
         
         # 设置视频请求的Referer
         final_referer = referer_url
-        
+
+        # 兜底：若 select_video_referer_for_task 函数未定义，使用 config 默认值（避免 NameError）
+        def _safe_select_video_referer(cfg, idx):
+            try:
+                _ref_list = cfg.get("video_referers") or []
+                if isinstance(_ref_list, list) and _ref_list:
+                    return list(_ref_list)
+                if isinstance(cfg.get("seo"), dict):
+                    _kw = cfg["seo"].get("keywords") or []
+                    if isinstance(_kw, list) and _kw:
+                        try:
+                            from urllib.parse import quote as _q
+                            return [f"https://www.google.com/search?q={_q(str(_kw[0]))}"]
+                        except Exception:
+                            return [f"https://www.google.com/search?q={_kw[0]}"]
+                return ["https://www.google.com/"]
+            except Exception:
+                return ["https://www.google.com/"]
+
         # 对于udis视频，使用当前任务已选择的Referer；若没有则按任务序号0取列表首项
         if is_udis_video_url(original_video_url):
-            final_referer = config.get('current_video_referer') or select_video_referer_for_task(config, 0)[0]
+            final_referer = config.get('current_video_referer') or _safe_select_video_referer(config, 0)[0]
             log.info(f"🎯 udis视频，使用当前任务Referer: {final_referer}")
         else:
             # 非udis视频，如果没有传入referer，使用当前任务Referer或列表首项
             if not final_referer:
-                final_referer = config.get('current_video_referer') or select_video_referer_for_task(config, 0)[0]
+                final_referer = config.get('current_video_referer') or _safe_select_video_referer(config, 0)[0]
             log.info(f"📋 使用Referer: {final_referer}")
         
         # ==================== 第一步：Cloudflare 验证绕过 ====================
         log.info("🛡️ 开始 Cloudflare 验证绕过...")
         try:
-            # 访问目标页面，等待验证加载（使用更宽松的超时设置）
-            response = page.goto(video_url, timeout=180000, wait_until="domcontentloaded", referer=final_referer)
-            page.wait_for_load_state("networkidle", timeout=90000)
-            
+            # 访问目标页面，等待验证加载（使用更宽松的超时设置 + 硬超时兜底）
+            try:
+                response = _hard_timeout_goto(
+                    page, video_url, timeout=180,
+                    wait_until="domcontentloaded", referer=final_referer,
+                )
+            except Exception:
+                response = None
+            _safe_page_wait(page, min_wait=3.0, max_wait=6.0, ad_wait=False)
+
             # 检查是否存在Cloudflare验证挑战
             if is_cloudflare_challenge(page):
                 log.info("🔐 检测到Cloudflare验证挑战，开始处理...")
@@ -7705,9 +9411,15 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             # 尝试直接访问原始URL而不进行Cloudflare验证
             log.info("🔄 尝试直接访问原始URL，不进行Cloudflare验证...")
             try:
-                response = page.goto(video_url, timeout=180000, wait_until="domcontentloaded", referer=final_referer)
-                page.wait_for_load_state("networkidle", timeout=90000)
-                
+                try:
+                    response = _hard_timeout_goto(
+                        page, video_url, timeout=180,
+                        wait_until="domcontentloaded", referer=final_referer,
+                    )
+                except Exception:
+                    response = None
+                _safe_page_wait(page, min_wait=3.0, max_wait=6.0, ad_wait=False)
+
                 # 检查是否加载了视频播放器
                 try:
                     page.wait_for_selector("video", timeout=60000)
@@ -7721,7 +9433,8 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         
         # ==================== 第二步：真实用户交互 - 页面滚动 ====================
         log.info("🎭 模拟真实用户页面滚动...")
-        scroll_amount = random.randint(0, 500)
+        _sp_cfg2 = config.get("scroll_pixels", {"min": 200, "max": 1000})
+        scroll_amount = random.randint(0, int(_sp_cfg2.get("max", 1000)))
         page.evaluate(f"""
             window.scrollTo({{
                 top: {scroll_amount},
@@ -7730,7 +9443,8 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         """)
         behavior_stats["scrolls"] += 1
         behavior_stats["scroll_distance"] += scroll_amount
-        scroll_wait = random.randint(1000, 3000)
+        _sw_cfg2 = config.get("scroll_wait", {"min": 0.5, "max": 5})
+        scroll_wait = random.randint(int(float(_sw_cfg2.get("min", 0.5)) * 1000), int(float(_sw_cfg2.get("max", 5)) * 1000))
         if not video_interruptible_sleep(scroll_wait / 1000):
             log.warning("⛔ 任务已停止（滚动等待中）")
             return 0, current_x, current_y, behavior_stats
@@ -7769,7 +9483,8 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
                     behavior_stats["clicks"] += 1
                     play_button_found = True
                     log.info(f"✅ 点击播放按钮: {selector}")
-                    click_wait = random.randint(500, 1500)
+                    _rcw = config.get("random_click_wait", {"min": 0.5, "max": 2.0})
+                    click_wait = random.randint(int(float(_rcw.get("min", 0.5)) * 1000), int(float(_rcw.get("max", 2.0)) * 1000))
                     if not video_interruptible_sleep(click_wait / 1000):
                         log.warning("⛔ 任务已停止（点击等待中）")
                         return 0, current_x, current_y, behavior_stats
@@ -7850,20 +9565,40 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         
         # 先检查一下有没有video元素
         try:
-            has_video = page_eval(
+            _has_video_raw = page_eval(
                 page,
-                "() => { const v = document.querySelector('video'); return !!v; }",
-                default=False,
+                "() => { const v = document.querySelector('video'); return !!v ? '1' : '0'; }",
+                default="0",
             )
+            has_video = False
+            if isinstance(_has_video_raw, bool):
+                has_video = _has_video_raw
+            elif isinstance(_has_video_raw, str):
+                has_video = _has_video_raw.strip() in ("1", "true", "True")
+            else:
+                try:
+                    has_video = bool(_has_video_raw)
+                except Exception:
+                    has_video = False
             log.info(f"页面上有video元素吗: {'是' if has_video else '否'}")
             
             # 如果没有video元素，尝试查找iframe中的视频
             if not has_video:
-                has_iframe = page_eval(
+                _has_iframe_raw = page_eval(
                     page,
-                    "() => { const v = document.querySelector('iframe'); return !!v; }",
-                    default=False,
+                    "() => { const v = document.querySelector('iframe'); return !!v ? '1' : '0'; }",
+                    default="0",
                 )
+                has_iframe = False
+                if isinstance(_has_iframe_raw, bool):
+                    has_iframe = _has_iframe_raw
+                elif isinstance(_has_iframe_raw, str):
+                    has_iframe = _has_iframe_raw.strip() in ("1", "true", "True")
+                else:
+                    try:
+                        has_iframe = bool(_has_iframe_raw)
+                    except Exception:
+                        has_iframe = False
                 log.info(f"页面上有iframe元素吗: {'是' if has_iframe else '否'}")
         except Exception as e:
             log.debug(f"检查video元素失败: {str(e)}")
@@ -8069,14 +9804,18 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         max_scrolls = max(1, int(watch_time / 10))       # 每10秒最多一次滚动
         max_clicks = max(1, int(watch_time / 15))        # 每15秒最多一次点击
         
-        mouse_move_wait = config["mouse_move_wait"]
-        scroll_pixels = config["scroll_pixels"]
-        scroll_wait = config["scroll_wait"]
+        mouse_move_wait = config.get("mouse_move_wait", {"min": 0.1, "max": 1.0})
+        scroll_pixels = config.get("scroll_pixels", {"min": 200, "max": 1000})
+        scroll_wait = config.get("scroll_wait", {"min": 0.5, "max": 5})
+        mouse_steps_cfg = config.get("mouse_move_steps", {"min": 50, "max": 250})
+        click_count_cfg = config.get("random_click_count", {"min": 0, "max": 3})
+        click_wait_cfg = config.get("random_click_wait", {"min": 0.5, "max": 2.0})
         
         log.info(f"📋 行为模拟参数: 鼠标移动最多{max_mouse_moves}次, 滚动最多{max_scrolls}次, 点击最多{max_clicks}次")
         
         # 阶段1: 模拟鼠标移动（简化版）
-        mouse_move_count = min(random.randint(2, 8), max_mouse_moves)
+        _mmc_cfg = config.get("mouse_move_count", {"min": 2, "max": 20})
+        mouse_move_count = min(random.randint(int(_mmc_cfg.get("min", 2)), int(_mmc_cfg.get("max", 20))), max_mouse_moves)
         log.info(f"🖱️ 阶段1: 鼠标移动 {mouse_move_count} 次")
         for _ in range(mouse_move_count):
             if elapsed >= watch_time:
@@ -8086,11 +9825,11 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             target_y = random.randint(100, page.viewport_size.get('height', 1080) - 100)
             
             # 使用简化的线性移动（避免贝塞尔曲线计算过多）
-            page.mouse.move(target_x, target_y, steps=random.randint(10, 20))
+            page.mouse.move(target_x, target_y, steps=random.randint(int(mouse_steps_cfg.get("min", 50)), int(mouse_steps_cfg.get("max", 250))))
             current_x, current_y = target_x, target_y
             behavior_stats["mouse_moves"] += 1
             
-            move_wait = random.uniform(0.5, 1.5)
+            move_wait = random.uniform(float(mouse_move_wait.get("min", 0.1)), float(mouse_move_wait.get("max", 1.0)))
             sleep_time = min(move_wait, watch_time - elapsed)
             if not video_interruptible_sleep(sleep_time):
                 log.warning("⛔ 任务已停止（鼠标移动等待中）")
@@ -8100,18 +9839,19 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             behavior_stats["total_stay"] += int(sleep_time * 1000)
         
         # 阶段2: 模拟页面滚动
-        scroll_count = min(random.randint(1, 4), max_scrolls)
+        _sc_cfg2 = config.get("scroll_count", {"min": 2, "max": 10})
+        scroll_count = min(random.randint(max(1, int(_sc_cfg2.get("min", 2))), max(1, int(_sc_cfg2.get("max", 10)))), max_scrolls)
         log.info(f"📜 阶段2: 页面滚动 {scroll_count} 次")
         for _ in range(scroll_count):
             if elapsed >= watch_time:
                 break
                 
-            scroll_amount = random.randint(100, 400)
+            scroll_amount = random.randint(int(scroll_pixels.get("min", 200)), int(scroll_pixels.get("max", 1000)))
             page.evaluate(f"window.scrollBy(0, {scroll_amount})")
             behavior_stats["scrolls"] += 1
             behavior_stats["scroll_distance"] += scroll_amount
             
-            scroll_wait_time = random.uniform(1, 3)
+            scroll_wait_time = random.uniform(float(scroll_wait.get("min", 0.5)), float(scroll_wait.get("max", 5)))
             sleep_time = min(scroll_wait_time, watch_time - elapsed)
             if not video_interruptible_sleep(sleep_time):
                 log.warning("⛔ 任务已停止（滚动等待中）")
@@ -8121,7 +9861,7 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             behavior_stats["total_stay"] += int(sleep_time * 1000)
         
         # 阶段3: 随机点击页面
-        click_count = min(random.randint(1, 3), max_clicks)
+        click_count = min(random.randint(max(1, int(click_count_cfg.get("min", 0))), max(1, int(click_count_cfg.get("max", 3)))), max_clicks)
         log.info(f"👆 阶段3: 随机点击 {click_count} 次")
         for _ in range(click_count):
             if elapsed >= watch_time:
@@ -8131,11 +9871,11 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
                 target_x = random.randint(100, page.viewport_size.get('width', 1920) - 100)
                 target_y = random.randint(100, page.viewport_size.get('height', 1080) - 100)
                 
-                page.mouse.move(target_x, target_y, steps=random.randint(5, 10))
+                page.mouse.move(target_x, target_y, steps=random.randint(int(mouse_steps_cfg.get("min", 50)), int(mouse_steps_cfg.get("max", 250))))
                 page.mouse.click(target_x, target_y)
                 behavior_stats["clicks"] += 1
                 
-                click_wait_time = random.uniform(1, 2)
+                click_wait_time = random.uniform(float(click_wait_cfg.get("min", 0.5)), float(click_wait_cfg.get("max", 2.0)))
                 sleep_time = min(click_wait_time, watch_time - elapsed)
                 if not video_interruptible_sleep(sleep_time):
                     log.warning("⛔ 任务已停止（点击等待中）")
@@ -8237,7 +9977,8 @@ def click_chicken_soup_link(page, target_url, current_x, current_y, config):
                     log.info(f"✅ 点击 Chicken Soup 链接成功！")
                     
                     # 等待页面加载
-                    wait_load = random.uniform(2, 4)
+                    _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                    wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                     time.sleep(wait_load)
                     page.wait_for_load_state("domcontentloaded", timeout=60000)
                     
@@ -8300,7 +10041,8 @@ def click_book_link_to_list(page, target_url, current_x, current_y, config):
                     time.sleep(random.uniform(0.5, 1.0))
                     target_link.click()
                     log.info("✅ 点击 book 链接进入列表页成功！")
-                    wait_load = random.uniform(2, 4)
+                    _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                    wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                     time.sleep(wait_load)
                     page.wait_for_load_state('domcontentloaded', timeout=60000)
                     return True, current_x, current_y
@@ -8377,7 +10119,8 @@ def click_chapter_link_to_page(page, target_url, current_x, current_y, config):
                     time.sleep(random.uniform(0.5, 1.0))
                     target_link.click()
                     log.info("✅ 点击 chapter/可点击链接进入章节页成功！")
-                    wait_load = random.uniform(2, 4)
+                    _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                    wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                     time.sleep(wait_load)
                     page.wait_for_load_state('domcontentloaded', timeout=60000)
                     return True, current_x, current_y
@@ -8443,7 +10186,8 @@ def click_back_home_button(page, target_url, current_x, current_y, config):
                     time.sleep(random.uniform(0.5, 1.0))
                     target_elem.click()
                     log.info("✅ 点击返回按钮回到首页成功！")
-                    wait_load = random.uniform(2, 4)
+                    _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                    wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                     time.sleep(wait_load)
                     page.wait_for_load_state('domcontentloaded', timeout=60000)
                     return True, current_x, current_y
@@ -8631,7 +10375,8 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                             log.info(f"✅ 点击包含 {text_list} 的链接成功！")
                             
                             # 等待页面加载
-                            wait_load = random.uniform(3, 5)
+                            _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                            wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                             time.sleep(wait_load)
                             try:
                                 page.wait_for_load_state('domcontentloaded', timeout=30000)
@@ -8946,7 +10691,8 @@ def watch_video_ad_from_page(page, config, current_x, current_y):
                     continue
             
             # 滚动后的随机等待
-            wait_scroll = random.uniform(1, 2)
+            _sw_vf = config.get("scroll_wait", {"min": 0.5, "max": 5})
+            wait_scroll = random.uniform(float(_sw_vf.get("min", 0.5)), float(_sw_vf.get("max", 5)))
             time.sleep(wait_scroll)
             behavior_stats["waits"] += 1
             behavior_stats["total_stay"] += int(wait_scroll * 1000)
@@ -8973,8 +10719,12 @@ def watch_video_ad_from_page(page, config, current_x, current_y):
         
         # 等待 iframe 页面加载完成
         try:
-            frame.wait_for_load_state('networkidle', timeout=10000)
-            wait_load = random.uniform(1, 2)
+            try:
+                frame.wait_for_load_state('domcontentloaded', timeout=15000)
+            except Exception:
+                pass
+            _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+            wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
             time.sleep(wait_load)
             behavior_stats["waits"] += 1
             behavior_stats["total_stay"] += int(wait_load * 1000)
@@ -9329,16 +11079,18 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
         behavior_stats["waits"] += 1
         behavior_stats["total_stay"] += int(home_wait * 1000)
         
-        # 滚动页面
+        # 滚动页面 ★ 从配置读取参数
         log.info("滚动首页...")
+        _sp_cfg = config.get("scroll_pixels", {"min": 200, "max": 1000})
+        _sw_cfg = config.get("scroll_wait", {"min": 0.5, "max": 5})
         try:
-            scroll_amount = random.randint(300, 800)
+            scroll_amount = random.randint(int(_sp_cfg.get("min", 200)), int(_sp_cfg.get("max", 1000)))
             page.evaluate(f"window.scrollBy(0, {scroll_amount})")
             behavior_stats["scrolls"] += 1
             behavior_stats["scroll_distance"] += scroll_amount
         except Exception:
             pass
-        wait_after_scroll = random.uniform(0.5, 1.5)
+        wait_after_scroll = random.uniform(float(_sw_cfg.get("min", 0.5)), float(_sw_cfg.get("max", 5)))
         time.sleep(wait_after_scroll)
         behavior_stats["waits"] += 1
         behavior_stats["total_stay"] += int(wait_after_scroll * 1000)
@@ -9435,7 +11187,8 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
                     log.info(f"✓ 第{click_count}次点击完成")
                     
                     # 等待页面加载
-                    wait_load = random.uniform(2, 4)
+                    _plw = config.get("page_load_wait", {"min": 1, "max": 8})
+                    wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                     time.sleep(wait_load)
                     behavior_stats["waits"] += 1
                     behavior_stats["total_stay"] += int(wait_load * 1000)
@@ -9447,15 +11200,17 @@ def navigate_page_hierarchy(page, home_url, config, min_clicks=2):
                     behavior_stats["waits"] += 1
                     behavior_stats["total_stay"] += int(page_wait * 1000)
                     
-                    # 滚动新页面
+                    # 滚动新页面 ★ 从配置读取
                     try:
-                        scroll_amount = random.randint(200, 600)
+                        _sp_cfg3 = config.get("scroll_pixels", {"min": 200, "max": 1000})
+                        scroll_amount = random.randint(int(_sp_cfg3.get("min", 200)), int(_sp_cfg3.get("max", 1000)))
                         page.evaluate(f"window.scrollBy(0, {scroll_amount})")
                         behavior_stats["scrolls"] += 1
                         behavior_stats["scroll_distance"] += scroll_amount
                     except Exception:
                         pass
-                    wait_after_click_scroll = random.uniform(0.5, 1)
+                    _sw_nh = config.get("scroll_wait", {"min": 0.5, "max": 5})
+                    wait_after_click_scroll = random.uniform(float(_sw_nh.get("min", 0.5)), float(_sw_nh.get("max", 5)))
                     time.sleep(wait_after_click_scroll)
                     behavior_stats["waits"] += 1
                     behavior_stats["total_stay"] += int(wait_after_click_scroll * 1000)
@@ -9747,13 +11502,14 @@ def redial_adsl_and_get_ip(profile=None, min_interval=None, sleep_func=None, sta
             status_ref["status"] = "IP三要素无效，重新拨号"
             log.warning(f"[ADSL] IP {public_ip} 三要素硬校验失败: {invalid_reason}，废弃并重新拨号")
             continue
-        # IP 类型提示（住宅/数据中心/移动/代理）；数据中心IP对广告风控不利，给出告警
+        # IP 类型检测（住宅/数据中心/移动/代理）；数据中心/代理IP对广告风控高危，自动拒绝
         _ip_type = resolved.get("ip_type")
         if _ip_type:
-            if _ip_type in ("datacenter", "proxy"):
-                log.warning(f"[ADSL] ⚠️ IP {public_ip} 类型={_ip_type}（数据中心/代理，广告风控高危，建议关注）")
+            if _ip_type in ("datacenter", "proxy", "vpn", "hosting"):
+                log.error(f"🚫 [风控铁律] IP {public_ip} 类型={_ip_type}（数据中心/代理/VPN/托管，广告风控高危），自动拒绝并重新获取")
+                continue  # ★ 阻断式：高危IP直接拒绝，重新获取
             else:
-                log.info(f"[ADSL] IP {public_ip} 类型={_ip_type}")
+                log.info(f"[ADSL] IP {public_ip} 类型={_ip_type}（住宅/移动，安全）")
         sync_process_timezone_to_ip(resolved)
         _record_adsl_ip_use(public_ip, resolved)
         status_ref["country"] = resolved.get("country_code") or resolved.get("country_name") or ""
@@ -9978,7 +11734,7 @@ def _format_plan_log_block(plan, title, show_tasks=True, max_tasks=10):
 
 
 def worker_task(single_task=False, adsl_ip_task=False):
-    global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status, _last_executed_plan
+    global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status, _last_executed_plan, config
     stats["total"] = 0
     stats["success"] = 0
     stats["fail"] = 0
@@ -10170,14 +11926,83 @@ def worker_task(single_task=False, adsl_ip_task=False):
     # 记录上一个任务的结束时间
     last_task_end_time = 0
     
+    # ★ 保存config基线快照（行为画像修改后每个任务迭代开始时恢复，防止跨任务污染）
+    import copy as _copy_cfg_snap
+    _config_baseline_snapshot = _copy_cfg_snap.deepcopy(config)
+
+    # ========== ★ P2-5(1)：单任务 watchdog suicide Timer（30 分钟硬上限，杜绝卡死） ==========
+    # 背景：偶发 Playwright / Proxy / 广告请求会在某个 task 内卡死（page.goto/page.evaluate 超时后仍不释放），
+    # 后续所有任务都被阻塞，相当于整个调度器"停摆"。这里每个 task 外层挂一个 1800s 的 watchdog Timer，
+    # 到点仍未执行完就直接 os._exit(24)，由 systemd/supervisor/外层调度器拉起，避免整天 0 任务。
+    _task_global_watchdog = [None]  # 用 list 方便内层闭包修改
+    _task_suicide_code = 24
+
+    def _start_task_global_watchdog(task_label, seconds=1800):
+        """每个 task 外层开启 suicide watchdog。"""
+        try:
+            import threading as _tw
+            _tid = [None]
+
+            def _suicide_fn():
+                try:
+                    log.critical(
+                        f"💀 P2-5 watchdog: 单任务[{task_label}]执行超过 {seconds}s，"
+                        f"认定为死锁/卡死，立即 os._exit({_task_suicide_code})，"
+                        f"请用 systemd/supervisor 自动拉起并查看上一个任务日志"
+                    )
+                except Exception:
+                    pass
+                # 直接 _exit 而不是 sys.exit，避免 finally/atexit 阻塞
+                os._exit(_task_suicide_code)
+
+            _t = _tw.Timer(interval=seconds, function=_suicide_fn)
+            _t.daemon = True
+            _tid[0] = _t
+            _t.start()
+            _task_global_watchdog[0] = _tid
+        except Exception as _e:
+            log.debug(f"watchdog 启动失败（不影响任务）: {type(_e).__name__}")
+
+    def _cancel_task_global_watchdog():
+        """task 正常结束后取消 suicide watchdog。"""
+        try:
+            if _task_global_watchdog and _task_global_watchdog[0]:
+                _t = _task_global_watchdog[0][0]
+                if _t and _t.is_alive():
+                    _t.cancel()
+                    _task_global_watchdog[0] = None
+        except Exception:
+            _task_global_watchdog[0] = None
+
+    # ========== ★ P2-5(2)：单任务浏览网站时长全局审计（低于阈值=没给广告注入时间） ==========
+    # Google AdSense / Ads 脚本：首次进入目标站后，
+    #   1) ad client 初始化 (5~12s)
+    #   2) 发起 ad request → 竞拍 → 渲染 (10~25s)
+    #   3) ActiveView 计数要 ≥1s 可见
+    # 若浏览时长 < 45s，基本等同于"广告刚填完就走"=没曝光没收益。
+    # 这里把阈值硬性钉到 60s，并对 < 60s 的任务发出警告+写入日志。
+    # （真正补时长的地方在 simulate_human_behavior：P0-2 的 safe_page_wait 与各层最小停留）
+    _BROWSE_DURATION_WARN_S = 60.0  # 建议：90s 更稳，60s 是下限红线
+    _BROWSE_DURATION_CRITICAL_S = 45.0  # 低于这个值基本 0 收益
+
     with sync_playwright() as p:
         for task_idx, task in enumerate(tasks_list):
+            # ★ 每个任务迭代开始时恢复config到基线状态（防止上一个任务的行为画像修改残留）
+            config.update(_copy_cfg_snap.deepcopy(_config_baseline_snapshot))
+            
             # ★ 断点恢复：跳过已完成的任务
             if task.get("status") == "已完成":
                 log.info(f"⏭️ 跳过已完成的任务 #{task_idx+1}（断点恢复）")
                 stats["success"] += 1
                 continue
-            
+
+            # ========== ★ P2-5：为本任务开启 suicide watchdog（30 min 硬上限） ==========
+            _start_task_global_watchdog(
+                f"{task_idx+1}/{total_tasks if 'total_tasks' in dir() else len(tasks_list)}@{task.get('proxy_country','??')}",
+                seconds=1800,
+            )
+            enter_site_time = None  # 进入网站（首页加载完成）时间锚点（放这里防止单分支未定义）
+
             # 更新当前任务索引
             current_task_idx = task_idx
             if task_idx < len(tasks_list):
@@ -10220,9 +12045,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
             # 多天计划优先显示完整计划时间
             _actual_start_sec = current_task.get("actual_start", 0)
             _start_str = current_task.get("plan_time") or "00:00:00"
+            # 附加当前进程时区下的计划时间，避免因进程TZ随IP切换导致"看似未按计划执行"的误解
+            _local_plan_hint = ""
+            _plan_epoch = current_task.get("actual_start_epoch")
+            if _plan_epoch:
+                try:
+                    import datetime as _dt_hint
+                    _local_plan_hint = f" = {_dt_hint.datetime.fromtimestamp(int(_plan_epoch)).strftime('%Y-%m-%d %H:%M:%S')}当前时区"
+                except Exception:
+                    _local_plan_hint = ""
             log.info(
                 f"📌 当前任务: {current_task['idx']}/{total_tasks}, "
-                f"计划开始时间={_start_str}, "
+                f"计划开始时间={_start_str}(北京时间){_local_plan_hint}, "
                 f"预估时长={current_task.get('task_duration', 0):.1f}s, "
                 f"代理国家={current_task['proxy_country']}"
             )
@@ -10237,6 +12071,17 @@ def worker_task(single_task=False, adsl_ip_task=False):
             # 按计划时间执行；多天计划优先使用 epoch，避免跨天任务被连续跑完
             if current_task.get("actual_start_epoch"):
                 wait_sec = max(0, int(current_task.get("actual_start_epoch", _now_epoch)) - _now_epoch)
+            elif current_task.get("plan_time"):
+                # 旧格式计划无 epoch 字段：按北京时间解析 plan_time 推导 epoch，
+                # 严禁回退到 20-40 秒间隔（会导致多天计划被连续提前跑完）
+                try:
+                    _naive_pt = _dt.datetime.strptime(str(current_task["plan_time"]), "%Y-%m-%d %H:%M:%S")
+                    _pt_epoch = int(pytz.timezone("Asia/Shanghai").localize(_naive_pt).timestamp())
+                    wait_sec = max(0, _pt_epoch - _now_epoch)
+                except Exception:
+                    wait_sec = random.uniform(
+                        config.get("task_interval", {}).get("min", 20),
+                        config.get("task_interval", {}).get("max", 40))
             elif task_idx == 0:
                 _today_utc_start = _now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
                 _now_sec_utc = (_now_utc - _today_utc_start).total_seconds()
@@ -10290,7 +12135,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 ip_retry_max = 3  # 舍弃 IP 后最多重试 3 次
                 seo_ready = False  # 是否成功准备好 SEO（必须为 True 才能继续）
 
-                # ⏱️ 前置流程计时起点：从拨号/取IP开始
+                # ⏱️ 前置流程计时起点：从取IP/代理设置开始
                 dial_start_time = time.time()
                 enter_site_time = None  # 进入网站（首页加载完成）时间锚点
 
@@ -10510,6 +12355,68 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             f"✅ IP 三要素识别成功 country={country}, timezone={timezone}, "
                             f"language={language}, source={resolved_ip_info.get('source')}"
                         )
+
+                        # ========== ★ P0-1/P0-4/P1-1 风控钩子：IP/账户/时段准入 ==========
+                        if _HAS_RCE and exit_ip and exit_ip != "未知":
+                            # adv_id 占位：后续若接入多账户配置，可从 task/account 取
+                            _adv_id = current_task.get("adv_account_id") or ""
+                            # 构造一个稳定 device_id (基于 fingerprint_id 或任务+UA的hash)
+                            _fp = current_task.get("fingerprint_id") or (
+                                f"{cc_upper}|{language}|{selected_ua[:64] if 'selected_ua' in dir() else ''}"
+                            )
+                            # P0-1 隔离池（7 天 C 段 + ASN + 指纹互斥）
+                            _ok1, _why1 = _rce.isolate_pool.allow(
+                                adv_id=_adv_id or "default",
+                                ip=exit_ip,
+                                fingerprint=_fp,
+                                ua=current_task.get("user_agent") or "",
+                                asn=resolved_ip_info.get("asn") or "",
+                            )
+                            if not _ok1:
+                                log.warning(f"⛔ P0-1隔离拒绝，换IP：{_why1}")
+                                continue
+                            # P0-4 3 层账户×设备×IP 互斥
+                            _ok4, _why4 = _rce.adv_isolation.can_acquire(
+                                adv_id=_adv_id or "default",
+                                device_id=_fp,
+                                ip=exit_ip,
+                                ua=current_task.get("user_agent") or "",
+                            )
+                            if not _ok4:
+                                log.warning(f"⛔ P0-4账户隔离拒绝，换IP：{_why4}")
+                                continue
+                            # P1-1 时段分布过滤（当地凌晨拒绝 / 工作时段加权通过）
+                            _tz = resolved_ip_info.get("timezone") or timezone
+                            _ok_tz, _w, _hr = _rce.tz_schedule.allow_now(_tz)
+                            if not _ok_tz:
+                                log.warning(
+                                    f"⏳ P1-1 时段过滤：当地 {_hr}:00 权重={_w:.2f} < 阈值，"
+                                    f"挂起此 IP 并延后 60s 再试"
+                                )
+                                time.sleep(60)
+                                continue
+                            # P1-5 Copula 采样：提前为本次任务抽取 bounce/pv/engagement 目标值
+                            _b = _rce.copula.sample_behavior(
+                                _host(target_url) if 'target_url' in dir() else "",
+                                country=cc_upper,
+                            )
+                            current_task.setdefault("_rce_behavior_plan", _b)
+                            log.info(
+                                f"🎲 P1-5 行为采样 bounce_prob={_b['bounce_prob']:.2f} "
+                                f"pages={_b['pages']} engagement={_b['engagement_sec']:.0f}s"
+                            )
+                            # P2-1 曝光 CV 限流检查
+                            _ok_cv, _cv = _rce.exposure_cv.allow(
+                                _host(target_url) if 'target_url' in dir() else ""
+                            )
+                            if not _ok_cv:
+                                log.warning(
+                                    f"📉 P2-1 曝光模式异常 CV={_cv:.2f}，本轮注入率降低 30%"
+                                )
+                                # 70% 概率跳过（软限流）
+                                if random.random() < 0.3:
+                                    continue
+                        # ======================================================================
                         # —— Step 2: 决定 SEO 区域（严禁跳过 SEO，不可支持的语言直接舍弃 IP） ——
                         if not config.get("enable_seo", True):
                             log.error("❌ enable_seo=False，无法启动任务（严禁跳过 SEO）")
@@ -10631,7 +12538,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     fingerprint_success = True
                     fingerprint_id = fingerprint["fingerprint_id"]
                     user_agent = fingerprint["user_agent"]
-                    qa_log_fingerprint_ip_consistency(resolved_ip_info, fingerprint)
+                    qa_checks = qa_log_fingerprint_ip_consistency(resolved_ip_info, fingerprint)
+                    # ★ 阻断式校验：指纹与IP不一致时拒绝该IP，重新获取
+                    if not qa_checks.get("all_consistent", False):
+                        log.error(f"🚫 指纹与IP一致性校验失败，舍弃该IP，重新获取")
+                        fingerprint = None
+                        fingerprint_success = False
+                        continue
                     resolution = fingerprint["resolution"]
                     stable_desktop_resolutions = [
                         "1366x768", "1440x900", "1536x864",
@@ -10788,6 +12701,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     "--dns-over-https-templates=https://dns.google/dns-query",
                     "--dns-over-https-mode=secure",
                 ])
+                
+                # P2-3 DNS 解析分散
+                if _HAS_RCE:
+                    _dns_pool = _rce.dns_diversity.pick_resolver(country or 'US')
+                    log.info(f"🌐 P2-3 DNS解析器: {_dns_pool}")
                 
                 _launch_args.extend([
                         f"--lang={_launch_lang}",
@@ -10995,8 +12913,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     viewport={"width": width, "height": height},
                     locale=browser_locale,
                     timezone_id=browser_timezone,
-                    permissions=[],
-                    geolocation=None,
+                    permissions=["geolocation"],
+                    geolocation=get_geolocation_for_ip(resolved_ip_info),
                     device_scale_factor=_ctx_dsf,
                     is_mobile=_ctx_is_mobile,
                     has_touch=_ctx_is_mobile,
@@ -11006,11 +12924,44 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 if qa_storage_state_path:
                     context_kwargs["storage_state"] = qa_storage_state_path
                 context = browser.new_context(**context_kwargs)
+                # ★ 地理坐标注入日志
+                _geo = context_kwargs.get("geolocation")
+                if _geo:
+                    log.info(f" 地理坐标注入: lat={_geo['latitude']}, lng={_geo['longitude']}, accuracy={_geo['accuracy']}m")
                 
                 log.info(f"✅ 浏览器上下文配置完成 - 语言: {browser_locale}, 时区: {browser_timezone}, 分辨率: {resolution}")
                 
+                # P1-3 电池+运动传感器仿真
+                if _HAS_RCE:
+                    try:
+                        _dev_id = current_task.get('fingerprint_id') or f"{country}|{selected_ua}"
+                        _bat = _rce.battery.get_level(_dev_id)
+                        _accel = _rce.motion.make_accel(128)
+                        log.info(f"🔋 P1-3 电池: {_bat['level_pct']}% charging={_bat['charging']}")
+                    except Exception as _rce_e:
+                        log.debug(f"P1-3 电池/传感器异常(忽略): {_rce_e}")
+                
                 # ========== 覆盖Canvas和WebGL指纹，添加完整反检测 ==========
                 context.add_init_script(rf"""
+                    // ========== -1. Meta Referrer 注入（广告合规，提升收益；WordPress 用户请同时在主题 header.php 中加入 <meta name="referrer" ... />） ==========
+                    // 必须在所有 init_script 的第一块执行，保证 AdSense 脚本执行前已经设置好 Referrer Policy
+                    (function() {{
+                        try {{
+                            const _m = document.createElement('meta');
+                            _m.setAttribute('name', 'referrer');
+                            _m.setAttribute('content', 'no-referrer-when-downgrade');
+                            const _insert = function() {{
+                                try {{
+                                    const _h = document.head || document.getElementsByTagName('head')[0];
+                                    if (_h && !document.querySelector('meta[name="referrer"]')) _h.insertBefore(_m, _h.firstChild);
+                                }} catch(_) {{}}
+                            }};
+                            _insert();
+                            // Head 可能还没解析完，挂 DOMContentLoaded 再次兜底
+                            try {{ document.addEventListener('DOMContentLoaded', _insert, {{ once: true }}); }} catch(_) {{}}
+                        }} catch(_) {{}}
+                    }})();
+
                     // ========== 0. WebRTC IP泄露防护（保留API但过滤内网IP，完全禁用会被风控识别） ==========
                     (function() {{
                         const _OrigRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
@@ -11050,12 +13001,26 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     }})();
                     
                     // ========== 1. 隐藏自动化特征 ==========
-                    // 隐藏navigator.webdriver
-                    Object.defineProperty(navigator, 'webdriver', {{
-                        value: undefined,
-                        writable: false,
-                        configurable: false
-                    }});
+                    // 隐藏navigator.webdriver —— 使用 Navigator.prototype 层覆盖，
+                    // 同时对顶层窗口 + 所有 iframe 生效；返回值必须是 false（真浏览器非自动化时为false），
+                    // 且 configurable=true 允许广告联盟脚本重新定义（writable:false/configurable:false 反而会被严格检测识破）
+                    (function() {{
+                        try {{
+                            Object.defineProperty(Navigator.prototype, 'webdriver', {{
+                                get: function() {{ return false; }},
+                                configurable: true,
+                                enumerable: true
+                            }});
+                        }} catch(e) {{
+                            try {{
+                                Object.defineProperty(navigator, 'webdriver', {{
+                                    get: function() {{ return false; }},
+                                    configurable: true,
+                                    enumerable: true
+                                }});
+                            }} catch(_) {{}}
+                        }}
+                    }})();
                     
                     // 修复 headless 模式下 document.visibilityState="hidden" 的致命检测点
                     // 真实用户的当前标签页始终是 "visible"
@@ -11125,48 +13090,52 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     
 
                     // ========== 2. 补充真实浏览器属性 ==========
-                    // 模拟plugins（不使用DOM创建，init_script时document.body为null）
-                    if (!navigator.plugins.length) {{
-                        const _makePlugin = (name, filename, desc) => {{
-                            const p = Object.create(Plugin.prototype);
-                            Object.defineProperties(p, {{
-                                name: {{ value: name, enumerable: true }},
-                                filename: {{ value: filename, enumerable: true }},
-                                description: {{ value: desc || '', enumerable: true }},
-                                length: {{ value: 1, enumerable: true }}
+                    // ★ 已移除假 plugins / mimeTypes 注入（Chrome 120+ 默认隐私模式返回空数组，
+                    //   合规、真实且被广告风控接受；造假反而与 Chrome 版本 + Headless 模式冲突，
+                    //   导致 fingerprint 一致性校验失败）。
+                    // （如需本地非隐私模式验证 plugins 长度，直接在真实 Chrome 打开控制台即可）
+
+                    // ★ navigator.language / languages：可重定义（configurable=true），
+                    //   允许广告联盟脚本覆盖，避免被风控严格检测识破。
+                    (function() {{
+                        try {{
+                            const _lang = "{browser_locale}";
+                            const _langs = ["{browser_locale}"];
+                            // 兼容 zh-CN → en-US 的宽松比对
+                            const _primary = _lang.split('-')[0] || _lang;
+                            if (_lang.indexOf('-') > 0 && _primary !== _lang) _langs.push(_primary);
+                            if (_langs.indexOf('en') === -1) _langs.push('en');
+                            Object.defineProperty(Navigator.prototype, 'language', {{
+                                get: function() {{ return _lang; }},
+                                configurable: true,
+                                enumerable: true
                             }});
-                            return p;
-                        }};
-                        const _plugins = [
-                            _makePlugin('Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'),
-                            _makePlugin('Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', 'Portable Document Format'),
-                            _makePlugin('Native Client', 'internal-nacl-plugin', 'Native Client Executable')
-                        ];
-                        Object.defineProperty(navigator, 'plugins', {{
-                            get: function() {{ return _plugins; }},
-                            configurable: true
-                        }});
-                    }}
-                    
-                    // 模拟mimeTypes
-                    if (!navigator.mimeTypes.length) {{
-                        const _mimes = [
-                            {{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }},
-                            {{ type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' }},
-                            {{ type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }}
-                        ];
-                        Object.defineProperty(navigator, 'mimeTypes', {{
-                            get: function() {{ return _mimes; }},
-                            configurable: true
-                        }});
-                    }}
+                            Object.defineProperty(Navigator.prototype, 'languages', {{
+                                get: function() {{ return _langs.slice(); }},
+                                configurable: true,
+                                enumerable: true
+                            }});
+                        }} catch(e) {{
+                            try {{
+                                Object.defineProperty(navigator, 'language', {{
+                                    get: function() {{ return "{browser_locale}"; }},
+                                    configurable: true
+                                }});
+                            }} catch(_) {{}}
+                        }}
+                    }})();
                     
                     // ========== 3. Canvas和WebGL指纹（合规化：噪声扰动 + 真实GPU字符串 + toString保护） ==========
                     // Canvas：对真实渲染结果注入稳定的逐像素微噪声（基于会话种子），而非返回固定串
                     (function() {{
                         const _seed = {canvas_noise_seed} >>> 0;
-                        let _s = _seed || 1;
-                        const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
+                        // ★ 升级: xorshift128 PRNG（替代LCG，防止ML分类器识别线性同余序列）
+                        let _x = _seed || 1, _y = (_seed * 2654435761) >>> 0 || 362436069, _z = (_seed * 2246822519) >>> 0 || 521288629, _w = (_seed * 3266489917) >>> 0 || 88675123;
+                        const _rnd = function() {{
+                            const t = _x ^ (_x << 11); _x = _y; _y = _z; _z = _w;
+                            _w = (_w ^ (_w >>> 19)) ^ (t ^ (t >>> 8));
+                            return (_w >>> 0) / 4294967296;
+                        }};
                         const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                         const _hookedGetImageData = function() {{
                             const data = _origGetImageData.apply(this, arguments);
@@ -11366,37 +13335,101 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     }})();
                     
                     // ========== 4. 语言设置 ==========
-                    // 强制覆盖语言
-                    Object.defineProperty(navigator, 'language', {{
-                        value: "{browser_locale}",
-                        writable: false,
-                        configurable: false
-                    }});
-                    
-                    // 语言列表：根据实际locale生成合理的回退链（不同语言环境不应总是en-US回退）
+                    // （已在"2. 补充真实浏览器属性"块中以 Navigator.prototype + configurable:true 覆盖，
+                    //   这里的旧 writable:false/configurable:false 版本会与上一个定义冲突，直接删除）
+
+                    // ========== P1-2：全局 Function.prototype.toString 保护 ==========
+                    // 任何经过 hook 的函数 .toString() 都必须展示 native code，否则被风控脚本一眼识破
+                    // 注意：Python f-string 中不允许反斜杠；这里改用 / 字面量包裹（正斜杠在 f-string 中可直接写）
                     (function() {{
-                        const _loc = "{browser_locale}";
-                        const _langPrefix = _loc.split('-')[0];
-                        let _langs = [_loc];
-                        // 根据语言前缀生成合理的回退链
-                        const _fallbacks = {{
-                            'zh': ['zh-CN', 'zh', 'en-US', 'en'],
-                            'ja': ['ja-JP', 'ja', 'en-US', 'en'],
-                            'ko': ['ko-KR', 'ko', 'en-US', 'en'],
-                            'de': ['de-DE', 'de', 'en-US', 'en'],
-                            'fr': ['fr-FR', 'fr', 'en-US', 'en'],
-                            'es': ['es-ES', 'es', 'en-US', 'en'],
-                            'pt': ['pt-BR', 'pt', 'en-US', 'en'],
-                            'ru': ['ru-RU', 'ru', 'en-US', 'en'],
-                            'en': ['en-US', 'en']
-                        }};
-                        _langs = _fallbacks[_langPrefix] || [_loc, _langPrefix, 'en-US', 'en'];
-                        // 确保当前locale在第一位
-                        if (_langs[0] !== _loc) {{ _langs = [_loc].concat(_langs.filter(function(l){{ return l !== _loc; }})); }}
-                        Object.defineProperty(navigator, 'languages', {{
-                            get: function() {{ return Object.freeze(_langs.slice()); }},
-                            configurable: true
-                        }});
+                        try {{
+                            const _orig = Function.prototype.toString;
+                            // 正则字面量花括号已在Python rf-string中用双写方式转义
+                            const _NATIVE_RE = /^\\s*function[^()]*\\([^)]*\\)\\s*{{\\s*\\[native code\\]\\s*}}\\s*$/i;
+                            const _HOOK_FLAG = "__pw_native_tostring__";
+                            Function.prototype.toString = function() {{
+                                try {{
+                                    if (this && typeof this === 'function') {{
+                                        try {{
+                                            if (this[_HOOK_FLAG]) return "function " + (this.name || "") + "() {{ [native code] }}";
+                                        }} catch(_) {{}}
+                                        try {{
+                                            const s = _orig.call(this);
+                                            if (typeof s === 'string' && _NATIVE_RE.test(s)) return s;
+                                        }} catch(_) {{}}
+                                        try {{
+                                            const fnName = this.name || "";
+                                            if (typeof _ORIGINAL_FN_SET !== 'undefined' && _ORIGINAL_FN_SET && _ORIGINAL_FN_SET.has && _ORIGINAL_FN_SET.has(this)) {{
+                                                return "function " + fnName + "() {{ [native code] }}";
+                                            }}
+                                        }} catch(_) {{}}
+                                    }}
+                                }} catch(_) {{}}
+                                return _orig.apply(this, arguments);
+                            }};
+                            // 保护自身 toString
+                            Object.defineProperty(Function.prototype.toString, 'toString', {{
+                                value: function() {{ return 'function toString() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                        }} catch(e) {{}}
+                    }})();
+                    // 用全局 WeakSet 收集"已经被标记为原生"的函数对象（支持 iframe 跨域不访问）
+                    (function() {{
+                        try {{ window._ORIGINAL_FN_SET = new WeakSet(); }} catch(_) {{}}
+                    }})();
+
+                    // ========== P1-2：iframe MutationObserver + 反检测脚本注入 ==========
+                    // AdSense 广告在 iframe 里渲染，父窗口 init_script 默认不会注入到跨域 iframe；
+                    // 策略：1) 用 MutationObserver 监听新 iframe 创建；2) 对同源 iframe 通过 contentWindow 再次写入保护；
+                    //        3) 对跨域 iframe 也不做任何破坏性尝试，只保证父窗口已通过 window.top/frameElement 伪装。
+                    (function() {{
+                        try {{
+                            const _applyIframeProtections = function(win) {{
+                                if (!win) return;
+                                try {{
+                                    // 同源才会成功，跨域抛错直接跳过（符合合规要求）
+                                    if (win === window) return;
+                                    const d = win.document;
+                                    if (!d) return;
+                                    // 同源 iframe 内再注入一次 referrer meta
+                                    try {{
+                                        if (!d.querySelector('meta[name="referrer"]')) {{
+                                            const m = d.createElement('meta');
+                                            m.name = 'referrer'; m.content = 'no-referrer-when-downgrade';
+                                            const h = d.head || d.getElementsByTagName('head')[0];
+                                            if (h) h.insertBefore(m, h.firstChild);
+                                        }}
+                                    }} catch(_) {{}}
+                                }} catch(_) {{}}
+                            }};
+                            // 对已存在的 iframe 扫一遍
+                            try {{ Array.prototype.forEach.call(document.querySelectorAll('iframe'), function(f){{ try {{ _applyIframeProtections(f.contentWindow); }} catch(_){{}} }}); }} catch(_) {{}}
+                            // 监听后续新增 iframe
+                            try {{
+                                const _mo = new MutationObserver(function(mutations) {{
+                                    for (let i = 0; i < mutations.length; i++) {{
+                                        const m = mutations[i];
+                                        if (!m || !m.addedNodes || !m.addedNodes.length) continue;
+                                        m.addedNodes.forEach(function(n) {{
+                                            try {{
+                                                if (!n) return;
+                                                if (n.nodeType === 1 && n.tagName === 'IFRAME') {{
+                                                    setTimeout(function(){{ _applyIframeProtections(n.contentWindow); }}, 0);
+                                                    return;
+                                                }}
+                                                if (n.querySelectorAll) {{
+                                                    Array.prototype.forEach.call(n.querySelectorAll('iframe'), function(f){{
+                                                        setTimeout(function(){{ _applyIframeProtections(f.contentWindow); }}, 0);
+                                                    }});
+                                                }}
+                                            }} catch(_) {{}}
+                                        }});
+                                    }}
+                                }});
+                                _mo.observe(document.documentElement, {{ childList: true, subtree: true }});
+                            }} catch(_) {{}}
+                        }} catch(e) {{}}
                     }})();
                     
                     // ========== 4.1 时区覆盖（与 context timezone_id 双保险）==========
@@ -11584,8 +13617,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     (function() {{
                         try {{
                             const _seed = {canvas_noise_seed} >>> 0;
-                            let _s = _seed || 1;
-                            const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
+                            let _x = _seed || 1, _y = (_seed * 2654435761) >>> 0 || 362436069, _z = (_seed * 2246822519) >>> 0 || 521288629, _w = (_seed * 3266489917) >>> 0 || 88675123;
+                            const _rnd = function() {{ const t = _x ^ (_x << 11); _x = _y; _y = _z; _z = _w; _w = (_w ^ (_w >>> 19)) ^ (t ^ (t >>> 8)); return (_w >>> 0) / 4294967296; }};
                             // Hook OfflineAudioContext.startRendering
                             if (window.OfflineAudioContext) {{
                                 const _origStart = OfflineAudioContext.prototype.startRendering;
@@ -11604,6 +13637,32 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     }});
                                 }};
                             }}
+                            // ★ P0-3增强: AnalyserNode.getFloatFrequencyData噪声（CreepJS/Pixelscan检测点）
+                            if (window.AnalyserNode) {{
+                                const _origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
+                                AnalyserNode.prototype.getFloatFrequencyData = function(array) {{
+                                    _origGetFloat.call(this, array);
+                                    try {{
+                                        for (let i = 0; i < array.length; i += 10) {{
+                                            array[i] += (_rnd() - 0.5) * 0.01;
+                                        }}
+                                    }} catch(e) {{}}
+                                }};
+                                const _origGetByte = AnalyserNode.prototype.getByteFrequencyData;
+                                AnalyserNode.prototype.getByteFrequencyData = function(array) {{
+                                    _origGetByte.call(this, array);
+                                    try {{
+                                        for (let i = 0; i < array.length; i += 20) {{
+                                            array[i] = Math.max(0, Math.min(255, array[i] + ((_rnd() * 2 | 0) - 1)));
+                                        }}
+                                    }} catch(e) {{}}
+                                }};
+                            }}
+                            // ★ DynamicsCompressorNode.threshold保护（另一个音频指纹检测点）
+                            if (window.DynamicsCompressorNode) {{
+                                const _origDynamics = window.DynamicsCompressorNode;
+                                // 不覆盖构造函数，仅保护getFloatFrequencyData即可
+                            }}
                         }} catch(e) {{}}
                     }})();
                     
@@ -11611,8 +13670,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     (function() {{
                         try {{
                             const _seed = {canvas_noise_seed} >>> 0;
-                            let _s = _seed || 1;
-                            const _rnd = function() {{ _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; }};
+                            let _x = _seed || 1, _y = (_seed * 2654435761) >>> 0 || 362436069, _z = (_seed * 2246822519) >>> 0 || 521288629, _w = (_seed * 3266489917) >>> 0 || 88675123;
+                            const _rnd = function() {{ const t = _x ^ (_x << 11); _x = _y; _y = _z; _z = _w; _w = (_w ^ (_w >>> 19)) ^ (t ^ (t >>> 8)); return (_w >>> 0) / 4294967296; }};
                             const _origGetBCR = Element.prototype.getBoundingClientRect;
                             Element.prototype.getBoundingClientRect = function() {{
                                 const rect = _origGetBCR.call(this);
@@ -11624,6 +13683,78 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 value: function() {{ return 'function getBoundingClientRect() {{ [native code] }}'; }},
                                 configurable: true
                             }});
+                        }} catch(e) {{}}
+                    }})();
+                    
+                    // ========== ★ P2-7: WebGL时间侧信道防护（渲染耗时随机化） ==========
+                    (function() {{
+                        try {{
+                            const _seed = {canvas_noise_seed} >>> 0;
+                            let _x = _seed || 1, _y = (_seed * 2654435761) >>> 0 || 362436069, _z = (_seed * 2246822519) >>> 0 || 521288629, _w = (_seed * 3266489917) >>> 0 || 88675123;
+                            const _rnd = function() {{ const t = _x ^ (_x << 11); _x = _y; _y = _z; _z = _w; _w = (_w ^ (_w >>> 19)) ^ (t ^ (t >>> 8)); return (_w >>> 0) / 4294967296; }};
+                            // Hook performance.now() 添加微噪声（防止通过渲染时间差异指纹化GPU）
+                            const _origPerfNow = performance.now.bind(performance);
+                            let _perfNoiseAccum = 0;
+                            performance.now = function() {{
+                                const real = _origPerfNow();
+                                // 每次调用添加±0.01-0.05ms的累积漂移（模拟真实系统时钟抖动）
+                                _perfNoiseAccum += (_rnd() - 0.5) * 0.04;
+                                return real + _perfNoiseAccum;
+                            }};
+                            Object.defineProperty(performance.now, 'toString', {{
+                                value: function() {{ return 'function now() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                            // WebGL readPixels时间侧信道：添加随机延迟
+                            const _patchReadPixels = function(proto) {{
+                                if (!proto || !proto.readPixels) return;
+                                const _orig = proto.readPixels;
+                                proto.readPixels = function() {{
+                                    // 在readPixels前插入微量随机工作（干扰时间测量）
+                                    const _junk = new Float32Array(16);
+                                    for (let i = 0; i < 16; i++) _junk[i] = Math.sin(i * _rnd());
+                                    return _orig.apply(this, arguments);
+                                }};
+                            }};
+                            try {{ _patchReadPixels(WebGLRenderingContext.prototype); }} catch(e) {{}}
+                            try {{ _patchReadPixels(WebGL2RenderingContext.prototype); }} catch(e) {{}}
+                        }} catch(e) {{}}
+                    }})();
+                    
+                    // ========== ★ P2-8: 事件时序对齐（requestAnimationFrame同步，防止事件时间戳异常） ==========
+                    (function() {{
+                        try {{
+                            // 确保 Date.now() 和 performance.now() 的时间戳与 rAF 帧对齐
+                            // 真实浏览器中，事件时间戳始终是帧时间的整数倍（16.67ms @ 60Hz）
+                            const _origRAF = window.requestAnimationFrame;
+                            let _lastFrameTime = 0;
+                            window.requestAnimationFrame = function(callback) {{
+                                return _origRAF.call(window, function(timestamp) {{
+                                    _lastFrameTime = timestamp;
+                                    callback(timestamp);
+                                }});
+                            }};
+                            Object.defineProperty(window.requestAnimationFrame, 'toString', {{
+                                value: function() {{ return 'function requestAnimationFrame() {{ [native code] }}'; }},
+                                configurable: true
+                            }});
+                            // 保护 Event.timeStamp：确保事件时间戳与帧时间对齐
+                            const _origAddEventListener = EventTarget.prototype.addEventListener;
+                            EventTarget.prototype.addEventListener = function(type, listener, options) {{
+                                const wrappedListener = function(event) {{
+                                    // 将事件时间戳对齐到最近的帧边界（16.67ms倍数）
+                                    try {{
+                                        if (event && event.timeStamp && _lastFrameTime > 0) {{
+                                            const frameInterval = 1000 / 60;  // 60Hz
+                                            const aligned = Math.round(event.timeStamp / frameInterval) * frameInterval;
+                                            Object.defineProperty(event, 'timeStamp', {{ value: aligned, configurable: true }});
+                                        }}
+                                    }} catch(e) {{}}
+                                    if (typeof listener === 'function') return listener.call(this, event);
+                                    if (listener && listener.handleEvent) return listener.handleEvent(event);
+                                }};
+                                return _origAddEventListener.call(this, type, wrappedListener, options);
+                            }};
                         }} catch(e) {{}}
                     }})();
                     
@@ -11718,7 +13849,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                 # 阶段2：不再让浏览器访问 httpbin/ipify/icanhazip 等外部探测端点。
                 # 代理可用性由 6666 控制面与 VPS 目标站测速保证，避免探测 URL 抢占 SOCKS5 链路并污染当前页面。
-                log.warning("🩺 代理链路浏览器探测已跳过（阶段2）：直接访问目标站")
+                log.warning("🩺 代理链路浏览器探测已跳过（阶段2）：后续通过搜索/社媒Referer进入目标站")
                 
                 # 立即检查语言一致性
                 actual_language = page_eval(
@@ -11850,6 +13981,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     ad_impressions = 0
                     ad_refreshes = 0
                     ad_monitor = create_ad_monitor()
+                    reset_ad_click_tracking()  # ★ 新任务开始，清空广告点击去重记录
                     page_behavior_stats = {
                         "mouse_moves": 0,
                         "scrolls": 0,
@@ -11862,6 +13994,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         "total_stay": 0,
                         "key_presses": 0
                     }
+                    
+                    # ★ P2-9: 加载跨会话行为画像（微调本次任务参数，制造用户级一致性）
+                    _behavior_profile = None
+                    try:
+                        _bp_site = target_url or ""
+                        _bp_country = (country or "US").upper()
+                        _behavior_profile = load_behavior_profile(_bp_site, _bp_country)
+                        if _behavior_profile and _behavior_profile.get("visit_count", 0) >= 2:
+                            config = apply_behavior_profile_to_config(_behavior_profile, config)
+                            log.info(f"🧠 [行为画像] 已加载历史画像(访问{_behavior_profile['visit_count']}次)，微调本次行为参数")
+                    except Exception as _bp_err:
+                        log.debug(f"[行为画像] 加载失败(忽略): {str(_bp_err)[:60]}")
                     
                     # 初始化视频相关变量
                     video_watched = False
@@ -11885,7 +14029,111 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         search_mode = config.get("seo", {}).get("search_mode", "direct_referer")
                         already_on_target = False
                         current_x, current_y = 0, 0  # 初始化鼠标坐标（避免 UnboundLocalError）
-                        if search_mode == "real_search":
+                        
+                        # ★ P0-2: 流量来源多样化（防止100%搜索流量被审计识别）
+                        # 真实网站流量分布: ~60%搜索 + ~20%直接 + ~10%社媒 + ~10%外链
+                        _traffic_diversity_cfg = config.get("traffic_diversity", {})
+                        _td_enabled = _traffic_diversity_cfg.get("enabled", True)
+                        _traffic_source = "search"  # 默认搜索引擎
+                        if _td_enabled:
+                            _td_roll = random.random()
+                            _pct_search = _traffic_diversity_cfg.get("search_pct", 0.60)
+                            _pct_direct = _traffic_diversity_cfg.get("direct_pct", 0.20)
+                            _pct_social = _traffic_diversity_cfg.get("social_pct", 0.10)
+                            # _pct_referral = 1 - search - direct - social
+                            if _td_roll < _pct_search:
+                                _traffic_source = "search"
+                            elif _td_roll < _pct_search + _pct_direct:
+                                _traffic_source = "direct"
+                            elif _td_roll < _pct_search + _pct_direct + _pct_social:
+                                _traffic_source = "social"
+                            else:
+                                _traffic_source = "referral"
+                            log.info(f"🌐 [流量多样化] 本次访问来源: {_traffic_source} (search={_pct_search:.0%}/direct={_pct_direct:.0%}/social={_pct_social:.0%}/referral=剩余)")
+                        
+                        if _traffic_source == "direct":
+                            # ★ 直接访问：用户输入URL/书签（无Referer）
+                            log.info(f"🌐 [流量多样化] 直接访问模式（模拟书签/地址栏输入）")
+                            simulate_rtt_jitter(base_ms=60, jitter_ms=30)
+                            try:
+                                page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+                                already_on_target = True
+                                enter_site_time = time.time()
+                            except Exception as _direct_err:
+                                log.warning(f"⚠️ 直接访问失败: {str(_direct_err)[:80]}，回退到搜索模式")
+                                _traffic_source = "search"
+                        elif _traffic_source == "social":
+                            # ★ 社交媒体跳转：先访问社媒平台，再点击链接进入目标站
+                            _social_platforms = [
+                                {"name": "Facebook", "url": "https://www.facebook.com/"},
+                                {"name": "Twitter/X", "url": "https://x.com/home"},
+                                {"name": "Reddit", "url": "https://www.reddit.com/"},
+                                {"name": "Pinterest", "url": "https://www.pinterest.com/"},
+                                {"name": "Instagram", "url": "https://www.instagram.com/"},
+                            ]
+                            _social = random.choice(_social_platforms)
+                            log.info(f"🌐 [流量多样化] 社媒跳转: {_social['name']} → {target_url}")
+                            simulate_rtt_jitter(base_ms=100, jitter_ms=50)
+                            try:
+                                page.goto(_social["url"], timeout=30000, wait_until="domcontentloaded")
+                                # 在社媒页面停留（模拟浏览动态）
+                                _social_stay = random.uniform(3.0, 8.0)
+                                current_x, current_y = simulate_human_in_window(
+                                    page, _social_stay, page_behavior_stats, current_x, current_y,
+                                    config, page_name=f"社媒({_social['name']})"
+                                )
+                                # 通过JS导航到目标站（模拟点击链接，保留Referer）
+                                page.evaluate(f"window.location.href = '{target_url}'")
+                                time.sleep(random.uniform(2.0, 5.0))
+                                already_on_target = True
+                                enter_site_time = time.time()
+                                log.info(f"✅ [流量多样化] 社媒跳转成功: {_social['name']} → 目标站")
+                            except Exception as _social_err:
+                                log.warning(f"⚠️ 社媒跳转失败: {str(_social_err)[:80]}，回退到搜索模式")
+                                _traffic_source = "search"
+                        elif _traffic_source == "referral":
+                            # ★ 外链跳转：从相关网站点击链接进入（模拟博客/论坛推荐）
+                            _referral_sites = [
+                                "https://news.ycombinator.com/",
+                                "https://www.quora.com/",
+                                "https://medium.com/",
+                                "https://stackoverflow.com/",
+                            ]
+                            _ref_site = random.choice(_referral_sites)
+                            log.info(f"🌐 [流量多样化] 外链跳转: {_ref_site} → {target_url}")
+                            simulate_rtt_jitter(base_ms=90, jitter_ms=40)
+                            try:
+                                page.goto(_ref_site, timeout=30000, wait_until="domcontentloaded")
+                                _ref_stay = random.uniform(2.0, 6.0)
+                                current_x, current_y = simulate_human_in_window(
+                                    page, _ref_stay, page_behavior_stats, current_x, current_y,
+                                    config, page_name=f"外链站({_ref_site.split('//')[1][:20]})"
+                                )
+                                page.evaluate(f"window.location.href = '{target_url}'")
+                                time.sleep(random.uniform(2.0, 4.0))
+                                already_on_target = True
+                                enter_site_time = time.time()
+                                log.info(f"✅ [流量多样化] 外链跳转成功")
+                            except Exception as _ref_err:
+                                log.warning(f"⚠️ 外链跳转失败: {str(_ref_err)[:80]}，回退到搜索模式")
+                                _traffic_source = "search"
+                        
+                        # P0-2 Referer风控检查
+                        if _HAS_RCE:
+                            try:
+                                _kw = selected_keyword if 'selected_keyword' in dir() and selected_keyword else config.get('seo',{}).get('default_kw','')
+                                _ref_result = _rce.referer_guard.check_and_make(
+                                    search_url=generated_referer if (_traffic_source == 'search' and 'generated_referer' in dir()) else '',
+                                    landing_url=target_url,
+                                    kw=_kw,
+                                )
+                                if _ref_result.get('rewritten'):
+                                    log.info(f"🔗 P0-2 Referer已改写: {_ref_result.get('reason')} → {_ref_result.get('referer')[:80]}...")
+                            except Exception as _rce_e:
+                                log.debug(f"P0-2 Referer检查异常(忽略): {_rce_e}")
+                        
+                        # 搜索引擎模式（默认/回退）
+                        if _traffic_source == "search" and search_mode == "real_search":
                             # 执行完整搜索跳转流程（带真人模拟，支持所有搜索引擎）
                             search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config)
                             if search_success:
@@ -11894,7 +14142,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 # [调整] 把 enter_site_time 设置为现在（真搜索跳转完成即进入网站）
                                 enter_site_time = time.time()
                             else:
-                                log.warning(f"🔍 [真搜索] 未成功跳转，继续直接导航目标页")
+                                log.warning(f"🔍 [真搜索] 未成功跳转，将由Referer来源页导航进入目标站")
                         # =========================================
 
                         # 获取网页浏览模式配置（各层+循环+间隔）
@@ -11920,10 +14168,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         if chapter_loop_count <= 1:
                             loop_interval = 0.0
 
-                        # 读取 6 层配置（停留比例 + 最小停留 + 关键字 + 兜底 URL）
+                        # 读取 5 层配置（停留比例 + 最小停留 + 关键字 + 兜底 URL）
                         layers = []
                         total_ratio = 0.0
-                        for li in range(1, 7):
+                        for li in range(1, 6):
                             layer_cfg = web_config.get(f"layer_{li}", {})
                             ratio = float(layer_cfg.get("stay_ratio", 0.0) or 0.0)
                             min_stay = float(layer_cfg.get("min_stay", 10) or 10)
@@ -11949,6 +14197,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     l["ratio"] = share
                         total_ratio = sum(l["ratio"] for l in layers) or 1.0
 
+                        # P2-4 跳转漏斗 + CPL 仿真
+                        if _HAS_RCE:
+                            try:
+                                _target_url = current_task.get('target_url') or target_url
+                                _funnel_path = _rce.funnel.build_3layer(_target_url, layers=3)
+                                _cpl_stays = _rce.cpl_simulator.simulate(_funnel_path)
+                                log.info(f"📐 P2-4 漏斗: {len(_funnel_path)}层, CPL停留: {_cpl_stays}")
+                            except Exception as _rce_e:
+                                log.debug(f"P2-4 漏斗异常(忽略): {_rce_e}")
+
                         # ★ 修正逻辑：配置时长优先，保险绳保底
                         #   每轮独立随机，但总时长不超过对数正态保险绳
                         if enter_site_time is None:
@@ -11962,10 +14220,30 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         _sd_mu = _math.log(_sd_median)
                         # ★ 修复：保险绳下限必须≥配置的浏览时长最小值，避免deadline提前截断浏览
                         _cfg_stay_min_for_rope = float(config.get("total_stay", {}).get("min", 80))
+                        _cfg_stay_max_for_rope = float(config.get("total_stay", {}).get("max", 300))
                         _rope_floor = max(60, _cfg_stay_min_for_rope)  # 不低于配置min，且绝对不低于60s
                         _session_secs = min(_sd_cap, max(_rope_floor, _math.exp(random.gauss(_sd_mu, _sd_sigma))))
                         task_deadline = enter_site_time + _session_secs
-                        log.info(f"⏱️ Session时长(对数正态): {_session_secs:.0f}s (中位数={_sd_median:.0f}s, σ={_sd_sigma}, 下限={_rope_floor:.0f}s)")
+                        # ========== ★ 停留日志：进入网站锚点 + Session保险绳参数（用于排查广告收益低） ==========
+                        log.info(
+                            f"⏱️ [停留-01] enter_site_time锚点: {time.strftime('%H:%M:%S', time.localtime(enter_site_time))}, "
+                            f"total_stay配置: min={_cfg_stay_min_for_rope:.0f}s / max={_cfg_stay_max_for_rope:.0f}s"
+                        )
+                        log.info(
+                            f"⏱️ [停留-02] Session保险绳(对数正态): {_session_secs:.0f}s | "
+                            f"参数: median={_sd_median:.0f}s, σ={_sd_sigma}, hard_cap={_sd_cap:.0f}s, floor={_rope_floor:.0f}s | "
+                            f"task_deadline = {time.strftime('%H:%M:%S', time.localtime(task_deadline))}"
+                        )
+                        if _session_secs < _BROWSE_DURATION_CRITICAL_S:
+                            log.error(
+                                f"⏱️ [停留-02/红线] Session保险绳={_session_secs:.0f}s < 红线{_BROWSE_DURATION_CRITICAL_S:.0f}s，"
+                                f"广告脚本大概率没完成 init→request→拍卖→渲染，必然 0 收益！建议把 config.total_stay.min 至少调到 {int(_BROWSE_DURATION_WARN_S)+10}s"
+                            )
+                        elif _session_secs < _BROWSE_DURATION_WARN_S:
+                            log.warning(
+                                f"⏱️ [停留-02/警告] Session保险绳={_session_secs:.0f}s < 建议值{_BROWSE_DURATION_WARN_S:.0f}s，"
+                                f"广告可能有填充但 ActiveView 计数被折损。建议把 config.total_stay.min 至少调到 {int(_BROWSE_DURATION_WARN_S)+10}s"
+                            )
                         
                         round_total_stays = []
                         remaining_time = task_deadline - time.time()  # 剩余可运行时间
@@ -11990,12 +14268,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         log.info(
                             f"🎯 浏览循环次数: {chapter_loop_count}次，每轮间隔: {loop_interval:.1f}秒，"
                             f"各轮随机时长: {', '.join(f'{s:.1f}s' for s in round_total_stays)}，"
-                            f"任务总浏览时长≈{total_task_stay:.1f}秒（=各轮之和，不含前置/拨号/间隔）"
+                            f"任务总浏览时长≈{total_task_stay:.1f}秒（=各轮之和，不含前置/取IP/间隔）"
                         )
                         for _ridx in range(chapter_loop_count):
                             log.info(
-                                f"📊 第{_ridx+1}轮每层停留(L1-L5): "
-                                + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(min(5, len(round_layer_stays[_ridx]))))
+                                f"📊 第{_ridx+1}轮每层停留(L1-L{len(layers)}): "
+                                + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(len(round_layer_stays[_ridx])))
                             )
     
                         # ========== 风控核心：Referer来源页自然导航链路 ==========
@@ -12043,11 +14321,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             log.info(f"🔗 [风控铁律] 第0步：访问Referer来源页: {_referer_url[:80]}")
                             _referer_visited = False
                             try:
-                                page.goto(_referer_url, timeout=30000, wait_until="domcontentloaded")
+                                simulate_rtt_jitter(base_ms=60, jitter_ms=50)  # ★ RTT仿真
                                 try:
-                                    page.wait_for_load_state("networkidle", timeout=5000)
+                                    _hard_timeout_goto(page, _referer_url, timeout=30, wait_until="domcontentloaded")
                                 except Exception:
                                     pass
+                                _safe_page_wait(page, min_wait=1.0, max_wait=2.0, ad_wait=False)
                                 _referer_visited = True
                                 log.info(f"✅ [风控] Referer来源页已加载: {page.url[:60]}")
                             except Exception as e:
@@ -12061,7 +14340,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 # 滚动浏览来源页内容
                                 try:
                                     for _scroll_i in range(random.randint(1, 3)):
-                                        _scroll_y = random.randint(100, 400)
+                                        _scroll_y = random.randint(int(config.get("scroll_pixels", {}).get("min", 100)), int(config.get("scroll_pixels", {}).get("max", 400)))
                                         page.mouse.wheel(0, _scroll_y)
                                         time.sleep(random.uniform(0.8, 2.0))
                                     # 随机鼠标移动（模拟阅读/浏览）
@@ -12111,24 +14390,18 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                 # 这确保 document.referrer = 来源页URL（真实浏览器行为）
                                                 # 而 page.goto(url, referer=xxx) 只设置HTTP头，不设置document.referrer
                                                 page.evaluate("(url) => { window.location.href = url; }", url)
-                                                # 等待页面加载
+                                                # 等待页面加载（networkidle → _safe_page_wait，根治卡死）
                                                 try:
                                                     page.wait_for_load_state("domcontentloaded", timeout=25000)
                                                 except Exception:
                                                     pass
-                                                try:
-                                                    page.wait_for_load_state("networkidle", timeout=8000)
-                                                except Exception:
-                                                    pass
+                                                _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=True)
                                                 # Cloudflare/WAF挑战检测
                                                 try:
                                                     if is_cloudflare_challenge(page):
                                                         log.info("🔐 检测到Cloudflare验证挑战，等待自动通过...")
                                                         time.sleep(random.uniform(5.0, 8.0))
-                                                        try:
-                                                            page.wait_for_load_state("networkidle", timeout=15000)
-                                                        except Exception:
-                                                            pass
+                                                        _safe_page_wait(page, min_wait=2.0, max_wait=4.0, ad_wait=True)
                                                 except Exception:
                                                     pass
                                                 # ★ 根因修复：验证导航是否成功（window.location.href可能被Referer页SW/CSP阻止）
@@ -12142,11 +14415,15 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                         # ★ 通过selenium_bridge的referer参数设置HTTP Referer头（CDP Network.setExtraHTTPHeaders）
                                                         # 这确保目标站收到的HTTP请求包含正确的Referer头
                                                         _referer_for_goto = referer or ''
-                                                        page.goto(url, timeout=30000, wait_until="domcontentloaded", referer=_referer_for_goto)
                                                         try:
-                                                            page.wait_for_load_state("networkidle", timeout=8000)
+                                                            _hard_timeout_goto(
+                                                                page, url, timeout=30,
+                                                                wait_until="domcontentloaded",
+                                                                referer=_referer_for_goto,
+                                                            )
                                                         except Exception:
                                                             pass
+                                                        _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=True)
                                                         # ★ 注入document.referrer覆写（让页面JS/广告脚本也能读到正确的referrer）
                                                         if _referer_for_goto:
                                                             try:
@@ -12184,6 +14461,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                         log.info(f"📄 从首页开始浏览: {target_url}")
                                     
                                     # ★ 自然跳转（从来源页通过JS导航，document.referrer自动正确）
+                                    simulate_rtt_jitter(base_ms=100, jitter_ms=60)  # ★ RTT仿真：模拟真实网络延迟
                                     if not optimized_page_goto(page, _actual_target, referer=_referer_url):
                                         log.error(f"页面访问多次失败，任务终止")
                                         return False
@@ -12220,7 +14498,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                     // EvaDav
                                                     if (document.querySelector('script[src*="evadav"],iframe[src*="evadav"]')) return 'EvaDav';
                                                     // HilltopAds/EvaDav 投放域名
-                                                    if (document.querySelector('script[src*="curoax"],script[src*="pufted"],iframe[src*="bony-teaching"],script[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
+                                                    if (document.querySelector('script[src*="curoax"],iframe[src*="curoax"],script[src*="pufted"],iframe[src*="pufted"],iframe[src*="bony-teaching"],script[src*="bony-teaching"],script[src*="untimely-hello"],iframe[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
                                                     // NativeAds
                                                     if (document.querySelector('[class*="nativeads"]')) return 'NativeAds';
                                                     // PropellerAds
@@ -12421,6 +14699,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     log.info(f"✅ [广告主动加载] 全页滚动后检测到 {_ad_containers_after_scroll} 个广告容器")
                                 else:
                                     log.info(f"⚠️ [广告主动加载] 全页滚动后仍未检测到广告DOM容器（广告脚本可能未执行或被阻断）")
+                                # ★ 广告点击：首页全页滚动后尝试点击
+                                _ad_clicked, current_x, current_y = try_click_visible_ad(page, config, current_x, current_y, stage="首页-广告加载后")
                             except Exception as _ad_load_e:
                                 log.warning(f"⚠️ [广告主动加载] 滚动触发异常: {str(_ad_load_e)[:80]}")
 
@@ -12455,6 +14735,22 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 _bounce_ceil = _bounce_floor + 20
                             _bounce_stay = random.uniform(_bounce_floor, _bounce_ceil)
                             log.info(f"🚪 跳出停留: {_bounce_stay:.1f}s (范围{_bounce_floor:.0f}~{_bounce_ceil:.0f}s, 配置min={_cfg_stay_min:.0f}s)")
+                            # ========== ★ 停留日志：跳出型分支 ==========
+                            if _bounce_stay < _BROWSE_DURATION_CRITICAL_S:
+                                log.error(
+                                    f"⏱️ [停留-03/红线] 跳出型任务停留={_bounce_stay:.1f}s < 红线{_BROWSE_DURATION_CRITICAL_S:.0f}s，"
+                                    f"广告脚本不可能完成 init+request+render，必然 0 收益。请把 config.bounce_rate.max 调低至≤0.15，"
+                                    f"并把 config.total_stay.min 至少调到 {int(_BROWSE_DURATION_WARN_S)+10}s"
+                                )
+                            elif _bounce_stay < _BROWSE_DURATION_WARN_S:
+                                log.warning(
+                                    f"⏱️ [停留-03/警告] 跳出型任务停留={_bounce_stay:.1f}s < 建议值{_BROWSE_DURATION_WARN_S:.0f}s，"
+                                    f"广告填充但 ActiveView 可能不计数，收益折损。建议把 bounce_rate.max 调低≤0.20"
+                                )
+                            else:
+                                log.info(
+                                    f"⏱️ [停留-03] 跳出型任务停留={_bounce_stay:.1f}s ≥ 建议值{_BROWSE_DURATION_WARN_S:.0f}s（仍属于高跳出率，长期会降低质量分）"
+                                )
                             current_x, current_y = simulate_human_in_window(
                                 page, _bounce_stay, page_behavior_stats, current_x, current_y,
                                 config, page_name=f"[T{task_idx+1}] 首页(跳出)", deadline=task_deadline
@@ -12462,7 +14758,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             ad_monitor = scan_ads_during_task(page, ad_monitor, "跳出型任务首页停留后")
                             log.info(f"🚪 跳出型任务完成：首页停留{_bounce_stay:.0f}s后离开")
                         if not _is_bounce:
-                            log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L6，任务总时长=各轮之和）")
+                            log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L{len(layers)}，任务总时长=各轮之和）")
                         if not _is_bounce:
                             for loop_idx in range(chapter_loop_count):
                                 try:
@@ -12487,9 +14783,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 # —— L1 首页停留 ——
                                 home_stay = _layer_stays[0]
                                 log.info(f"[第{loop_idx+1}轮] 首页(L1)停留窗口: {home_stay:.1f}秒")
+                                # ========== ★ 停留日志：L1-Ln 每层停留预算与红线对比 ==========
+                                _t_before_layers = time.time()
+                                if home_stay < 20:
+                                    log.warning(
+                                        f"⏱️ [停留-04/L{1}] 第{loop_idx+1}轮 L1首页停留预算={home_stay:.1f}s < 20s，"
+                                        f"内容+广告未进入视野就下翻，易被判定跳转垃圾流量（≥20s/页才被GA4记为有效页面）"
+                                    )
                                 current_x, current_y = simulate_human_in_window(
                                     page, home_stay, page_behavior_stats, current_x or 100, current_y or 100,
                                     config, page_name=f"[T{task_idx+1}] 首页", deadline=task_deadline
+                                )
+                                log.info(
+                                    f"⏱️ [停留-04/L{1}] 第{loop_idx+1}轮 L1首页实际运行: simulate_human_in_window 返回，"
+                                    f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
                                 )
                                 ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮首页停留后")
 
@@ -12504,18 +14811,29 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     page_behavior_stats["mouse_moves"] += 1
                                     list_stay = _layer_stays[1]
                                     log.info(f"[第{loop_idx+1}轮] 列表页(L2)停留窗口: {list_stay:.1f}秒")
+                                    if list_stay < 20:
+                                        log.warning(
+                                            f"⏱️ [停留-04/L2] 第{loop_idx+1}轮 L2列表页停留预算={list_stay:.1f}s < 20s，"
+                                            f"GA4会把<15s页记为bounce page session，降低广告质量分"
+                                        )
                                     current_x, current_y = simulate_human_in_window(
                                         page, list_stay, page_behavior_stats,
                                         current_x or 300, current_y or 300,
                                         config, page_name="列表页", deadline=task_deadline
                                     )
+                                    log.info(
+                                        f"⏱️ [停留-04/L2] 第{loop_idx+1}轮 L2列表页实际运行返回，"
+                                        f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
+                                    )
                                     ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮列表页停留后")
+                                    # ★ 广告点击：列表页检测到广告后按概率点击
+                                    _ad_clicked, current_x, current_y = try_click_visible_ad(page, config, current_x, current_y, stage=f"列表页L2-第{loop_idx+1}轮")
                                 else:
                                     log.warning(f"⚠️ 第{loop_idx+1}轮进入列表页失败，本轮跳过深层")
 
-                                # 尝试更深层浏览：layer_3 → layer_4 → ... → layer_6
+                                # 尝试更深层浏览：layer_3 → layer_4 → layer_5
                                 _broken = False
-                                for level_idx in range(2, 6):
+                                for level_idx in range(2, len(layers)):
                                     if not success_list:
                                         break
                                     try:
@@ -12544,12 +14862,25 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                                     stay = _layer_stays[level_idx]
                                     log.info(f"[第{loop_idx+1}轮] layer_{level_idx+1} 停留: {stay:.1f}秒")
+                                    if stay < 25:
+                                        log.warning(
+                                            f"⏱️ [停留-04/L{level_idx+1}] 第{loop_idx+1}轮 内容页(L{level_idx+1})停留预算={stay:.1f}s < 25s，"
+                                            f"内容页正常阅读需30~90s，过短会被GA4/Ads模型判定为诱导跳转或爬虫"
+                                        )
+                                    _ts_before_deep = time.time()
                                     current_x, current_y = simulate_human_in_window(
                                         page, stay, page_behavior_stats,
                                         current_x or 300, current_y or 300,
                                         config, page_name=f"layer_{level_idx+1}", deadline=task_deadline
                                     )
+                                    log.info(
+                                        f"⏱️ [停留-04/L{level_idx+1}] 第{loop_idx+1}轮 L{level_idx+1}内容页实际返回，"
+                                        f"预算={stay:.1f}s，真实耗时≈{time.time()-_ts_before_deep:.1f}s，"
+                                        f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
+                                    )
                                     ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮layer_{level_idx+1}停留后")
+                                    # ★ 广告点击：深层页面检测到广告后按概率点击
+                                    _ad_clicked, current_x, current_y = try_click_visible_ad(page, config, current_x, current_y, stage=f"layer{level_idx+1}-第{loop_idx+1}轮")
 
                                 if _broken:
                                     break
@@ -12582,13 +14913,32 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     except RuntimeError:
                                         break
                                     log.info(f"⏸ 每轮浏览间隔: {loop_interval:.1f}秒（真人行为持续）")
+                                    _ts_before_interval = time.time()
                                     current_x, current_y = simulate_human_in_window(
                                         page, loop_interval, page_behavior_stats,
                                         current_x or 100, current_y or 100,
                                         config, page_name=f"[轮间间隔{loop_idx+1}]", deadline=task_deadline
                                     )
+                                    log.info(
+                                        f"⏱️ [停留-05/轮间] 第{loop_idx+1}轮→{loop_idx+2}轮间隔返回，"
+                                        f"间隔预算={loop_interval:.1f}s，真实耗时≈{time.time()-_ts_before_interval:.1f}s，"
+                                        f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
+                                    )
     
                             # ========== 网页浏览模式结束 → 全程真人行为统计 ==========
+                            _sum_stats_stay_ms = page_behavior_stats.get("total_stay", 0)
+                            _sum_stats_stay_s = float(_sum_stats_stay_ms) / 1000.0 if isinstance(_sum_stats_stay_ms, (int, float)) else 0.0
+                            _actual_elapsed_s = float(time.time() - _t_before_layers) if '_t_before_layers' in dir() else 0.0
+                            log.info(
+                                f"⏱️ [停留-06/全程] 全流程L1→Ln实际运行≈{_actual_elapsed_s:.1f}s，"
+                                f"behavior_stats.total_stay(行为累加)={_sum_stats_stay_s:.1f}s，"
+                                f"deadline剩余={max(0, task_deadline - time.time()):.1f}s"
+                            )
+                            if _actual_elapsed_s > 0 and _actual_elapsed_s < _BROWSE_DURATION_CRITICAL_S:
+                                log.error(
+                                    f"⏱️ [停留-06/全程红线] 全流程运行仅{_actual_elapsed_s:.1f}s < 红线{_BROWSE_DURATION_CRITICAL_S:.0f}s，"
+                                    f"请检查：① _check_rope 是否提前抛RuntimeError ② 每层 stay_ratio 总和是否太小 ③ total_stay.min 是否过短"
+                                )
                             log.info(
                                 "✅ 网页浏览模式完成！全程真人行为统计："
                                 f"鼠标移动 {page_behavior_stats['mouse_moves']} 次，"
@@ -12657,7 +15007,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     // EvaDav
                                     if (document.querySelector('script[src*="evadav"],iframe[src*="evadav"]')) return 'EvaDav';
                                     // HilltopAds/EvaDav 投放域名（随机域名）
-                                    if (document.querySelector('script[src*="curoax"],script[src*="pufted"],iframe[src*="bony-teaching"],script[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
+                                    if (document.querySelector('script[src*="curoax"],iframe[src*="curoax"],script[src*="pufted"],iframe[src*="pufted"],iframe[src*="bony-teaching"],script[src*="bony-teaching"],script[src*="untimely-hello"],iframe[src*="untimely-hello"]')) return 'HilltopAds/EvaDav';
                                     // NativeAds 容器
                                     if (document.querySelector('[class*="nativeads"]')) return 'NativeAds';
                                     // 标准广告尺寸 iframe
@@ -12823,7 +15173,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         if exit_ip and exit_ip != "未知":
                             ip_session_manager.record_ip_session(exit_ip)
                         
-                        # ⏱️ 时间统计：前置流程时长（拨号→进入网站）、浏览网站时长（进入网站→任务结束）
+                        # ⏱️ 时间统计：前置流程时长（取IP→搜索/社媒跳转→进入网站）、浏览网站时长（进入网站→任务结束）
                         _task_end_time = time.time()
                         if enter_site_time is not None:
                             _pre_dur = max(0.0, enter_site_time - dial_start_time)
@@ -12833,11 +15183,71 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             _pre_dur = max(0.0, _task_end_time - dial_start_time)
                             _browse_dur = 0.0
                         log.info(
-                            f"<span style='color:#ff3333;font-weight:bold'>前置流程时长（拨号→进入网站）: {_pre_dur:.1f}秒</span>"
+                            f"<span style='color:#ff3333;font-weight:bold'>前置流程时长（取IP→搜索/社媒跳转→进入网站）: {_pre_dur:.1f}秒</span>"
                         )
                         log.info(
                             f"<span style='color:#ff3333;font-weight:bold'>浏览网站时长（进入网站→任务结束）: {_browse_dur:.1f}秒</span>"
                         )
+                        # P1-2 Profile持久化+回访入队
+                        if _HAS_RCE:
+                            try:
+                                _fp_id = current_task.get('fingerprint_id') or f"{country}|{selected_ua[:32] if 'selected_ua' in dir() else 'unknown'}"
+                                _target_host = ''
+                                try: _target_host = current_task.get('target_url','') or target_url
+                                except: pass
+                                _scroll_d = behavior_stats.get('total_scroll_depth',0) if 'behavior_stats' in dir() else 0.0
+                                _rce.profile_store.record_visit(
+                                    fp_id=_fp_id,
+                                    host=_target_host,
+                                    dwell_sec=_browse_dur if '_browse_dur' in dir() else 60,
+                                    scroll_depth=min(1.0, _scroll_d / 5000) if _scroll_d else 0.3,
+                                    clicks=ad_impressions if 'ad_impressions' in dir() else 0,
+                                )
+                                log.info(f"👤 P1-2 Profile已更新: fp={_fp_id[:20]}...")
+                            except Exception as _rce_e:
+                                log.debug(f"P1-2 Profile异常(忽略): {_rce_e}")
+                        # ========== ★ P2-5(2)：浏览网站时长全局审计 ==========
+                        # 低于 CRITICAL：直接判定"没给广告注入时间"，流量必然 0 收益
+                        # 低于 WARN 但 ≥CRITICAL：有注入概率但偏低，提示管理员把 total_stay 调大
+                        try:
+                            if enter_site_time is None:
+                                log.error(
+                                    f"🚫 P2-5[停留审计] 本任务 enter_site_time=None（未进入目标站），"
+                                    f"广告不可能被初始化/渲染/点击，必然 0 收益"
+                                )
+                            elif _browse_dur < _BROWSE_DURATION_CRITICAL_S:
+                                log.error(
+                                    f"🚫 P2-5[停留审计] 浏览网站时长={_browse_dur:.1f}s < "
+                                    f"红线 {_BROWSE_DURATION_CRITICAL_S:.0f}s，广告脚本大概率"
+                                    f"尚未完成 init→request→拍卖→渲染，本任务基本确定 0 收益。"
+                                    f"建议把 config.total_stay.min 提高到至少 {int(_BROWSE_DURATION_WARN_S)+10}s"
+                                )
+                            elif _browse_dur < _BROWSE_DURATION_WARN_S:
+                                log.warning(
+                                    f"⚠️ P2-5[停留审计] 浏览网站时长={_browse_dur:.1f}s < "
+                                    f"建议阈值 {_BROWSE_DURATION_WARN_S:.0f}s，广告有填充但可能没达到"
+                                    f"ActiveView(≥50%面积/≥1s) 计数，收益有较大折损。建议把 "
+                                    f"config.total_stay.min 提高到至少 {int(_BROWSE_DURATION_WARN_S)+10}s"
+                                )
+                            else:
+                                log.info(
+                                    f"✅ P2-5[停留审计] 浏览网站时长={_browse_dur:.1f}s ≥ "
+                                    f"{_BROWSE_DURATION_WARN_S:.0f}s 达标，广告有充足时间 "
+                                    f"init+request+render+ActiveView 计数"
+                                )
+                        except Exception as _audit_err:
+                            log.debug(f"停留审计日志异常(忽略): {type(_audit_err).__name__}")
+
+                        # P2-5 ICR 无效点击率监控
+                        if _HAS_RCE:
+                            try:
+                                _is_bounce_val = 1.0 if ('_is_bounce' in dir() and _is_bounce) else 0.0
+                                _rce.icr_monitor.record(time.time(), _browse_dur if '_browse_dur' in dir() else 0, _is_bounce_val)
+                                _warn_icr, _snap_icr, _why_icr = _rce.icr_monitor.should_warn()
+                                if _warn_icr:
+                                    log.error(f"🚫 P2-5 ICR告警: {_why_icr} | 快照={_snap_icr}")
+                            except Exception as _rce_e:
+                                log.debug(f"P2-5 ICR异常(忽略): {_rce_e}")
 
                         log.task_result(task_time, success, valid_traffic)
                     
@@ -12888,11 +15298,47 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 _pre_dur = max(0.0, _task_end_time - _dst)
                                 _browse_dur = 0.0
                             log.info(
-                                f"<span style='color:#ff3333;font-weight:bold'>前置流程时长（拨号→进入网站）: {_pre_dur:.1f}秒</span>"
+                                f"<span style='color:#ff3333;font-weight:bold'>前置流程时长（取IP→搜索/社媒跳转→进入网站）: {_pre_dur:.1f}秒</span>"
                             )
                             log.info(
                                 f"<span style='color:#ff3333;font-weight:bold'>浏览网站时长（进入网站→任务结束）: {_browse_dur:.1f}秒</span>"
                             )
+                            # ========== ★ P2-5(2)：异常路径也要审计停留时长 ==========
+                            try:
+                                if _est is None:
+                                    log.error(
+                                        f"🚫 P2-5[停留审计-异常] enter_site_time=None（未进入目标站），"
+                                        f"广告 0 收益"
+                                    )
+                                elif _browse_dur < _BROWSE_DURATION_CRITICAL_S:
+                                    log.error(
+                                        f"🚫 P2-5[停留审计-异常] 浏览网站时长={_browse_dur:.1f}s < "
+                                        f"红线 {_BROWSE_DURATION_CRITICAL_S:.0f}s，广告未完成渲染"
+                                    )
+                                elif _browse_dur < _BROWSE_DURATION_WARN_S:
+                                    log.warning(
+                                        f"⚠️ P2-5[停留审计-异常] 浏览网站时长={_browse_dur:.1f}s < "
+                                        f"建议阈值 {_BROWSE_DURATION_WARN_S:.0f}s"
+                                    )
+                                else:
+                                    log.info(
+                                        f"✅ P2-5[停留审计-异常] 浏览网站时长={_browse_dur:.1f}s ≥ "
+                                        f"{_BROWSE_DURATION_WARN_S:.0f}s 达标"
+                                    )
+                            except Exception:
+                                pass
+
+                        # P2-5 ICR 无效点击率监控（异常路径）
+                        if _HAS_RCE:
+                            try:
+                                _is_bounce_val = 1.0 if ('_is_bounce' in dir() and _is_bounce) else 0.0
+                                _bw_dur = _browse_dur if '_browse_dur' in dir() else 0
+                                _rce.icr_monitor.record(time.time(), _bw_dur, _is_bounce_val)
+                                _warn_icr, _snap_icr, _why_icr = _rce.icr_monitor.should_warn()
+                                if _warn_icr:
+                                    log.error(f"🚫 P2-5 ICR告警(异常路径): {_why_icr} | 快照={_snap_icr}")
+                            except Exception as _rce_e:
+                                log.debug(f"P2-5 ICR异常(忽略): {_rce_e}")
 
                         # 增强报警信息：包含异常类型、阶段、堆栈摘要
                         import traceback as _tb_inner
@@ -12967,6 +15413,15 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 )
                             except Exception as _qa_e:
                                 log.warning(f"[QA会话] 保存失败: {str(_qa_e)[:120]}")
+                        # ★ P2-9: 保存跨会话行为画像
+                        try:
+                            if _behavior_profile is not None and 'page_behavior_stats' in locals():
+                                _bp_save_url = target_url or config.get("target_url", "")
+                                _bp_save_country = (country or "US").upper()
+                                save_behavior_profile(_bp_save_url, _bp_save_country, page_behavior_stats, _behavior_profile)
+                                log.debug(f"🧠 [行为画像] 已更新(visit_count={_behavior_profile.get('visit_count', 0)})")
+                        except Exception as _bp_save_err:
+                            log.debug(f"[行为画像] 保存失败(忽略): {str(_bp_save_err)[:60]}")
                         if _cur_ctx is not None:
                             _ok, _err = _safe_close(_cur_ctx, "close", 15000, "context")
                             if _ok:
@@ -13002,10 +15457,17 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 _t_cleanup.sleep(_cleanup_wait)
                             except Exception:
                                 pass
+                        # ========== ★ P2-5：本任务正常/异常结束后，取消 suicide watchdog ==========
+                        _cancel_task_global_watchdog()
             except Exception as outer_e:
                 log.error(f"外层任务异常: {str(outer_e)}")
                 import traceback
                 log.debug(f"外层异常详情: {traceback.format_exc()}")
+                # 外层异常也要取消 watchdog，避免误自杀
+                try:
+                    _cancel_task_global_watchdog()
+                except Exception:
+                    pass
             
 
     
@@ -13057,7 +15519,8 @@ def index():
                                   statstotal=stats['total'], statssuccess=stats['success'], 
                                   statsfail=stats['fail'],
                                   stats=stats, runningtask=task_running,
-                                  planned_total=planned_total_tasks, APP_VERSION=APP_VERSION))
+                                  planned_total=planned_total_tasks, APP_VERSION=APP_VERSION,
+                                  VPS_HOST=os.environ.get("VPS_HOST", "")))
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
@@ -13106,9 +15569,19 @@ def get_website_task_status():
 @app.route('/get_video_stats', methods=['GET'])
 def get_video_stats():
     try:
+        # 兜底：直接从 stats 中读，避免引用未定义函数（UI 不崩）
+        # （get_total_video_views / get_country_video_views 若未来上线，再替换这里）
+        _cvv = stats.get("country_video_views", {}) or {}
+        if not isinstance(_cvv, dict):
+            _cvv = {}
+        _total_views = 0
+        try:
+            _total_views = sum(int(v) for v in _cvv.values() if isinstance(v, (int, float)))
+        except Exception:
+            _total_views = 0
         video_stats = {
-            "total_views": get_total_video_views(),
-            "country_views": get_country_video_views(),
+            "total_views": _total_views,
+            "country_views": dict(_cvv),
             "video_item_success": stats.get("video_item_success", 0),
             "video_item_fail": stats.get("video_item_fail", 0)
         }
@@ -14217,6 +16690,142 @@ def api_status():
         "total_video_watch_time": stats.get("total_video_watch_time", 0),
         "adsl": adsl_status
     })
+
+# ========== 🛡️ Dwell Monitor Guardian：Flask 控制接口（前端按钮：启动/停止/状态） ==========
+# 设计：用 subprocess.Popen 启动独立的 _dwell_monitor_guardian.py 守护进程，与 app.py 完全解耦，
+#       即便 app.py reload/重启，守护进程仍可单独存活或被明确 kill。
+import subprocess as _sp_dm
+import signal as _sig_dm
+_DWELL_MONITOR_PROC = {"proc": None, "start_ts": None}
+
+def _dm_snapshot_read_safe() -> dict:
+    """最佳方案是 guardian 写 JSON 到 logs/monitor_status.json，这里读它；若文件不存在则返回空快照。"""
+    import json as _json_dm
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "monitor_status.json")
+    try:
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return _json_dm.load(f)
+    except Exception:
+        pass
+    return {}
+
+@app.route('/dwell_monitor/status', methods=['GET'])
+def dwell_monitor_status():
+    proc = _DWELL_MONITOR_PROC["proc"]
+    running = bool(proc and proc.poll() is None)
+    pid = proc.pid if running else (proc.pid if proc else None)
+    full_status = _dm_snapshot_read_safe()
+    snapshot = full_status.get("snapshot", {})
+    alerts = full_status.get("alerts", [])
+    return jsonify({
+        "success": True,
+        "running": running,
+        "pid": pid,
+        "start_ts": _DWELL_MONITOR_PROC["start_ts"],
+        "snapshot": snapshot,
+        "alerts": alerts[-20:],  # 最近20条告警
+        "alert_count": len(alerts),
+        "alert_file": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "monitor_alerts.log"),
+        "consecutive_crit": full_status.get("consecutive_crit", 0),
+    })
+
+@app.route('/dwell_monitor/alerts', methods=['GET'])
+def dwell_monitor_alerts():
+    """返回告警历史（最近100条），支持 ?limit=N 参数"""
+    import json as _json_dm
+    limit = request.args.get("limit", 100, type=int)
+    limit = max(1, min(limit, 200))  # 限制在 1-200 之间
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "monitor_alerts.log")
+    alerts = []
+    try:
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            alerts.append(_json_dm.loads(line))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    # 按时间倒序，返回最近 limit 条
+    alerts = alerts[-limit:]
+    return jsonify({
+        "success": True,
+        "alerts": alerts,
+        "total": len(alerts),
+    })
+
+@app.route('/dwell_monitor/start', methods=['POST'])
+def dwell_monitor_start():
+    global _DWELL_MONITOR_PROC
+    data = request.get_json(silent=True) or {}
+    no_auto_pause = bool(data.get("no_auto_pause", False))
+    # 若已运行 → 直接返回成功
+    proc = _DWELL_MONITOR_PROC["proc"]
+    if proc and proc.poll() is None:
+        return jsonify({"success": True, "message": "Dwell Monitor 已在运行", "pid": proc.pid})
+    # 否则 spawn 一个新的 Python 子进程（stdout/stderr 吞掉，防止阻塞 app）
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    guardian_script = os.path.join(base_dir, "_dwell_monitor_guardian.py")
+    if not os.path.exists(guardian_script):
+        return jsonify({"success": False, "message": f"监控脚本不存在: {guardian_script}"}), 404
+    env = os.environ.copy()
+    cmd = [
+        sys.executable, guardian_script,
+        "--host=127.0.0.1",
+        f"--port={config.get('server_port', 5000) if hasattr(config, 'get') else 5000}",
+        f"--log={os.path.join(base_dir, 'app.log')}",
+        "--poll=0.15",
+    ]
+    if no_auto_pause:
+        cmd.append("--no-auto-pause")
+    try:
+        new_proc = _sp_dm.Popen(
+            cmd,
+            stdout=_sp_dm.DEVNULL,
+            stderr=_sp_dm.STDOUT,
+            cwd=base_dir,
+            env=env,
+            start_new_session=True,  # 独立会话，app 退出后 guardian 不会被连带 kill（用户要手动停）
+        )
+    except Exception as e:
+        return jsonify({"success": False, "message": f"启动失败: {type(e).__name__}: {e}"}), 500
+    _DWELL_MONITOR_PROC["proc"] = new_proc
+    _DWELL_MONITOR_PROC["start_ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify({"success": True, "pid": new_proc.pid, "cmd": cmd})
+
+@app.route('/dwell_monitor/stop', methods=['POST'])
+def dwell_monitor_stop():
+    global _DWELL_MONITOR_PROC
+    proc = _DWELL_MONITOR_PROC["proc"]
+    if not proc:
+        return jsonify({"success": True, "message": "Dwell Monitor 未启动"})
+    if proc.poll() is not None:
+        _DWELL_MONITOR_PROC["proc"] = None
+        return jsonify({"success": True, "message": "Dwell Monitor 已退出(僵尸句柄清理)"})
+    try:
+        try:
+            # start_new_session=True 的情况下 kill pgid 最干净
+            os.killpg(os.getpgid(proc.pid), _sig_dm.SIGTERM)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except _sp_dm.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), _sig_dm.SIGKILL)
+            except Exception:
+                proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+    finally:
+        _DWELL_MONITOR_PROC["proc"] = None
+    return jsonify({"success": True, "message": "Dwell Monitor 已停止"})
 
 @app.route('/api/debug_config')
 def debug_config():
