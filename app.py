@@ -14736,8 +14736,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if not _ht_cfg.get("enabled", False):
                                 return False, None
                             try:
+                                # ★ P0-3：传入 IP 信息，机房/代理IP 直接拒绝，避免浪费代理费
+                                _ip_info = resolved_ip_info if 'resolved_ip_info' in dir() else None
                                 _ok, _pop, _diag = _popunder.trigger_popunder(
                                     _page, _context, config=_ht_cfg,
+                                    resolved_ip_info=_ip_info,
                                 )
                                 if _ok:
                                     log.info(
