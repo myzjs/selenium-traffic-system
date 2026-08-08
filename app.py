@@ -20,7 +20,7 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -3940,25 +3940,39 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
     from seo_query_module import get_seo_query
 
     # ===== 各搜索引擎专属选择器 =====
+    # ★ 修复：更新各引擎CSS选择器，适配2025-2026最新DOM结构
     ENGINE_SELECTORS = {
         "google": {
-            "search_box": 'input[name="q"]',
+            "search_box": 'textarea[name="q"], input[name="q"]',
             "result_links": [
-                'a[data-ved][href*="http"]',
-                'a[data-ved]',
+                '#search a[href*="/url?q="]',
+                '#search a[data-ved][href*="http"]',
+                '#search a[data-ved]',
+                '#rso a[href*="/url?q="]',
+                '#rso a[href*="http"]',
+                '#rso a[data-ved]',
+                'div.g a[href*="/url?q="]',
+                'div.g a[data-ved]',
             ],
             "privacy_buttons": [
                 'button[aria-label*="Accept all"]',
                 'button:has-text("Accept all")',
                 'button:has-text("Accept")',
+                'button[aria-label*="Alle akzeptieren"]',
+                'button[aria-label*="Tout accepter"]',
+                'button[aria-label*="Aceptar"]',
                 'div[id*="L2AGLb"] button',
+                'form[action*="consent"] button',
             ],
         },
         "bing": {
-            "search_box": 'input[name="q"]',
+            "search_box": 'input[name="q"], textarea[name="q"]',
             "result_links": [
+                '#b_results li.b_algo h2 a',
+                '#b_results li.b_algo a[href*="http"]',
                 'li.b_algo h2 a',
-                'li.b_algo a[href*="http"]',
+                'li.b_algo a[href]',
+                '#b_results a[href*="http"]',
             ],
             "privacy_buttons": [
                 'button[id*="bnp_btn_accept"]',
@@ -3969,12 +3983,13 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         "baidu": {
             "search_box": 'input[id="kw"], input[name="wd"]',
             "result_links": [
-                'h3.t a[href*="http"]',
+                'h3.t a',
                 'h3.c-title a',
                 '.result h3 a',
                 '.c-container h3 a',
+                '#content_left h3 a',
             ],
-            "privacy_buttons": [],  # 百度一般无隐私弹窗
+            "privacy_buttons": [],
         },
         "sogou": {
             "search_box": 'input[id="upquery"], input[name="query"]',
@@ -3982,6 +3997,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                 'h3.vr-title a',
                 '.results h3 a',
                 '.vrwrap h3 a',
+                '#main h3 a',
             ],
             "privacy_buttons": [],
         },
@@ -3991,10 +4007,37 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                 'h3.res-title a',
                 '.result h3 a',
                 'li.res-list h3 a',
+                '#resultso a[href]',
             ],
             "privacy_buttons": [],
         },
     }
+    
+    def _parse_redirect_url(href):
+        """从搜索引擎重定向URL中提取真实目标URL"""
+        try:
+            parsed = urlparse(href)
+            # Google: /url?q=ACTUAL_URL&sa=...
+            if '/url' in parsed.path and 'q=' in href:
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                if 'q' in qs:
+                    return qs['q'][0]
+            # Baidu: /link?url=ENCODED
+            if 'link?url=' in href:
+                from urllib.parse import parse_qs, unquote
+                qs = parse_qs(parsed.query)
+                if 'url' in qs:
+                    return unquote(qs['url'][0])
+            # Sogou: /link?url=...
+            if '/link?' in href and 'url=' in href:
+                from urllib.parse import parse_qs, unquote
+                qs = parse_qs(parsed.query)
+                if 'url' in qs:
+                    return unquote(qs['url'][0])
+        except Exception:
+            pass
+        return href
 
     try:
         log.info(f"🔍 [真搜索] 开始完整搜索跳转流程，引擎={selected_engine_id}, 关键词={selected_keyword}")
@@ -4141,20 +4184,60 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         # 等待搜索结果页（networkidle → _safe_page_wait）
         _safe_page_wait(page, min_wait=1.5, max_wait=3.5, ad_wait=False)
 
+        # ★ 8.5 检测CAPTCHA/空结果页（提前发现问题）
+        try:
+            _post_url = page.url
+            _post_title = (page.title() or "").lower()
+            _captcha_keywords = ["captcha", "recaptcha", "unusual traffic", "not a robot",
+                                 "验证", "人机验证", "安全检测", "robot", "blocked",
+                                 "sorry", "access denied", "403"]
+            if any(kw in _post_title for kw in _captcha_keywords):
+                log.warning(f"🔍 [真搜索] 检测到CAPTCHA/拦截页面: title={page.title()[:60]}, url={_post_url[:80]}")
+            elif "google" in selected_engine_id and "#search" not in _post_url and "q=" not in _post_url:
+                log.warning(f"🔍 [真搜索] Google搜索结果页URL异常(无q参数): {_post_url[:80]}")
+            elif "bing" in selected_engine_id and "q=" not in _post_url:
+                log.warning(f"🔍 [真搜索] Bing搜索结果页URL异常(无q参数): {_post_url[:80]}")
+        except Exception:
+            pass
+
         # 9. 新增：在搜索结果页加入真人模拟窗口！
         results_duration = random.uniform(3.0, 6.0)
         log.info(f"🔍 [真搜索] 在搜索结果页停留：{results_duration:.1f}s，真人模型介入")
         current_x, current_y = simulate_human_in_window(page, results_duration, stats, current_x, current_y, config, page_name=f"搜索结果页({selected_engine_id})")
 
-        # 10. 找目标链接（使用引擎专属结果选择器 + 通用兜底）
+        # 10. 找目标链接（使用引擎专属结果选择器 + 重定向URL解析 + JS兜底）
         log.info(f"🔍 [真搜索] 查找目标链接: {target_url}")
         target_parsed = urlparse(target_url)
         target_host = target_parsed.netloc
+        # ★ 去掉 www. 前缀以提高匹配率（Google/Bing 结果常省略 www）
+        target_host_nowww = target_host.replace("www.", "")
         target_link_found = None
+
+        # ★ Debug: 记录当前页面URL和标题
+        try:
+            _debug_url = page.url
+            _debug_title = page.title() or ""
+            log.info(f"🔍 [真搜索] 搜索结果页URL: {_debug_url[:120]}, 标题: {_debug_title[:60]}")
+        except Exception:
+            pass
 
         # 构建结果链接选择器列表：引擎专属 + 通用域名匹配
         result_selectors = list(selectors.get("result_links", []))
         result_selectors.append('a[href*="' + target_host + '"]')
+        result_selectors.append('a[href*="' + target_host_nowww + '"]')
+
+        # ★ 辅助函数：检查href是否匹配目标站
+        def _href_matches_target(href):
+            if not href:
+                return False
+            # 直接匹配
+            if target_host in href or target_host_nowww in href:
+                return True
+            # 解析重定向URL（Google /url?q=、Baidu /link?url=、Sogou /link?url=）
+            resolved = _parse_redirect_url(href)
+            if resolved != href and (target_host in resolved or target_host_nowww in resolved):
+                return True
+            return False
 
         # 遍历搜索结果中的 a 标签
         for selector in result_selectors:
@@ -4162,14 +4245,62 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                 links = page.query_selector_all(selector)
                 for l in links:
                     href = l.get_attribute("href")
-                    if href and target_host in href:
+                    if _href_matches_target(href):
                         target_link_found = l
-                        log.info(f"🔍 [真搜索] 找到目标搜索结果链接: {href}")
+                        log.info(f"🔍 [真搜索] 找到目标搜索结果链接: {href[:120]}")
                         break
                 if target_link_found:
                     break
             except Exception:
                 continue
+
+        # ★ JS兜底：如果CSS选择器全部未命中，用JS遍历全页面所有a标签
+        if not target_link_found:
+            try:
+                _js_result = page.evaluate("""(targetHost, targetHostNoWww) => {
+                    const links = document.querySelectorAll('a[href]');
+                    const allHrefs = [];
+                    for (const a of links) {
+                        const href = a.href;
+                        if (!href) continue;
+                        allHrefs.push(href.substring(0, 150));
+                        if (href.includes(targetHost) || href.includes(targetHostNoWww)) {
+                            return { found: true, href: href, index: allHrefs.length };
+                        }
+                        // 检查Google重定向URL
+                        try {
+                            const url = new URL(href, window.location.href);
+                            if (url.pathname === '/url') {
+                                const q = url.searchParams.get('q');
+                                if (q && (q.includes(targetHost) || q.includes(targetHostNoWww))) {
+                                    return { found: true, href: q, redirectHref: href, index: allHrefs.length };
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return { found: false, totalLinks: links.length, sampleHrefs: allHrefs.slice(0, 20) };
+                }""", target_host, target_host_nowww)
+
+                if _js_result and _js_result.get("found"):
+                    _found_href = _js_result.get("href", "")
+                    log.info(f"🔍 [真搜索] JS兜底找到目标链接(index={_js_result.get('index')}): {_found_href[:120]}")
+                    try:
+                        if _js_result.get("redirectHref"):
+                            target_link_found = page.query_selector(f'a[href*="{_found_href[:60]}"]')
+                        if not target_link_found:
+                            target_link_found = page.query_selector(f'a[href*="{target_host}"]')
+                        if not target_link_found:
+                            target_link_found = page.query_selector(f'a[href*="{target_host_nowww}"]')
+                    except Exception:
+                        pass
+                else:
+                    _total = _js_result.get("totalLinks", 0) if _js_result else 0
+                    _samples = _js_result.get("sampleHrefs", []) if _js_result else []
+                    log.warning(f"🔍 [真搜索] 全页面未找到目标链接 (总链接数={_total})")
+                    if _samples:
+                        log.warning(f"🔍 [真搜索] 前20个链接样本: {_samples[:5]}")
+            except Exception as _js_err:
+                log.warning(f"🔍 [真搜索] JS兜底搜索失败: {str(_js_err)[:100]}")
         
         if target_link_found:
             # 滚动到可见（加超时保护，避免元素已脱离DOM导致卡死）
