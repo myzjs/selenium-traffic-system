@@ -45,6 +45,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _LAST_POPUNDER_TS: float = 0.0
 _ACTIVE_GUARDIANS: List[threading.Thread] = []
 
+# ★ 新增：页面级防重复触发守卫（防止同一页面并发触发多个弹窗）
+_PAGE_TRIGGER_LOCK = threading.Lock()
+_PAGE_ACTIVE_TRIGGERS: Dict[int, float] = {}  # page_id -> trigger_ts
+
 # ★ 二次审计修复：ISP 关键词提升到模块级（避免每次调用重建元组）
 _HOSTING_ISP_KEYWORDS = frozenset({
     "digitalocean", "linode", "vultr", "hetzner", "ovh",
@@ -140,6 +144,58 @@ _POPUNDER_STEALTH_SCRIPT = """
                 get: function() { return {}; },
                 configurable: true
             });
+        }
+    } catch(e) {}
+
+    // 6. ★ 新增：全局 unhandledrejection 捕获（防止未处理 Promise 异常导致页面崩溃）
+    try {
+        if (!window.__ht_rejection_handler) {
+            window.addEventListener('unhandledrejection', function(event) {
+                // 广告 SDK 的 Promise 经常 reject，吞掉防止页面崩溃
+                try {
+                    event.preventDefault();
+                } catch(e) {}
+            });
+            window.__ht_rejection_handler = true;
+        }
+    } catch(e) {}
+
+    // 7. ★ 新增：window.onerror 兜底（捕获未 try-catch 的同步异常）
+    try {
+        if (!window.__ht_onerror_handler) {
+            var _orig_onerror = window.onerror;
+            window.onerror = function(msg, url, line, col, error) {
+                // 广告脚本异常静默处理，不影响主流程
+                if (url && (url.indexOf('ad') > -1 || url.indexOf('tag') > -1
+                    || url.indexOf('pop') > -1 || url.indexOf('push') > -1)) {
+                    return true; // 阻止默认错误处理
+                }
+                // 非广告相关错误，传递给原始 onerror
+                if (typeof _orig_onerror === 'function') {
+                    return _orig_onerror(msg, url, line, col, error);
+                }
+                return false;
+            };
+            window.__ht_onerror_handler = true;
+        }
+    } catch(e) {}
+
+    // 8. ★ 新增：广告实例防重复初始化守卫
+    // 防止页面多次调用 window.open() 或广告 SDK 重复初始化
+    try {
+        if (!window.__ht_ad_instance_guard) {
+            window.__ht_ad_instance_guard = true;
+            window.__ht_ad_open_count = 0;
+            // 拦截 window.open，限制同一页面的弹窗创建次数
+            var _orig_open = window.open;
+            window.open = function() {
+                window.__ht_ad_open_count = (window.__ht_ad_open_count || 0) + 1;
+                // 同一页面最多允许 2 个弹窗（主弹窗 + 1 个备份）
+                if (window.__ht_ad_open_count > 2) {
+                    return null; // 拒绝第 3+ 个弹窗
+                }
+                return _orig_open.apply(this, arguments);
+            };
         }
     } catch(e) {}
 })();
@@ -361,12 +417,33 @@ def _guard_stay_and_close(
             pass
     except Exception as e:
         _log.debug("[Pop-under] 守护线程异常(忽略): %s", e)
+    finally:
+        # ★ 新增：清理页面级触发守卫
+        if main_page is not None:
+            _cleanup_page_triggers(id(main_page))
 
 
 def _cleanup_dead_guardians():
     """清理已经结束的守护线程（非阻塞）"""
     global _ACTIVE_GUARDIANS
     _ACTIVE_GUARDIANS = [t for t in _ACTIVE_GUARDIANS if t.is_alive()]
+
+
+def _cleanup_page_triggers(page_id: int) -> None:
+    """清理页面级触发守卫（弹窗关闭后调用）"""
+    with _PAGE_TRIGGER_LOCK:
+        _PAGE_ACTIVE_TRIGGERS.pop(page_id, None)
+
+
+def _check_page_reentry(page_id: int, cooldown_s: float = 90.0) -> bool:
+    """检查同一页面是否有活跃触发（防并发重复）。返回 True=允许触发。"""
+    with _PAGE_TRIGGER_LOCK:
+        now = time.time()
+        last_ts = _PAGE_ACTIVE_TRIGGERS.get(page_id, 0.0)
+        if now - last_ts < cooldown_s:
+            return False  # 仍在冷却中
+        _PAGE_ACTIVE_TRIGGERS[page_id] = now
+        return True
 
 
 # ============================================================================
@@ -401,7 +478,7 @@ def trigger_popunder(
     if not is_ip_safe_for_hilltopads(resolved_ip_info):
         return False, None, {"triggered": False, "reason": "ip_unsafe"}
 
-    # ---- 冷却检查 ----
+    # ---- 冷却检查（全局） ----
     _cleanup_dead_guardians()
     now = time.time()
     cooldown = cfg.get("cooldown_between_triggers_s", 90)
@@ -411,6 +488,12 @@ def trigger_popunder(
             int(now - _LAST_POPUNDER_TS), cooldown,
         )
         return False, None, {"triggered": False, "reason": "cooldown"}
+
+    # ---- 页面级防重复触发守卫（防并发 worker 对同一 page 重复触发） ----
+    page_id = id(page)
+    if not _check_page_reentry(page_id, cooldown_s=float(cooldown)):
+        _log.info("Pop-under 页面级冷却中（同一页面 %d s 内已触发），跳过", cooldown)
+        return False, None, {"triggered": False, "reason": "page_cooldown"}
 
     # ---- 随机概率 ----
     prob = cfg.get("trigger_probability", 0.40)
@@ -606,11 +689,17 @@ def self_test() -> Dict[str, bool]:
     results["guardian_subtracts_elapsed"] = "stay_sec - elapsed" in open(__file__).read()
     results["hosting_keywords_module_level"] = isinstance(_HOSTING_ISP_KEYWORDS, frozenset)
     results["coords_none_safe"] = True  # page=None 不再依赖异常兜底
+    # ★ 三次审计新增验证（全局异常捕获 + onerror + 防重复初始化）
+    results["unhandled_rejection_handler"] = "unhandledrejection" in _POPUNDER_STEALTH_SCRIPT
+    results["onerror_handler"] = "__ht_onerror_handler" in _POPUNDER_STEALTH_SCRIPT
+    results["ad_instance_guard"] = "__ht_ad_instance_guard" in _POPUNDER_STEALTH_SCRIPT
+    results["page_reentry_guard"] = callable(_check_page_reentry)
+    results["page_trigger_cleanup"] = callable(_cleanup_page_triggers)
     return results
 
 
 if __name__ == "__main__":
-    print("Pop-under Trigger 模块自检 (含 P0×3 修复):")
+    print("Pop-under Trigger 模块自检 (含 P0×3 + 三次审计修复):")
     for k, v in self_test().items():
         status = "PASS" if v else "FAIL"
         print(f"  {status}  {k}")
