@@ -229,7 +229,7 @@ class IPProvider:
         return {"success": False, "error": f"IPDeep API {max_retries}次尝试均失败"}
 
     def _get_ip_details(self, proxy_url: str) -> Dict:
-        """通过代理获取出口IP详细信息"""
+        """通过代理获取出口IP详细信息（5个API + 重试，提高容错）"""
         ip_apis = [
             {
                 "name": "ip-api.com",
@@ -260,26 +260,91 @@ class IPProvider:
                     "isp": data.get("org"),
                     "language": _get_language_from_country(data.get("country", "US"))
                 }
+            },
+            {
+                "name": "ifconfig.me",
+                "url": "http://ifconfig.me/ip",
+                "parser": lambda text: {
+                    "success": bool(text.strip()),
+                    "ip": text.strip(),
+                    "country": "",
+                    "country_code": "",
+                    "region": "",
+                    "city": "",
+                    "timezone": "",
+                    "isp": "",
+                    "language": "en-US",
+                    "_ip_only": True  # 标记：仅获取IP，需二次查询地理信息
+                },
+                "_text_mode": True
+            },
+            {
+                "name": "api.ipify.org",
+                "url": "https://api.ipify.org?format=json",
+                "parser": lambda data: {
+                    "success": bool(data.get("ip")),
+                    "ip": data.get("ip"),
+                    "country": "",
+                    "country_code": "",
+                    "region": "",
+                    "city": "",
+                    "timezone": "",
+                    "isp": "",
+                    "language": "en-US",
+                    "_ip_only": True
+                }
+            },
+            {
+                "name": "checkip.amazonaws.com",
+                "url": "http://checkip.amazonaws.com",
+                "parser": lambda text: {
+                    "success": bool(text.strip()),
+                    "ip": text.strip(),
+                    "country": "",
+                    "country_code": "",
+                    "region": "",
+                    "city": "",
+                    "timezone": "",
+                    "isp": "",
+                    "language": "en-US",
+                    "_ip_only": True
+                },
+                "_text_mode": True
             }
         ]
 
         proxies = {"http": proxy_url, "https": proxy_url}
 
-        for api in ip_apis:
-            try:
-                resp = requests.get(api["url"], proxies=proxies, timeout=8)
-                if resp.status_code != 200:
+        # ★ 最多尝试2轮（第2轮仅重试前2个完整API）
+        for round_idx in range(2):
+            apis_to_try = ip_apis if round_idx == 0 else ip_apis[:2]
+            for api in apis_to_try:
+                try:
+                    resp = requests.get(api["url"], proxies=proxies, timeout=10)
+                    if resp.status_code != 200:
+                        continue
+                    # 文本模式 vs JSON模式
+                    if api.get("_text_mode"):
+                        result = api["parser"](resp.text)
+                    else:
+                        data = resp.json()
+                        result = api["parser"](data)
+                    if result.get("success") and result.get("ip"):
+                        # 如果仅获取到IP（无地理信息），用ip-api.com补全
+                        if result.get("_ip_only") and not result.get("country_code"):
+                            geo = self._enrich_ip_geo(result["ip"])
+                            if geo:
+                                result.update(geo)
+                        logger.info(f"[IP详情] 通过 {api['name']} 获取: {result.get('ip')} ({result.get('country_code', '?')})")
+                        return result
+                except Exception as e:
+                    logger.debug(f"[IP详情] {api['name']} 失败(round{round_idx}): {e}")
                     continue
-                data = resp.json()
-                result = api["parser"](data)
-                if result.get("success") and result.get("ip"):
-                    logger.info(f"[IP详情] 通过 {api['name']} 获取: {result.get('ip')} ({result.get('country')})")
-                    return result
-            except Exception as e:
-                logger.debug(f"[IP详情] {api['name']} 失败: {e}")
-                continue
+            if round_idx == 0:
+                logger.debug("[IP详情] 第1轮全部失败，1秒后重试...")
+                time.sleep(1)
 
-        logger.warning("[IP详情] 所有API失败，无法获取出口IP信息")
+        logger.warning("[IP详情] 所有API失败(2轮)，无法获取出口IP信息")
         # ★ 审计修复#10：所有API失败时不应返回success:True，避免下游用"未知"作为IP地址
         return {
             "success": False,
@@ -293,6 +358,30 @@ class IPProvider:
             "isp": "Unknown",
             "language": "en-US"
         }
+
+    def _enrich_ip_geo(self, ip: str) -> Dict:
+        """用ip-api.com补全IP地理信息（直连，不走代理）"""
+        try:
+            resp = requests.get(
+                f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,timezone,isp",
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success":
+                    return {
+                        "country": data.get("country"),
+                        "country_code": data.get("countryCode"),
+                        "region": data.get("regionName"),
+                        "city": data.get("city"),
+                        "timezone": data.get("timezone"),
+                        "isp": data.get("isp"),
+                        "language": _get_language_from_country(data.get("countryCode", "US")),
+                        "_ip_only": False
+                    }
+        except Exception:
+            pass
+        return None
 
 
 def _get_language_from_country(country_code: str) -> str:

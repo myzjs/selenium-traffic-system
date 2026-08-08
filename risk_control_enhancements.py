@@ -524,9 +524,28 @@ class _AdvIsolation:
         try:
             with self._state.open("r", encoding="utf-8") as f:
                 d = json.load(f)
-            self._di = {tuple(k): v for k, v in d.get("di", {})}
-            self._ia = {tuple(k): v for k, v in d.get("ia", {})}
-            self._ad = {tuple(k): v for k, v in d.get("ad", {})}
+            # _save 写出的是三元组列表 [k1, k2, ts]，不能用 {k, v} 二元解包
+            def _pairs(raw):
+                out = {}
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        try:
+                            out[tuple(k)] = v
+                        except Exception:
+                            continue
+                elif isinstance(raw, list):
+                    for item in raw:
+                        try:
+                            if len(item) == 3:
+                                out[(item[0], item[1])] = item[2]
+                            elif len(item) == 2:
+                                out[tuple(item[0])] = item[1]
+                        except Exception:
+                            continue
+                return out
+            self._di = _pairs(d.get("di", []))
+            self._ia = _pairs(d.get("ia", []))
+            self._ad = _pairs(d.get("ad", []))
         except Exception as e:
             _log.warning("adv_isolation 状态加载失败: %s", e)
 

@@ -360,13 +360,20 @@ class Frame:
             self._switch_back()
 
     def _wrap_script(self, script: str, arg=None) -> str:
-        if callable_like := script.strip().startswith("() =>") or script.strip().startswith("function"):
+        import re as _re_ws
+        s = script.strip()
+        # ★ 带参箭头函数：(keywords) => {...} → 用 arguments[0] 传参调用
+        if _re_ws.match(r"^\(([^()]*)\)\s*=>", s) or _re_ws.match(r"^[A-Za-z_$][\w$]*\s*=>", s):
+            if arg is not None:
+                return f"return ({s})(arguments[0]);"
+            return f"return ({s})();"
+        if s.startswith("() =>") or s.startswith("function"):
             if arg is not None:
                 return f"return ({script})(arguments[0]);"
             return f"return ({script})();"
         if arg is not None:
             return f"return (function() {{ {script} }})(arguments[0]);"
-        return f"return (function() {{ {script} }})();" if not script.strip().startswith("return") else script
+        return f"return (function() {{ {script} }})();" if not s.startswith("return") else script
 
     def wait_for_load_state(self, state: str = "load", timeout: int = 30000):
         """等待加载状态"""
@@ -766,6 +773,11 @@ class Page:
         Page._set_current_page(self)
 
     @property
+    def context(self):
+        """公开context属性，兼容Playwright API（page.context.options）"""
+        return self._context
+
+    @property
     def url(self) -> str:
         try:
             return self.driver.current_url or ""
@@ -975,7 +987,14 @@ class Page:
 
     def _prepare_script(self, script: str, arg=None) -> str:
         """准备JS脚本"""
+        import re as _re_ps
         s = script.strip()
+        # ★ 带参箭头函数：(keywords) => {...} 或 x => {...}
+        # 必须用 arguments[0] 传参调用，否则函数只被定义不被执行，返回 undefined
+        if _re_ps.match(r"^\(([^()]*)\)\s*=>", s) or _re_ps.match(r"^[A-Za-z_$][\w$]*\s*=>", s):
+            if arg is not None:
+                return f"return ({s})(arguments[0]);"
+            return f"return ({s})();"
         # 箭头函数或function
         if s.startswith("() =>") or s.startswith("(())") or s.startswith("function"):
             return f"return ({script})();"
@@ -1247,6 +1266,11 @@ class BrowserContext:
 
         # 应用init scripts和request interception到driver
         self._apply_context_config()
+
+    @property
+    def options(self):
+        """公开options属性，兼容Playwright API（context.options.get('user_agent')）"""
+        return self._options
 
     @staticmethod
     def _build_ua_metadata(user_agent: str, platform_hint: str = ""):

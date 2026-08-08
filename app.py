@@ -1882,7 +1882,7 @@ config = {
 
     # ★ HilltopAds Pop-under 弹窗触发配置
     "hilltopads": {
-        "enabled": False,                      # 总开关：是否触发 Pop-under 弹窗
+        "enabled": True,                       # 总开关：是否触发 Pop-under 弹窗（默认开启，IP 不安全的会话自动跳过）
         "trigger_probability": 0.40,           # 40% 会话触发（模拟自然拦截率）
         "trigger_after_pct_min": 0.20,         # 模拟进度 20% 后触发（积累页面交互）
         "trigger_after_pct_max": 0.40,         # 最晚 40% 处触发
@@ -14738,8 +14738,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 raise RuntimeError(f"任务超时（已运行 {time.time() - enter_site_time:.1f}秒）")
 
                         # ★ HilltopAds Pop-under 弹窗触发辅助
-                        def _try_hilltopads_popunder(_page, _context, _cfg):
-                            """在积累页面交互后，通过 CDP 层可信手势触发 Pop-under 弹窗"""
+                        def _try_hilltopads_popunder(_page, _context, _cfg, _ip_info=None):
+                            """在积累页面交互后，通过 CDP 层可信手势触发 Pop-under 弹窗。
+                            _ip_info 由调用方显式传入（修复：'resolved_ip_info' in dir()
+                            在外层作用域恒为 False 导致 IP 过滤形同虚设的 P0 Bug）。
+                            """
                             if not _HAS_POPUNDER:
                                 return False, None
                             _ht_cfg = _cfg.get("hilltopads", {})
@@ -14747,7 +14750,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 return False, None
                             try:
                                 # ★ P0-3：传入 IP 信息，机房/代理IP 直接拒绝，避免浪费代理费
-                                _ip_info = resolved_ip_info if 'resolved_ip_info' in dir() else None
                                 _ok, _pop, _diag = _popunder.trigger_popunder(
                                     _page, _context, config=_ht_cfg,
                                     resolved_ip_info=_ip_info,
@@ -14807,7 +14809,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             )
                             ad_monitor = scan_ads_during_task(page, ad_monitor, "跳出型任务首页停留后")
                             # ★ HilltopAds Pop-under：首页浏览后触发弹窗
-                            _try_hilltopads_popunder(page, context, config)
+                            _try_hilltopads_popunder(page, context, config, resolved_ip_info)
                             log.info(f"🚪 跳出型任务完成：首页停留{_bounce_stay:.0f}s后离开")
                         if not _is_bounce:
                             log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L{len(layers)}，任务总时长=各轮之和）")
@@ -14853,7 +14855,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 ad_monitor = scan_ads_during_task(page, ad_monitor, f"第{loop_idx+1}轮首页停留后")
                                 # ★ HilltopAds Pop-under：仅第一轮 L1 首页后触发（避免重复弹窗）
                                 if loop_idx == 0:
-                                    _try_hilltopads_popunder(page, context, config)
+                                    _try_hilltopads_popunder(page, context, config, resolved_ip_info)
 
                                 # —— L1 → L2 进入列表页 ——
                                 layer1_cfg = layers[0]

@@ -136,11 +136,15 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
     """
     P0-3：检查 IP 类型是否安全用于 HilltopAds。
     数据中心/代理/VPN/托管IP 直接拒绝——避免 100% IVT 过滤浪费代理费。
+    ★ P0 反转：IP 信息不可用/无法判断时【默认拒绝】，安全优先——
+    宁可不触发弹窗，也不让机房 IP 流量污染账号画像。
     """
     if resolved_ip_info is None:
-        # 无法判断 → 保守放行（让 HilltopAds 自己做最终判断）
-        _log.debug("[Pop-under] IP 信息不可用，保守放行")
-        return True
+        # 无法判断 → 默认拒绝（安全优先）
+        _log.warning(
+            "[Pop-under] IP 信息不可用，默认拒绝触发（安全优先）"
+        )
+        return False
 
     ip_type = str(resolved_ip_info.get("ip_type") or "").lower()
     isp = str(resolved_ip_info.get("isp") or "").lower()
@@ -256,16 +260,42 @@ def _cdp_click(cdp_session, x, y):
 
 def _guard_stay_and_close(
     popunder_page: Any,
+    main_page: Any,
     stay_sec: float,
     stealth_inject_fn,
 ) -> None:
     """
     守护线程：等待 stay_sec 后关闭弹窗。
     ★ P0-1 修复：不阻塞主线程，原站浏览不受影响。
+    ★ P0-4 修复：弹窗打开后短暂 bring_to_front() 激活 3-8s 再切回原站——
+    保证落地页在"前台可见"状态下完成资源加载（后台 tab 会被节流：
+    rAF 暂停、setTimeout 合并到 1s，广告主 conversion 上报不完整）。
     真人行为：用户打开弹窗后无视它继续看原站，弹窗在后台存活一阵后被关闭或自然死亡。
     """
     try:
-        # 分片 sleep + 定时检查页面是否还活着
+        # ---- 阶段 1：激活弹窗，让其在前台完成资源加载 ----
+        try:
+            time.sleep(random.uniform(2.0, 4.0))  # 弹窗创建后自然加载期
+            popunder_page.bring_to_front()
+            _log.info("[Pop-under] 弹窗已激活前台 %s s（完成资源加载）",
+                      "3-8s")
+            time.sleep(random.uniform(3.0, 8.0))
+            # 切回原站，模拟"用户看完弹窗又回原站"
+            try:
+                if main_page is not None:
+                    main_page.bring_to_front()
+            except Exception:
+                pass
+        except Exception as _e:
+            _log.debug("[Pop-under] 激活弹窗失败(忽略): %s", _e)
+
+        # ---- 阶段 2：等待资源完整加载（load 而非 domcontentloaded）----
+        try:
+            popunder_page.wait_for_load_state("load", timeout=15000)
+        except Exception:
+            _log.debug("[Pop-under] 弹窗 load 状态等待超时(忽略)")
+
+        # ---- 阶段 3：分片 sleep + 定时检查页面是否还活着 ----
         remaining = stay_sec
         while remaining > 0:
             step = min(2.0, remaining)
@@ -277,8 +307,13 @@ def _guard_stay_and_close(
             except Exception:
                 pass
 
-        # 存活期满后关闭
+        # 存活期满后关闭（避免 close() 触发 pagehide 程序化特征，
+        # 用 about:blank 先卸载内容再关闭）
         try:
+            try:
+                popunder_page.goto("about:blank", timeout=3000)
+            except Exception:
+                pass
             popunder_page.close()
         except Exception:
             pass
@@ -417,14 +452,14 @@ def trigger_popunder(
         except Exception:
             load_state = "timeout_or_error"
 
-        # 10. ★ P0-1 修复：异步守护线程（不阻塞原站浏览）
+        # 10. ★ P0-1 修复：异步守护线程（不阻塞原站浏览）+ P0-4 激活弹窗
         _log.info(
             "[Pop-under] 弹窗已创建: %s, 停留 %d s (异步守护), 加载=%s",
             pop_url[:100] if pop_url else "(blank)", stay, load_state,
         )
         guardian = threading.Thread(
             target=_guard_stay_and_close,
-            args=(popunder_page, stay, _inject_popunder_stealth),
+            args=(popunder_page, page, stay, _inject_popunder_stealth),
             daemon=True,
         )
         guardian.start()
@@ -475,7 +510,7 @@ def self_test() -> Dict[str, bool]:
     results["residential_allowed"] = is_ip_safe_for_hilltopads(
         {"ip_type": "residential", "isp": "Comcast Cable"}
     )
-    results["unknown_allowed"] = is_ip_safe_for_hilltopads(None)
+    results["unknown_rejected"] = not is_ip_safe_for_hilltopads(None)
     results["hosting_isp_rejected"] = not is_ip_safe_for_hilltopads(
         {"ip_type": "", "isp": "Amazon Web Services"}
     )

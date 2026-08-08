@@ -5,7 +5,7 @@ import time
 from selenium_bridge import sync_playwright
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-blink-features=AutomationControlled'])
+    browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-blink-features=AutomationControlled'])
     ctx = browser.new_context(
         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         viewport={'width': 1920, 'height': 1080}
