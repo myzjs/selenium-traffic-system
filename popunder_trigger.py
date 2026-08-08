@@ -524,10 +524,22 @@ def trigger_popunder(
 # ============================================================================
 
 def should_trigger_for_network(detected_network: str) -> bool:
+    """判断探测到的广告网络是否应触发 Pop-under。
+    ★ P1 修复：除 HilltopAds/EvaDav 关键词外，识别 HilltopAds/EvaDav 的
+    随机投放域名（curoax/pufted/bony-teaching/untimely-hello）——
+    旧实现只认品牌词，页面实际通过 CNAME 中转域名投放时判定为"无"导致不触发。
+    """
     if not detected_network or detected_network == "无":
         return False
     net_lower = detected_network.lower()
-    return any(kw in net_lower for kw in ("hilltopads", "hilltop", "evadav"))
+    # 品牌关键词
+    if any(kw in net_lower for kw in ("hilltopads", "hilltop", "evadav")):
+        return True
+    # HilltopAds/EvaDav 自定义投放域名（CNAME 中转）
+    _vendor_domains = (
+        "curoax", "pufted", "bony-teaching", "untimely-hello",
+    )
+    return any(d in net_lower for d in _vendor_domains)
 
 
 def self_test() -> Dict[str, bool]:
@@ -541,6 +553,10 @@ def self_test() -> Dict[str, bool]:
     results["detect_evadav"] = should_trigger_for_network("EvaDav")
     results["detect_none"] = not should_trigger_for_network("无")
     results["detect_adsense"] = not should_trigger_for_network("AdSense")
+    # ★ P1 修复：CNAME 随机投放域名识别
+    results["detect_curoax"] = should_trigger_for_network("curoax")
+    results["detect_bony_teaching"] = should_trigger_for_network("bony-teaching")
+    results["detect_untimely_hello"] = should_trigger_for_network("untimely-hello")
     # ★ P0-3 IP 过滤
     results["datacenter_rejected"] = not is_ip_safe_for_hilltopads(
         {"ip_type": "datacenter", "isp": "DigitalOcean"}
@@ -552,8 +568,17 @@ def self_test() -> Dict[str, bool]:
     results["hosting_isp_rejected"] = not is_ip_safe_for_hilltopads(
         {"ip_type": "", "isp": "Amazon Web Services"}
     )
-    # ★ P0-1 异步机制
-    results["async_guardian_exists"] = True  # 代码结构验证
+    # ★ P0-1 异步机制 —— ★ P2 修复：真实签名校验（旧版硬编码恒 True，
+    # 无法拦截"守护线程被误删/参数变动"回归）
+    try:
+        import inspect
+        _sig = inspect.signature(_guard_stay_and_close)
+        _params = list(_sig.parameters.keys())
+        results["async_guardian_exists"] = (
+            len(_params) >= 4 and "main_page" in _params
+        )
+    except Exception:
+        results["async_guardian_exists"] = False
     # ★ P0-2 反检测脚本
     results["stealth_script_defined"] = len(_POPUNDER_STEALTH_SCRIPT) > 500
     return results
