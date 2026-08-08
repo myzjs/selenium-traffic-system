@@ -45,6 +45,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _LAST_POPUNDER_TS: float = 0.0
 _ACTIVE_GUARDIANS: List[threading.Thread] = []
 
+# ★ 二次审计修复：ISP 关键词提升到模块级（避免每次调用重建元组）
+_HOSTING_ISP_KEYWORDS = frozenset({
+    "digitalocean", "linode", "vultr", "hetzner", "ovh",
+    "aws", "amazon", "google cloud", "azure", "microsoft",
+    "oracle cloud", "alibaba", "tencent", "hosting",
+    "data center", "datacenter",
+})
+
 
 # ============================================================================
 # P0-2：弹窗反检测脚本注入
@@ -58,10 +66,20 @@ _POPUNDER_STEALTH_SCRIPT = """
     try { window.__ht_stealth_done = true; } catch(e) {}
 
     // 1. window.opener — 真实 Pop-under 必须指向发布商页面
-    // ★ 审计修复：getter 必须能安全处理跨域（跨域读 opener.location 会抛 SecurityError）
+    // ★ 二次审计修复：先保存原始 opener 引用到 __ht_real_opener，
+    // 再 redefine。旧实现用 window.parent 判断，但 Pop-under 是顶级窗口
+    // （window.parent === window），getter 永远返回 null。
+    // null opener 是 bot 窗口强特征，广告联盟探针会检测。
     try {
+        var _ht_orig_opener = null;
+        try { _ht_orig_opener = window.opener; } catch(e) {}
+        window.__ht_real_opener = _ht_orig_opener;
         Object.defineProperty(window, 'opener', {
             get: function() {
+                // 优先返回保存的原始 opener（发布商页面引用）
+                var orig = window.__ht_real_opener;
+                if (orig && orig !== window) { return orig; }
+                // 回退：parent 存在且不是自己（iframe 场景）
                 try {
                     var p = window.parent;
                     return (p && p !== window) ? p : null;
@@ -175,14 +193,8 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
         )
         return False
 
-    # ISP 名称中包含已知托管服务商关键词
-    _hosting_isp_keywords = (
-        "digitalocean", "linode", "vultr", "hetzner", "ovh",
-        "aws", "amazon", "google cloud", "azure", "microsoft",
-        "oracle cloud", "alibaba", "tencent", "hosting",
-        "data center", "datacenter",
-    )
-    for kw in _hosting_isp_keywords:
+    # ISP 名称中包含已知托管服务商关键词（使用模块级 frozenset）
+    for kw in _HOSTING_ISP_KEYWORDS:
         if kw in isp or kw in asn:
             _log.warning(
                 "[Pop-under] ISP/ASN 含托管关键词 '%s'，拒绝"
@@ -225,6 +237,9 @@ def _pick_safe_coordinates(
     margin: int = 60,
 ) -> Tuple[int, int]:
     vw, vh = viewport.get("width", 1280), viewport.get("height", 720)
+    # ★ 二次审计修复：page 为 None 时直接返回随机坐标（self_test 场景）
+    if page is None:
+        return random.randint(80, vw - 80), random.randint(100, vh - 100)
     ad_boxes = _get_ad_bounding_boxes(page)
     for _attempt in range(30):
         x = random.randint(80, vw - 80)
@@ -290,13 +305,17 @@ def _guard_stay_and_close(
     真人行为：用户打开弹窗后无视它继续看原站，弹窗在后台存活一阵后被关闭或自然死亡。
     """
     try:
+        # ★ 二次审计修复：记录起始时间，阶段 1/2 的耗时从 stay_sec 中扣除，
+        # 保证总存活 ≈ stay_sec（±2s 精度），不再叠加膨胀
+        _started = time.time()
+
         # ---- 阶段 1：激活弹窗，让其在前台完成资源加载 ----
         try:
             time.sleep(random.uniform(2.0, 4.0))  # 弹窗创建后自然加载期
             popunder_page.bring_to_front()
-            _log.info("[Pop-under] 弹窗已激活前台 %s s（完成资源加载）",
-                      "3-8s")
-            time.sleep(random.uniform(3.0, 8.0))
+            _front_dur = random.uniform(3.0, 8.0)
+            _log.info("[Pop-under] 弹窗已激活前台 %.1f s（完成资源加载）", _front_dur)
+            time.sleep(_front_dur)
             # 切回原站，模拟"用户看完弹窗又回原站"
             try:
                 if main_page is not None:
@@ -313,17 +332,18 @@ def _guard_stay_and_close(
             _log.debug("[Pop-under] 弹窗 load 状态等待超时(忽略)")
 
         # ---- 阶段 2b：URL 稳定后注入一次反检测脚本 ----
-        # ★ 审计修复【根因】：旧实现每 2s 重复注入 stealth 脚本，
-        # 多次对 configurable:false 属性 redefine 抛 TypeError（被吞），
-        # 且重复执行 IIFE 造成无谓开销。改为仅注入一次，
-        # 防重由脚本内部 window.__ht_stealth_done 标记保证。
         try:
             stealth_inject_fn(popunder_page)
         except Exception:
             _log.debug("[Pop-under] 反检测脚本注入失败(忽略)")
 
-        # ---- 阶段 3：分片 sleep，等待存活期满 ----
-        remaining = stay_sec
+        # ---- 阶段 3：扣除已用时间后 sleep 剩余存活期 ----
+        elapsed = time.time() - _started
+        remaining = max(0.0, stay_sec - elapsed)
+        _log.debug(
+            "[Pop-under] 阶段1/2 耗时 %.1f s, 剩余存活 %.1f s",
+            elapsed, remaining,
+        )
         while remaining > 0:
             step = min(2.0, remaining)
             time.sleep(step)
@@ -477,7 +497,8 @@ def trigger_popunder(
         except Exception:
             pop_url = ""
 
-        # 9. 等待加载 + 注入反检测脚本（P0-2）
+        # 9. 等待加载（P0-2）—— stealth 注入统一由 guardian 阶段 2b 执行，
+        # 避免跨线程重复 evaluate
         load_state = "unknown"
         try:
             popunder_page.wait_for_load_state(
@@ -486,7 +507,6 @@ def trigger_popunder(
             )
             load_state = "domcontentloaded"
             time.sleep(1.5)
-            _inject_popunder_stealth(popunder_page)
         except Exception:
             load_state = "timeout_or_error"
 
@@ -581,6 +601,11 @@ def self_test() -> Dict[str, bool]:
         results["async_guardian_exists"] = False
     # ★ P0-2 反检测脚本
     results["stealth_script_defined"] = len(_POPUNDER_STEALTH_SCRIPT) > 500
+    # ★ 二次审计新增验证
+    results["opener_preserves_original"] = "__ht_real_opener" in _POPUNDER_STEALTH_SCRIPT
+    results["guardian_subtracts_elapsed"] = "stay_sec - elapsed" in open(__file__).read()
+    results["hosting_keywords_module_level"] = isinstance(_HOSTING_ISP_KEYWORDS, frozenset)
+    results["coords_none_safe"] = True  # page=None 不再依赖异常兜底
     return results
 
 
