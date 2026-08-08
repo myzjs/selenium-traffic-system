@@ -52,62 +52,78 @@ _ACTIVE_GUARDIANS: List[threading.Thread] = []
 
 _POPUNDER_STEALTH_SCRIPT = """
 (function() {
-    // ★ P0修复：弹窗窗口指纹——补全 opener / Cookie / navigator 等检测点
+    // ★ 审计修复：防重复注入——guardian 与触发流程可能多次调用本脚本，
+    // 相同页面只执行一次，避免对 configurable:false 属性反复 redefine 抛 TypeError
+    if (window.__ht_stealth_done) { return; }
+    try { window.__ht_stealth_done = true; } catch(e) {}
 
     // 1. window.opener — 真实 Pop-under 必须指向发布商页面
-    if (!window.opener || window.opener === window) {
-        try {
-            Object.defineProperty(window, 'opener', {
-                get: function() {
-                    // 返回一个看起来像正常发布商页面的 proxy
-                    return window.parent !== window ? window.parent : null;
-                },
-                configurable: true
-            });
-        } catch(e) {}
-    }
+    // ★ 审计修复：getter 必须能安全处理跨域（跨域读 opener.location 会抛 SecurityError）
+    try {
+        Object.defineProperty(window, 'opener', {
+            get: function() {
+                try {
+                    var p = window.parent;
+                    return (p && p !== window) ? p : null;
+                } catch(e) { return null; }
+            },
+            configurable: true
+        });
+    } catch(e) {}
 
-    // 2. Cookie — 全新窗口空 Cookie 是 bot 强特征
-    if (document.cookie.length === 0) {
-        var _ht_d = new Date();
-        _ht_d.setTime(_ht_d.getTime() + (30 * 24 * 60 * 60 * 1000));
-        document.cookie = 'ht_v=1; path=/; expires=' + _ht_d.toUTCString() + '; SameSite=Lax';
-        // 再设一个带随机值的 cookie 模拟浏览历史
-        document.cookie = 'ht_sid=' + Math.random().toString(36).substring(2, 10)
-            + '; path=/; SameSite=Lax';
-    }
+    // 2. Cookie — 全新窗口空 Cookie 是 bot 强特征（仅当前域可写，跨域自动忽略）
+    try {
+        if (document.cookie.length === 0) {
+            var _ht_d = new Date();
+            _ht_d.setTime(_ht_d.getTime() + (30 * 24 * 60 * 60 * 1000));
+            document.cookie = 'ht_v=1; path=/; expires=' + _ht_d.toUTCString() + '; SameSite=Lax';
+            document.cookie = 'ht_sid=' + Math.random().toString(36).substring(2, 10)
+                + '; path=/; SameSite=Lax';
+        }
+    } catch(e) {}
 
-    // 3. navigator 属性 — 确保和主窗口一致
-    // 这些值 Playwright 已经正确处理，但显式锁定以防万一
-    if (!navigator.languages || navigator.languages.length === 0) {
-        try {
+    // 3. navigator.languages — 确保和主窗口一致（configurable=true 防重复注入报错）
+    try {
+        if (!navigator.languages || navigator.languages.length === 0) {
             Object.defineProperty(navigator, 'languages', {
                 get: function() { return ['en-US', 'en']; },
-                configurable: false
+                configurable: true
             });
-        } catch(e) {}
-    }
+        }
+    } catch(e) {}
 
     // 4. document.referrer — 确保是发布商页面的 URL
-    // Playwright context 会自动处理，但显式检查
-    if (!document.referrer || document.referrer === '') {
-        try {
-            Object.defineProperty(document, 'referrer', {
-                get: function() { return window.opener ? window.opener.location.href : ''; },
-                configurable: false
-            });
-        } catch(e) {}
-    }
+    // ★ 审计修复【根因】：旧实现 getter 里读 window.opener.location.href，
+    // 弹窗跳到广告主跨域页面时读取跨域 location 会抛 SecurityError，
+    // 导致页面上所有读 document.referrer 的广告脚本崩溃（conversion 丢失）。
+    // 现在只在同源/可读时返回，跨域一律返回 ''，且内部 try-catch 兜底。
+    try {
+        Object.defineProperty(document, 'referrer', {
+            get: function() {
+                try {
+                    var o = window.opener;
+                    if (o && o.location) {
+                        try {
+                            var ref = o.location.href || '';
+                            if (ref.indexOf('http') === 0) { return ref; }
+                        } catch(e) { /* 跨域读 location 抛 SecurityError，吞掉返回空 */ }
+                    }
+                } catch(e) {}
+                return '';
+            },
+            configurable: true
+        });
+    } catch(e) {}
 
-    // 5. chrome.runtime — 无头模式的检测点
-    if (typeof chrome !== 'undefined' && !chrome.runtime) {
-        try {
+    // 5. chrome.runtime — 无头模式的检测点（configurable=true 防重复注入报错）
+    try {
+        if (typeof chrome !== 'undefined' && !chrome.runtime) {
             Object.defineProperty(chrome, 'runtime', {
                 get: function() { return {}; },
-                configurable: false
+                configurable: true
             });
-        } catch(e) {}
-    }
+        }
+    } catch(e) {}
 })();
 """
 
@@ -118,7 +134,8 @@ def _inject_popunder_stealth(page: Any) -> bool:
         page.evaluate(_POPUNDER_STEALTH_SCRIPT)
         return True
     except Exception as e:
-        _log.debug("[Pop-under] 反检测脚本注入失败(页面临时不可用): %s", e)
+        # ★ 审计修复：失败不再静默——仅注入 1-2 次，warning 可观测
+        _log.warning("[Pop-under] 反检测脚本注入失败(页面临时不可用): %s", e)
         return False
 
 
@@ -295,17 +312,22 @@ def _guard_stay_and_close(
         except Exception:
             _log.debug("[Pop-under] 弹窗 load 状态等待超时(忽略)")
 
-        # ---- 阶段 3：分片 sleep + 定时检查页面是否还活着 ----
+        # ---- 阶段 2b：URL 稳定后注入一次反检测脚本 ----
+        # ★ 审计修复【根因】：旧实现每 2s 重复注入 stealth 脚本，
+        # 多次对 configurable:false 属性 redefine 抛 TypeError（被吞），
+        # 且重复执行 IIFE 造成无谓开销。改为仅注入一次，
+        # 防重由脚本内部 window.__ht_stealth_done 标记保证。
+        try:
+            stealth_inject_fn(popunder_page)
+        except Exception:
+            _log.debug("[Pop-under] 反检测脚本注入失败(忽略)")
+
+        # ---- 阶段 3：分片 sleep，等待存活期满 ----
         remaining = stay_sec
         while remaining > 0:
             step = min(2.0, remaining)
             time.sleep(step)
             remaining -= step
-            # 尝试注入反检测脚本（页面可能在异步加载完成后才能注入）
-            try:
-                stealth_inject_fn(popunder_page)
-            except Exception:
-                pass
 
         # 存活期满后关闭（避免 close() 触发 pagehide 程序化特征，
         # 用 about:blank 先卸载内容再关闭）
@@ -397,10 +419,12 @@ def trigger_popunder(
         safe_x, safe_y = _pick_safe_coordinates(page, viewport, margin)
 
         # 3. 记录窗口数
-        handles_before = len(context.pages)
+        pages_before = list(context.pages)
 
-        # 4. CDP 通道
-        cdp = context.new_cdp_session(context.pages[0])
+        # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
+        #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
+        #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
+        cdp = context.new_cdp_session(page)
 
         # 5. bridged scroll handler
         page.evaluate("""
@@ -422,11 +446,25 @@ def trigger_popunder(
         max_wait = cfg.get("max_wait_for_popup_s", 3.0)
         deadline = time.time() + max_wait
         popunder_page = None
+        pages_before_ids = set(id(p) for p in pages_before)
         while time.time() < deadline:
             time.sleep(0.3)
             pages_now = context.pages
-            if len(pages_now) > handles_before:
-                popunder_page = pages_now[-1]
+            new_pages = [p for p in pages_now if id(p) not in pages_before_ids]
+            if new_pages:
+                # ★ 审计修复【根因】：旧实现直接取 pages_now[-1]（最后打开的 tab），
+                #    若主流程并发打开了其它 tab（如 SEO 结果页），会取错对象。
+                #    改为优先选 URL 非空且非 about:blank 的新页。
+                for _p in new_pages:
+                    try:
+                        _u = _p.url or ""
+                    except Exception:
+                        _u = ""
+                    if _u and not _u.startswith("about:"):
+                        popunder_page = _p
+                        break
+                if popunder_page is None:
+                    popunder_page = new_pages[-1]
                 break
 
         if popunder_page is None:
