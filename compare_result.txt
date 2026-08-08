@@ -1,0 +1,81 @@
+============================================================
+  本地代码 与 东京VPS(107.148.2.75) 代码一致性对比报告
+  生成时间: 2026-08-05 23:25:43
+============================================================
+
+【统计】
+  本地文件数: 4670
+  远程文件数: 4710
+  共同文件数: 4664
+
+【仅本地存在】 6 个文件:
+  + .dockerignore
+  + .env.example
+  + .gitignore
+  + venv/bin/python
+  + venv/bin/python3
+  + venv/bin/python3.9
+
+【仅远程存在】 46 个文件:
+  - __init__.py
+  - behavior_profiles/freestoryweb_com_AU.json
+  - behavior_profiles/freestoryweb_com_AUSTRALIA.json
+  - behavior_profiles/freestoryweb_com_CANADA.json
+  - behavior_profiles/freestoryweb_com_UNITED_KINGDOM.json
+  - behavior_profiles/freestoryweb_com_UNITED_STATES.json
+  - behavior_profiles/freestoryweb_com_US.json
+  - behavior_stats_result.json
+  - config.json.bak_vpspass
+  - conftest.py
+  - data/keyword_explore/keywords_baidu.com_20260727_093824.txt
+  - data/keyword_explore/keywords_baidu.com_20260727_093934.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260723_021332.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260727_094306.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260727_101320.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260729_103614.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_084930.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_110634.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_115903.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_190111.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_190620.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_190643.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_191121.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260730_223250.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260731_003709.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260731_101925.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260731_103721.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260731_103741.txt
+  - data/keyword_explore/keywords_freestoryweb.com_20260731_105708.txt
+  - dockerignore
+  - env.example
+  - fingerprint_test_result.json
+  - gitignore
+  - ip_session_history.json
+  - plan_progress.json
+  - proxy_auth_ext/background.js
+  - proxy_auth_ext/manifest.json
+  - service.pid
+  - start_service.sh
+  - test_app_core.py
+  - test_direct_ipdeep.py
+  - test_ip_info_resolver.py
+  - test_ip_region.py
+  - test_risk_check.py
+  - test_seo_query.py
+  - watchdog.sh
+
+【MD5内容不一致】 2 个文件:
+  ! config_audit_log.json
+      本地: 9096de104a57740d122d4a1250d58222
+      远程: 89f3ce5913cec6161dfe96a6f781f9d1
+  ! kpi_dashboard.json
+      本地: ed342e553ff49df27c2e0c5909b96fa8
+      远程: f6c9b5eea734b1a67bd19dffa8d187b2
+
+============================================================
+❌ 结论: 本地代码 与 东京VPS 存在差异
+   本地独有: 6
+   远程独有: 46
+   内容不同: 2
+   差异总计: 54
+============================================================

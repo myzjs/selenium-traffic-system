@@ -20,7 +20,7 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.6.8"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -3922,7 +3922,7 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         return False, current_x, current_y
 
 
-def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config):
+def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config, user_agent=""):
     """
     执行完整搜索引擎搜索跳转流程（带真人模拟），支持所有搜索引擎
     :param page: 浏览器页面
@@ -3932,6 +3932,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
     :param stats: 页面统计字典（给真人模拟用）
     :param current_x, current_y: 当前鼠标坐标
     :param config: 系统配置
+    :param user_agent: 当前浏览器UA字符串（用于判断Mac/Win平台）
     :return: (success, current_x, current_y)
     """
     from urllib.parse import urlparse
@@ -4185,6 +4186,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
         _safe_page_wait(page, min_wait=1.5, max_wait=3.5, ad_wait=False)
 
         # ★ 8.5 检测CAPTCHA/空结果页（提前发现问题）
+        _captcha_detected = False
         try:
             _post_url = page.url
             _post_title = (page.title() or "").lower()
@@ -4193,12 +4195,18 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                                  "sorry", "access denied", "403"]
             if any(kw in _post_title for kw in _captcha_keywords):
                 log.warning(f"🔍 [真搜索] 检测到CAPTCHA/拦截页面: title={page.title()[:60]}, url={_post_url[:80]}")
+                _captcha_detected = True
             elif "google" in selected_engine_id and "#search" not in _post_url and "q=" not in _post_url:
                 log.warning(f"🔍 [真搜索] Google搜索结果页URL异常(无q参数): {_post_url[:80]}")
             elif "bing" in selected_engine_id and "q=" not in _post_url:
                 log.warning(f"🔍 [真搜索] Bing搜索结果页URL异常(无q参数): {_post_url[:80]}")
         except Exception:
             pass
+        
+        # 如果检测到CAPTCHA，直接返回失败，不浪费后续时间
+        if _captcha_detected:
+            log.warning(f"🔍 [真搜索] CAPTCHA拦截，放弃本次搜索跳转")
+            return False, current_x, current_y
 
         # 9. 新增：在搜索结果页加入真人模拟窗口！
         results_duration = random.uniform(3.0, 6.0)
@@ -4342,13 +4350,34 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
 
 
 stats = {
-    "total": 0, 
-    "success": 0, 
+    "total": 0,
+    "success": 0,
     "fail": 0,
     "video_item_success": 0,
     "video_item_fail": 0,
     "country_video_views": {}  # key: country_code, value: count
 }
+_stats_lock = threading.Lock()  # 保护 stats 字典的并发读写
+
+def _safe_stats_inc(key, amount=1):
+    """线程安全地递增 stats 计数"""
+    with _stats_lock:
+        stats[key] = stats.get(key, 0) + amount
+
+def _safe_stats_reset():
+    """线程安全地重置 stats"""
+    with _stats_lock:
+        stats["total"] = 0
+        stats["success"] = 0
+        stats["fail"] = 0
+        stats["video_item_success"] = 0
+        stats["video_item_fail"] = 0
+        stats["country_video_views"] = {}
+
+def _safe_stats_snapshot():
+    """线程安全地获取 stats 快照"""
+    with _stats_lock:
+        return dict(stats)
 
 adsl_status = {
     "running": False,
@@ -4953,13 +4982,7 @@ HTML_TEMPLATE = r"""
                         </div>
                     </div>
                     <div>
-                        <div class="form-group">
-                            <label>移动的步数（步）</label>
-                            <div class="input-group">
-                                <input type="number" id="mouse_move_steps_min" value="{{ config.mouse_move_steps.min }}">
-                                <input type="number" id="mouse_move_steps_max" value="{{ config.mouse_move_steps.max }}">
-                            </div>
-                        </div>
+                        <!-- 移除重复的"移动的步数"输入框（ID重复导致只有第一个生效） -->
                         <div class="form-group">
                             <label>移动随机停顿（0.05-0.2）</label>
                             <div class="input-group">
@@ -5299,8 +5322,6 @@ HTML_TEMPLATE = r"""
             <!-- 任务验证配置Tab -->
             <div class="tab-content" id="tab-taskvalidation">
                 <div style="display: flex; gap: 10px; margin-bottom: 15px;">
-                    <button class="btn btn-blue" onclick="saveTaskValidationConfig()">保存配置</button>
-                    <button class="btn btn-yellow" onclick="resetTaskValidationConfig()">恢复默认</button>
                     <button class="btn" style="background:#dc2626;color:#fff;" id="btnSecurityDrill" onclick="startSecurityDrill()">🛡️ 攻防演练</button>
                     <button class="btn" style="background:linear-gradient(135deg, #f093fb 0%, #f5576c 100%);color:#fff;" id="btnKeywordExplore" onclick="startKeywordExplore()">🔍 关键词探索</button>
                 </div>
@@ -5372,22 +5393,7 @@ HTML_TEMPLATE = r"""
                 </div>
             </div>
             
-            <!-- 原网页跳转配置Tab，现在改名为网站流量 -->
-            <div class="tab-content" id="tab-webnav">
-                <div class="seo-panel">
-                    <h4 style="margin-top: 0; color: #4a9eff;">网站流量导航配置</h4>
-                    <!-- 这里将放置网站流量导航相关的配置 -->
-                    <div class="form-group">
-                        <label>网站流量导航配置内容</label>
-                        <textarea placeholder="网站流量导航配置内容" style="width: 100%; min-height: 200px;"></textarea>
-                    </div>
-                    
-                    <div style="display: flex; gap: 10px; margin-top: 20px;">
-                        <button class="btn btn-blue" onclick="saveWebNavConfig()">保存配置</button>
-                        <button class="btn btn-yellow" onclick="resetWebNavConfig()">恢复默认</button>
-                    </div>
-                </div>
-            </div><!-- /#tab-webnav -->
+            <!-- tab-webnav 已废弃，无对应Tab入口，移除死代码 -->
                 </div><!-- /.config-inner -->
         </div><!-- /.config-panel -->
 
@@ -5585,191 +5591,7 @@ HTML_TEMPLATE = r"""
             return result;
         }
         
-        function saveConfig() {
-            // 收集代理池配置
-            const proxyPoolItems = document.querySelectorAll('#proxy-pool-container .proxy-item');
-            const proxyPool = [];
-            proxyPoolItems.forEach(item => {
-                const idx = parseInt(item.getAttribute('data-idx'));
-                proxyPool.push({
-                    enabled: item.querySelector('.proxy-enabled').checked,
-                    country_code: item.querySelector('.proxy-country').value,
-                    proxy_api_url: item.querySelector('.proxy-api-url').value,
-                    proxy_user: item.querySelector('.proxy-user').value,
-                    proxy_pwd: item.querySelector('.proxy-pwd').value
-                });
-            });
-
-            // 收集流量模型选择
-            const selectedModels = [];
-            document.querySelectorAll('.model-check:checked').forEach(cb => {
-                selectedModels.push(cb.getAttribute('data-model'));
-            });
-
-            // 收集日流量区间
-            const dtNewMin = parseInt(document.getElementById('dt_new_min').value) || 50;
-            const dtNewMax = parseInt(document.getElementById('dt_new_max').value) || 100;
-            const dtMidMin = parseInt(document.getElementById('dt_mid_min').value) || 200;
-            const dtMidMax = parseInt(document.getElementById('dt_mid_max').value) || 300;
-            const dtOldMin = parseInt(document.getElementById('dt_old_min').value) || 500;
-            const dtOldMax = parseInt(document.getElementById('dt_old_max').value) || 600;
-
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    // 网络Tab
-                    ip_proxy_api: document.getElementById('ip_proxy_api').value,
-                    ip_proxy_user: document.getElementById('ip_proxy_user').value,
-                    ip_proxy_pwd: document.getElementById('ip_proxy_pwd').value,
-                    webrtc_leak_check_enabled: document.getElementById('webrtc_leak_check_enabled') ? document.getElementById('webrtc_leak_check_enabled').checked : true,
-                    session_mode: document.getElementById('session_mode') ? document.getElementById('session_mode').value : 'country_host_7d',
-
-                    // 代理池
-                    proxy_pool: proxyPool,
-                    
-                    // 运行模式
-                    headless: (document.querySelector('input[name="headless_mode"]:checked') || {}).value !== 'false',
-                    log_mode: (document.querySelector('input[name="log_mode"]:checked') || {}).value || 'test',
-                    
-                    // 任务Tab
-                    target_urls: (function() {
-                        const urls = [];
-                        for (let i = 1; i <= 5; i++) {
-                            const urlEl = document.getElementById('target_url_' + i);
-                            const enabledEl = document.getElementById('target_url_' + i + '_enabled');
-                            urls.push({
-                                url: urlEl ? urlEl.value.trim() : '',
-                                enabled: enabledEl ? enabledEl.checked : (i === 1)
-                            });
-                        }
-                        return urls;
-                    })(),
-                    site_creation_date: document.getElementById('site_creation_date').value,
-                    plan_days: Math.min(7, Math.max(1, parseInt(document.getElementById('plan_days').value) || 1)),
-                    selected_models: selectedModels,
-                    daily_traffic_range: {
-                        new: {min: dtNewMin, max: dtNewMax},
-                        mid: {min: dtMidMin, max: dtMidMax},
-                        old: {min: dtOldMin, max: dtOldMax}
-                    },
-                    task_interval: {
-                        min: parseFloat(document.getElementById('task_interval_min').value),
-                        max: parseFloat(document.getElementById('task_interval_max').value)
-                    },
-                    
-                    // 模型Tab
-                    qa_human_profile: (document.querySelector('input[name="qa_human_profile"]:checked') || {}).value || 'standard',
-                    ad_stay_time: {
-                        min: parseFloat(document.getElementById('ad_stay_time_min').value),
-                        max: parseFloat(document.getElementById('ad_stay_time_max').value)
-                    },
-                    page_load_wait: {
-                        min: parseFloat(document.getElementById('page_load_wait_min').value),
-                        max: parseFloat(document.getElementById('page_load_wait_max').value)
-                    },
-                    scroll_pixels: {
-                        min: parseInt(document.getElementById('scroll_pixels_min').value),
-                        max: parseInt(document.getElementById('scroll_pixels_max').value)
-                    },
-                    scroll_wait: {
-                        min: parseFloat(document.getElementById('scroll_wait_min').value),
-                        max: parseFloat(document.getElementById('scroll_wait_max').value)
-                    },
-                    ad_click_prob: {
-                        min: parseFloat(document.getElementById('ad_click_prob_min').value),
-                        max: parseFloat(document.getElementById('ad_click_prob_max').value)
-                    },
-                    ad_click_wait: {
-                        min: parseFloat(document.getElementById('ad_click_wait_min').value),
-                        max: parseFloat(document.getElementById('ad_click_wait_max').value)
-                    },
-                    daily_ad_click_limit: {min: parseInt((document.getElementById('daily_ad_click_limit_min') || {value:'0'}).value) || 0, max: parseInt((document.getElementById('daily_ad_click_limit_max') || {value:'0'}).value) || 0},
-                    random_click_count: {
-                        min: parseInt(document.getElementById('random_click_count_min').value),
-                        max: parseInt(document.getElementById('random_click_count_max').value)
-                    },
-                    random_click_wait: {
-                        min: parseFloat(document.getElementById('random_click_wait_min').value),
-                        max: parseFloat(document.getElementById('random_click_wait_max').value)
-                    },
-                    total_stay: {
-                        min: parseFloat(document.getElementById('total_stay_min').value),
-                        max: parseFloat(document.getElementById('total_stay_max').value)
-                    },
-                    mouse_move_count: {
-                        min: parseInt(document.getElementById('mouse_move_count_min').value),
-                        max: parseInt(document.getElementById('mouse_move_count_max').value)
-                    },
-                    mouse_move_steps: {
-                        min: parseInt(document.getElementById('mouse_move_steps_min').value),
-                        max: parseInt(document.getElementById('mouse_move_steps_max').value)
-                    },
-                    mouse_move_wait: {
-                        min: parseFloat(document.getElementById('mouse_move_wait_min').value),
-                        max: parseFloat(document.getElementById('mouse_move_wait_max').value)
-                    },
-                    scroll_count: {
-                        min: parseInt(document.getElementById('scroll_count_min').value),
-                        max: parseInt(document.getElementById('scroll_count_max').value)
-                    },
-                    bezier_pause_prob: {
-                        min: parseFloat(document.getElementById('bezier_pause_prob_min').value),
-                        max: parseFloat(document.getElementById('bezier_pause_prob_max').value)
-                    },
-                    mouse_move_pause: {
-                        min: parseFloat(document.getElementById('mouse_move_pause_min').value),
-                        max: parseFloat(document.getElementById('mouse_move_pause_max').value)
-                    },
-                    
-                    // 网页跳转配置
-                    web_navigation: {
-                        loop_count: {
-                            min: parseInt(document.getElementById('webnav_loop_count_min').value) || 1,
-                            max: parseInt(document.getElementById('webnav_loop_count_max').value) || 3
-                        },
-                        loop_interval: {
-                            min: parseFloat(document.getElementById('webnav_loop_interval_min').value) || 1,
-                            max: parseFloat(document.getElementById('webnav_loop_interval_max').value) || 1
-                        },
-                        layer_1: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer1_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer1_fallback_urls').value),
-                            stay_ratio: (parseFloat(document.getElementById('webnav_layer1_stay_ratio').value) || 0) / 100,
-                            min_stay: 10
-                        },
-                        layer_2: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer2_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer2_fallback_urls').value),
-                            stay_ratio: (parseFloat(document.getElementById('webnav_layer2_stay_ratio').value) || 0) / 100,
-                            min_stay: 10
-                        },
-                        layer_3: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer3_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer3_fallback_urls').value),
-                            stay_ratio: (parseFloat(document.getElementById('webnav_layer3_stay_ratio').value) || 0) / 100,
-                            min_stay: 10
-                        },
-                        layer_4: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer4_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer4_fallback_urls').value),
-                            stay_ratio: (parseFloat(document.getElementById('webnav_layer4_stay_ratio').value) || 0) / 100,
-                            min_stay: 10
-                        },
-                        layer_5: {
-                            keywords: parseCommaList(document.getElementById('webnav_layer5_keywords').value),
-                            fallback_urls: parseCommaList(document.getElementById('webnav_layer5_fallback_urls').value),
-                            stay_ratio: (parseFloat(document.getElementById('webnav_layer5_stay_ratio').value) || 0) / 100,
-                            min_stay: 10
-                        },
-                    }
-                })
-            }).then(response => response.json())
-            .then(result => {
-                alert('配置已保存');
-                location.reload();
-            });
-        }
+        // saveConfig 已废弃（由 collectConfigPayload + 各Tab独立保存函数替代）
 
         // 收集所有配置参数
         function collectConfigPayload() {
@@ -6543,17 +6365,7 @@ HTML_TEMPLATE = r"""
             });
         });
 
-        function startTask() {
-            // 兼容旧调用，直接生成并执行
-            const payload = collectConfigPayload();
-            fetch('/save_config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(() => {
-                fetch('/start_task', {method: 'POST'}).then(() => location.reload());
-            });
-        }
+        // startTask 已废弃（由 executePlan 替代）
 
         function stopTask() {
             if (!confirm('确定要停止当前网站/综合QA/视频任务吗？')) return;
@@ -6714,9 +6526,7 @@ HTML_TEMPLATE = r"""
             setTimeout(refreshDwellMonitorStatus, 600);
         });
 
-        function resetConfig() {
-            resetDefaults('all');
-        }
+        // resetConfig 已废弃（由 resetDefaults 替代）
 
         function resetDefaults(scope) {
             if (!confirm('确定要恢复默认参数吗？这会覆盖当前配置并清除未执行计划。')) return;
@@ -6940,15 +6750,20 @@ HTML_TEMPLATE = r"""
         function addEngine() {
             const container = document.getElementById('engines-container');
             const engineHtml = `
-                <div class="engine-item" style="display: flex; gap: 10px; margin-bottom: 10px; align-items: center;">
-                    <input type="text" class="engine-id" placeholder="引擎ID" style="flex: 1;">
-                    <input type="text" class="engine-name" placeholder="引擎名称" style="flex: 1;">
-                    <input type="text" class="engine-url" placeholder="搜索URL" style="flex: 2;">
-                    <select class="engine-lang" style="width: 100px;">
+                <div class="engine-item" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center; padding: 6px 8px; background: #1e1e1e; border-radius: 6px; border-left: 3px solid #3b82f6;">
+                    <span style="width:60px; font-size:11px; color:#60a5fa; font-weight:bold;">🔍搜索</span>
+                    <input type="text" class="engine-id" placeholder="ID" style="width: 80px; font-size: 12px;">
+                    <input type="text" class="engine-name" placeholder="名称" style="width: 100px; font-size: 12px;">
+                    <input type="text" class="engine-url" placeholder="Referer URL" style="flex: 1; font-size: 12px;">
+                    <select class="engine-lang" style="width: 70px; font-size: 12px;">
                         <option value="zh">中文</option>
                         <option value="en">英文</option>
                     </select>
-                    <button class="btn btn-red" onclick="removeEngine(this)" style="padding: 5px 10px;">删除</button>
+                    <select class="engine-type" style="width: 70px; font-size: 12px;">
+                        <option value="search">搜索</option>
+                        <option value="social">社媒</option>
+                    </select>
+                    <button class="btn btn-red" onclick="removeEngine(this)" style="padding: 4px 8px; font-size: 11px;">删除</button>
                 </div>
             `;
             container.insertAdjacentHTML('beforeend', engineHtml);
@@ -7022,23 +6837,8 @@ HTML_TEMPLATE = r"""
             resetDefaults('website');
         }
         
-        // SEO配置
-        function saveSEOConfig() {
-            alert('SEO配置已保存');
-        }
-        
-        function resetSEOConfig() {
-            resetDefaults('seo');
-        }
-        
-        // 任务验证配置
-        function saveTaskValidationConfig() {
-            alert('任务验证配置已保存');
-        }
-        
-        function resetTaskValidationConfig() {
-            resetDefaults('task_validation');
-        }
+        // 注：saveSEOConfig/resetSEOConfig/saveTaskValidationConfig 为历史废弃函数，已移除
+        // SEO配置保存使用 saveSeoConfig()（小写seo），由SEO Tab按钮调用
         
         // ===== 攻防演练 =====
         let _drillPolling = null;
@@ -11856,9 +11656,7 @@ def _format_plan_log_block(plan, title, show_tasks=True, max_tasks=10):
 
 def worker_task(single_task=False, adsl_ip_task=False):
     global task_running, _single_task_mode, stats, pending_plan, planned_total_tasks, current_task_idx, current_plan, adsl_status, _last_executed_plan, config
-    stats["total"] = 0
-    stats["success"] = 0
-    stats["fail"] = 0
+    _safe_stats_reset()
 
     log.info("任务已启动")
     task_running = True
@@ -11881,7 +11679,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
         ok, errors = validate_web_navigation_config(config, fail_hard=False)
         if not ok:
             log.error(f"❌ 网页浏览模式配置错误，任务终止: {'; '.join(errors)}")
-            stats["fail"] += 0
+            _safe_stats_inc("fail")
             task_running = False
             _single_task_mode = False
             return
@@ -11965,7 +11763,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
             import traceback as _tb
             log.error(f"❌ 单独任务创建失败: {type(e).__name__}: {e}")
             log.error(f"❌ 单独任务创建堆栈: {_tb.format_exc()[:800]}")
-            stats["fail"] += 1
+            _safe_stats_inc("fail")
             task_running = False
             _single_task_mode = False
             current_task_idx = -1
@@ -12007,7 +11805,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 _err = f"生成任务清单失败: {type(e).__name__}: {e}"
                 log.error(f"❌ {_err}")
                 log.error(f"❌ 堆栈: {_tb.format_exc()[:800]}")
-                stats["fail"] += 1
+                _safe_stats_inc("fail")
                 task_running = False
                 _single_task_mode = False
                 return
@@ -12115,7 +11913,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
             # ★ 断点恢复：跳过已完成的任务
             if task.get("status") == "已完成":
                 log.info(f"⏭️ 跳过已完成的任务 #{task_idx+1}（断点恢复）")
-                stats["success"] += 1
+                _safe_stats_inc("success")
                 continue
 
             # ========== ★ P2-5：为本任务开启 suicide watchdog（30 min 硬上限） ==========
@@ -12148,8 +11946,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 available_proxies = get_available_proxies(proxy_pool_enabled)
                 if not available_proxies:
                     log.error("❌ 没有可用代理（工作时间内），跳过本任务")
-                    stats["fail"] += 1
-                    stats["total"] += 1
+                    _safe_stats_inc("fail")
+                    _safe_stats_inc("total")
                     continue
                 selected_proxy = random.choice(available_proxies)
                 log.info(f"🔄 兆底切换至: {selected_proxy.get('country_code')}")
@@ -12225,7 +12023,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     break
             
             # 增加总任务计数
-            stats["total"] += 1
+            _safe_stats_inc("total")
             
             browser = None
             try:
@@ -12636,13 +12434,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 
                 # 中途停止或最终失败 → 直接进入下一轮
                 if not task_running:
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, "任务已停止")
                     continue
                 
                 if not seo_ready:
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, f"严禁跳过SEO：IP+SEO 准备失败（已重试 {ip_retry_max} 次）")
                     continue
@@ -12664,7 +12462,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 # 检查 proxy_info 是否为 None
                 if proxy_info is None:
                     log.error("❌ 代理信息为 None，无法生成指纹和配置")
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     continue
                 
                 # 生成与IP完全匹配的指纹
@@ -12710,7 +12508,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.debug(f"生成的指纹: {fingerprint}")
                 except Exception as e:
                     log.error(f"❌ 生成指纹失败: {e}")
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     continue
                 
                 # 构建代理配置（直连 IPDeep 代理出网）
@@ -12724,7 +12522,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     
                     if not proxy_host or not proxy_port:
                         log.error(f"❌ 代理信息不完整: host={proxy_host}, port={proxy_port}")
-                        stats["fail"] += 1
+                        _safe_stats_inc("fail")
                         continue
                     
                     # 直接使用 IPDeep 返回的 HTTP 代理出网
@@ -12747,7 +12545,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 except Exception as e:
                     log.error(f"❌ 构建代理配置失败: {e}")
                     log.error(f"❌ 错误类型: {type(e).__name__}")
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     continue
                 
                 # 确认代理使用方式
@@ -12755,7 +12553,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.info(f"✓ 使用代理访问目标网站: {proxy_host}:{proxy_port}")
                 except Exception as e:
                     log.error(f"❌ 确认代理使用方式失败: {e}")
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     continue
 
                 # ========== Step C-1: 目标网站健康检测 ==========
@@ -13977,7 +13775,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                 if not fingerprint or not fingerprint.get('language') or not fingerprint.get('timezone'):
                     log.error("❌ 指纹信息不完整，无法继续任务")
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     continue
 
                 browser_success = True
@@ -14087,7 +13885,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     record_fingerprint_usage(fingerprint_id, user_agent, country_code)
                 
                 if not browser_success or not consistency:
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, f"浏览器启动失败或指纹不一致: {consistency_details}")
                     continue
@@ -14101,7 +13899,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     _legacy = config.get("target_url", "")
                     _active_urls = [_legacy] if _legacy else []
                 if not _active_urls:
-                    stats["fail"] += 1
+                    _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, "没有勾选的目标网站")
                     continue
@@ -14270,7 +14068,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 搜索引擎模式（默认/回退）
                         if _traffic_source == "search" and search_mode == "real_search":
                             # 执行完整搜索跳转流程（带真人模拟，支持所有搜索引擎）
-                            search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config)
+                            search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config, user_agent=user_agent)
                             if search_success:
                                 log.info(f"🔍 [真搜索] 已成功跳转至目标页，跳过直接导航")
                                 already_on_target = True
@@ -15354,9 +15152,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     current_plan['tasks'][task_idx]['status'] = "失败"
                         
                         if success:
-                            stats["success"] += 1
+                            _safe_stats_inc("success")
                         else:
-                            stats["fail"] += 1
+                            _safe_stats_inc("fail")
                         
                         # ★ 记录IP会话（用于24h频率控制）
                         if exit_ip and exit_ip != "未知":
@@ -15441,7 +15239,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         log.task_result(task_time, success, valid_traffic)
                     
                     except Exception as e:
-                        stats["fail"] += 1
+                        _safe_stats_inc("fail")
                         task_time = time.time() - task_start_time
                         log.error(f"任务异常: {str(e)}")
                         import traceback
@@ -15702,42 +15500,55 @@ def get_current_ip_context():
 
 @app.route('/')
 def index():
-    ensure_config_defaults()
-    from flask import make_response
-    resp = make_response(render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
-                                  statstotal=stats['total'], statssuccess=stats['success'], 
-                                  statsfail=stats['fail'],
-                                  stats=stats, runningtask=task_running,
-                                  planned_total=planned_total_tasks, APP_VERSION=APP_VERSION,
-                                  VPS_HOST=os.environ.get("VPS_HOST", "")))
-    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    resp.headers['Pragma'] = 'no-cache'
-    resp.headers['Expires'] = '0'
-    return resp
+    """主页路由（带线程安全快照和异常保护）"""
+    try:
+        ensure_config_defaults()
+        from flask import make_response
+        _s = _safe_stats_snapshot()
+        resp = make_response(render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
+                                      statstotal=_s['total'], statssuccess=_s['success'], 
+                                      statsfail=_s['fail'],
+                                      stats=_s, runningtask=task_running,
+                                      planned_total=planned_total_tasks, APP_VERSION=APP_VERSION,
+                                      VPS_HOST=os.environ.get("VPS_HOST", "")))
+        resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+        return resp
+    except Exception as e:
+        import traceback
+        app.logger.error(f"index 路由异常: {e}\n{traceback.format_exc()}")
+        return f"系统内部错误: {e}", 500
 
 
 
 
 @app.route('/get_global_task_status', methods=['GET'])
 def get_global_task_status():
-    current_website_task = None
-    if current_plan and current_task_idx >= 0 and current_task_idx < len(current_plan.get('tasks', [])):
-        current_website_task = current_plan['tasks'][current_task_idx]
-    qa_running = False
-    with human_model_lock:
-        human_model = dict(human_model_state)
-    return jsonify({
-        "website": {
-            "running": bool(task_running or qa_running),
-            "current_task_idx": current_task_idx,
-            "current_task": current_website_task,
-            "total_tasks": current_plan['total_tasks'] if current_plan else 0
-        },
+    """获取全局任务状态（带异常保护）"""
+    try:
+        current_website_task = None
+        if current_plan and current_task_idx >= 0 and current_task_idx < len(current_plan.get('tasks', [])):
+            current_website_task = current_plan['tasks'][current_task_idx]
+        qa_running = False
+        with human_model_lock:
+            human_model = dict(human_model_state)
+        return jsonify({
+            "website": {
+                "running": bool(task_running or qa_running),
+                "current_task_idx": current_task_idx,
+                "current_task": current_website_task,
+                "total_tasks": current_plan['total_tasks'] if current_plan else 0
+            },
 
-        "ip": get_current_ip_context(),
-        "human_model": human_model,
-        "stats": stats
-    })
+            "ip": get_current_ip_context(),
+            "human_model": human_model,
+            "stats": _safe_stats_snapshot()
+        })
+    except Exception as e:
+        import traceback
+        app.logger.error(f"get_global_task_status 异常: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": "获取状态失败", "running": False, "stats": {}})
 
 
 @app.route('/get_website_task_status', methods=['GET'])
@@ -16048,9 +15859,12 @@ def start_task():
 
 @app.route('/start_single_task', methods=['POST'])
 def start_single_task():
-    global task_running
-    if task_running:
-        return jsonify({"status": "error", "message": "已有任务正在运行"}), 409
+    global task_running, _single_task_mode
+    with _task_start_lock:
+        if task_running:
+            return jsonify({"status": "error", "message": "已有任务正在运行"}), 409
+        task_running = True
+        _single_task_mode = True
     # 清除历史日志
     clean_logs()
     threading.Thread(target=worker_task, kwargs={"single_task": True}, daemon=True).start()
@@ -16074,6 +15888,18 @@ def stop_task():
     except Exception as e:
         log.warning(f"强制关闭浏览器异常: {e}")
     return jsonify({"status": "ok"})
+
+@app.route('/stop_video_tasks', methods=['POST'])
+def stop_video_tasks():
+    """停止视频相关任务（视频观看/视频QA等）"""
+    try:
+        log.info("🛑 收到停止视频任务请求")
+        # 视频任务共用 task_running 标志，stop_task 已将其置 False
+        # 此路由作为独立停止端点，确保前端 Promise.allSettled 不报 404
+        return jsonify({"status": "ok", "message": "视频任务已停止"})
+    except Exception as e:
+        log.warning(f"停止视频任务异常: {e}")
+        return jsonify({"status": "ok", "message": str(e)[:100]})
 
 @app.route('/get_historical_tasks', methods=['GET'])
 def get_historical_tasks():
@@ -16870,15 +16696,22 @@ def get_logs():
 
 @app.route('/api/status')
 def api_status():
-    return jsonify({
-        "running": task_running,
-        "total": stats["total"],
-        "success": stats["success"],
-        "fail": stats["fail"],
-        "video_view_count": stats.get("video_view_count", 0),
-        "total_video_watch_time": stats.get("total_video_watch_time", 0),
-        "adsl": adsl_status
-    })
+    """API状态接口（带异常保护）"""
+    try:
+        _s = _safe_stats_snapshot()
+        return jsonify({
+            "running": task_running,
+            "total": _s["total"],
+            "success": _s["success"],
+            "fail": _s["fail"],
+            "video_view_count": _s.get("video_view_count", 0),
+            "total_video_watch_time": _s.get("total_video_watch_time", 0),
+            "adsl": adsl_status
+        })
+    except Exception as e:
+        import traceback
+        app.logger.error(f"api_status 异常: {e}\n{traceback.format_exc()}")
+        return jsonify({"running": False, "total": 0, "success": 0, "fail": 0})
 
 # ========== 🛡️ Dwell Monitor Guardian：Flask 控制接口（前端按钮：启动/停止/状态） ==========
 # 设计：用 subprocess.Popen 启动独立的 _dwell_monitor_guardian.py 守护进程，与 app.py 完全解耦，
