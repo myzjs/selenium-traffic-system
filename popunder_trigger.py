@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,20 +43,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # 全局冷却计时 + 活跃守护线程
+# ★ M1 修复: _LAST_POPUNDER_TS 读写加锁，防并发 check-then-act 竞态导致双弹窗
 _LAST_POPUNDER_TS: float = 0.0
+_LAST_POPUNDER_LOCK = threading.Lock()
 _ACTIVE_GUARDIANS: List[threading.Thread] = []
 
 # ★ 新增：页面级防重复触发守卫（防止同一页面并发触发多个弹窗）
 _PAGE_TRIGGER_LOCK = threading.Lock()
 _PAGE_ACTIVE_TRIGGERS: Dict[int, float] = {}  # page_id -> trigger_ts
 
-# ★ 二次审计修复：ISP 关键词提升到模块级（避免每次调用重建元组）
+# ★ M2 修复：仅保留明确托管/机房关键词，移除宽泛品牌词(amazon/microsoft/alibaba/tencent)
+#   云品牌通过 ip_type=datacenter/hosting 判定，避免误伤名称含品牌词的住宅网络
 _HOSTING_ISP_KEYWORDS = frozenset({
     "digitalocean", "linode", "vultr", "hetzner", "ovh",
-    "aws", "amazon", "google cloud", "azure", "microsoft",
-    "oracle cloud", "alibaba", "tencent", "hosting",
-    "data center", "datacenter",
+    "oracle cloud", "hosting", "hostinger", "godaddy",
+    "data center", "datacenter", "colo", "dedicated",
+    "server", "cdn", "cloud",
 })
+
+# ★ M2: 词边界正则缓存（ISP 名称匹配用，避免误伤 "Microsoft Network" 等含品牌子串的住宅 ISP）
+_ISP_KEYWORD_RE = None
+def _build_isp_keyword_re():
+    global _ISP_KEYWORD_RE
+    if _ISP_KEYWORD_RE is None:
+        _alt = "|".join(re.escape(k) for k in sorted(_HOSTING_ISP_KEYWORDS, key=len, reverse=True))
+        _ISP_KEYWORD_RE = re.compile(rf"(^|[\s\-_.():/])({_alt})($|[\s\-_.():/])", re.IGNORECASE)
+    return _ISP_KEYWORD_RE
 
 
 # ============================================================================
@@ -241,6 +254,14 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
     isp = str(resolved_ip_info.get("isp") or "").lower()
     asn = str(resolved_ip_info.get("asn") or "").lower()
 
+    # ★ Bug#5 修复: 三要素全空=不可判断 → 默认拒绝（安全优先，宁可不触发也不让机房IP污染画像）
+    if not ip_type and not isp and not asn:
+        _log.warning(
+            "[Pop-under] IP 质量信息不可判断（ip_type/isp/asn 均缺失），"
+            "默认拒绝触发（安全优先）"
+        )
+        return False
+
     # 显式标记为数据中心/代理类型
     if ip_type and ip_type in _HILLTOPADS_BLOCKED_IP_TYPES:
         _log.warning(
@@ -249,14 +270,16 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
         )
         return False
 
-    # ISP 名称中包含已知托管服务商关键词（使用模块级 frozenset）
-    for kw in _HOSTING_ISP_KEYWORDS:
-        if kw in isp or kw in asn:
-            _log.warning(
-                "[Pop-under] ISP/ASN 含托管关键词 '%s'，拒绝"
-                "（HilltopAds 高过滤率）", kw,
-            )
-            return False
+    # ISP 名称中包含已知托管服务商关键词（★ Bug#3 修复：用词边界正则替代裸子串，避免误伤住宅 ISP）
+    _isp_re = _build_isp_keyword_re()
+    _target = f"{isp or ''} {asn or ''}"
+    _match = _isp_re.search(_target)
+    if _match:
+        _log.warning(
+            "[Pop-under] ISP/ASN 含托管关键词 '%s'，拒绝"
+            "（HilltopAds 高过滤率）", _match.group(0),
+        )
+        return False
 
     return True
 
@@ -340,6 +363,26 @@ def _cdp_click(cdp_session, x, y):
         "button": "left", "clickCount": 1,
         "timestamp": ts + int(random.uniform(80, 200)),
     })
+
+
+def _safe_page_url(page_obj: Any, timeout_s: float = 2.0) -> str:
+    """★ 挂死修复：安全读取弹窗 URL。
+    selenium_bridge 的 Page.url 会先 switch_to.window 再读 current_url，
+    弹窗导航/加载中可能无限挂起（实测把 3s 等待拖成 28s），
+    故用守护线程+超时兑底，超时返回空串（后续按 unconfirmed 处理）。
+    """
+    holder = {"url": ""}
+
+    def _read():
+        try:
+            holder["url"] = page_obj.url or ""
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return holder["url"]
 
 
 # ============================================================================
@@ -446,6 +489,12 @@ def _check_page_reentry(page_id: int, cooldown_s: float = 90.0) -> bool:
         return True
 
 
+def _is_page_in_cooldown(page_id: int, cooldown_s: float = 90.0) -> bool:
+    """★ M3 修复: 只读冷却检查（不占位）——概率跳过时不会污染页面守卫"""
+    with _PAGE_TRIGGER_LOCK:
+        return time.time() - _PAGE_ACTIVE_TRIGGERS.get(page_id, 0.0) < cooldown_s
+
+
 # ============================================================================
 # 弹窗触发核心
 # ============================================================================
@@ -476,29 +525,42 @@ def trigger_popunder(
 
     # ---- P0-3：IP 质量过滤 ----
     if not is_ip_safe_for_hilltopads(resolved_ip_info):
+        # ★ 可观测修复：静默拒绝会让"为何没弹窗"无法排查，升级为 info
+        _log.info("[Pop-under] IP 门禁拒绝，跳过触发 (ip_info=%s)",
+                  {k: (resolved_ip_info or {}).get(k) for k in ("ip_type", "isp", "asn")})
         return False, None, {"triggered": False, "reason": "ip_unsafe"}
 
     # ---- 冷却检查（全局） ----
     _cleanup_dead_guardians()
     now = time.time()
     cooldown = cfg.get("cooldown_between_triggers_s", 90)
-    if now - _LAST_POPUNDER_TS < cooldown:
+    with _LAST_POPUNDER_LOCK:  # ★ M1: 读锁保护
+        _since_last = now - _LAST_POPUNDER_TS
+    if _since_last < cooldown:
         _log.info(
             "Pop-under 冷却中（距上次 %d s < %d s），跳过",
-            int(now - _LAST_POPUNDER_TS), cooldown,
+            int(_since_last), cooldown,
         )
         return False, None, {"triggered": False, "reason": "cooldown"}
 
     # ---- 页面级防重复触发守卫（防并发 worker 对同一 page 重复触发） ----
+    # ★ M3 修复: 概率检查前只做【只读】冷却检查，不占位——概率跳过时不会烧掉 90s 冷却
     page_id = id(page)
-    if not _check_page_reentry(page_id, cooldown_s=float(cooldown)):
+    if _is_page_in_cooldown(page_id, cooldown_s=float(cooldown)):
         _log.info("Pop-under 页面级冷却中（同一页面 %d s 内已触发），跳过", cooldown)
         return False, None, {"triggered": False, "reason": "page_cooldown"}
 
     # ---- 随机概率 ----
     prob = cfg.get("trigger_probability", 0.40)
     if random.random() > prob:
+        # ★ 可观测修复：概率跳过不再静默（INFO 可见，便于区分 CDP 触发 vs 自然弹窗）
+        _log.info("[Pop-under] 概率跳过 (random > %.2f)，本次不触发 CDP 点击", prob)
         return False, None, {"triggered": False, "reason": "probability_skip"}
+
+    # ★ M3 修复: 概率通过后才正式占位（check + reserve 原子化）
+    if not _check_page_reentry(page_id, cooldown_s=float(cooldown)):
+        _log.info("Pop-under 页面级冷却中（并发占位竞争），跳过")
+        return False, None, {"triggered": False, "reason": "page_cooldown"}
 
     stay = float(stay_sec or random.randint(
         cfg.get("popunder_stay_min", 15),
@@ -523,62 +585,71 @@ def trigger_popunder(
 
         # 3. 记录窗口数
         pages_before = list(context.pages)
-
-        # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
-        #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
-        #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
-        cdp = context.new_cdp_session(page)
-
-        # 5. bridged scroll handler
-        page.evaluate("""
-            if (!window.__ht_pop_primed) {
-                window.__ht_pop_primed = false;
-                document.addEventListener('scroll', function _htScroll() {
-                    window.__ht_pop_primed = true;
-                    document.removeEventListener('scroll', _htScroll);
-                }, {once: false, passive: true});
-            }
-        """)
-
-        # 6. CDP 鼠标 + 点击
-        _cdp_mouse_move(cdp, start_x, start_y, safe_x, safe_y, steps=move_steps)
-        time.sleep(random.uniform(0.05, 0.15))
-        _cdp_click(cdp, safe_x, safe_y)
-
-        # 7. 等待弹窗
-        max_wait = cfg.get("max_wait_for_popup_s", 3.0)
-        deadline = time.time() + max_wait
-        popunder_page = None
         pages_before_ids = set(id(p) for p in pages_before)
-        while time.time() < deadline:
-            time.sleep(0.3)
-            pages_now = context.pages
-            new_pages = [p for p in pages_now if id(p) not in pages_before_ids]
-            if new_pages:
-                # ★ 审计修复【根因】：旧实现直接取 pages_now[-1]（最后打开的 tab），
-                #    若主流程并发打开了其它 tab（如 SEO 结果页），会取错对象。
-                #    改为优先选 URL 非空且非 about:blank 的新页。
-                for _p in new_pages:
-                    try:
-                        _u = _p.url or ""
-                    except Exception:
-                        _u = ""
-                    if _u and not _u.startswith("about:"):
-                        popunder_page = _p
-                        break
-                if popunder_page is None:
+        max_wait = cfg.get("max_wait_for_popup_s", 3.0)
+
+        # ★ 存量弹窗收养：自然弹窗已存在时不再发起 CDP 点击
+        #   （点击会被浪费，且旧弹窗已在 pages_before 中会被误判为 no_new_tab）
+        popunder_page = None
+        _adopted = len(pages_before) > 1
+        if _adopted:
+            popunder_page = pages_before[-1]
+            _log.info(
+                "[Pop-under] 检测到存量弹窗（共 %d 个标签），直接收养进守护，跳过 CDP 点击",
+                len(pages_before),
+            )
+        else:
+            # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
+            #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
+            #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
+            cdp = context.new_cdp_session(page)
+
+            # ★ 焦点保险：CDP Input 事件派发到当前焦点窗口，点击前确保焦点在发布商页
+            #   （selenium_bridge 共享 driver，焦点可能已被其它标签篡夺）
+            try:
+                _drv = getattr(context, "driver", None) or getattr(page, "driver", None)
+                _main_h = getattr(context, "_main_window_handle", None)
+                if _drv is not None and _main_h and _drv.current_window_handle != _main_h:
+                    _drv.switch_to.window(_main_h)
+            except Exception:
+                pass
+
+            # 5. bridged scroll handler
+            page.evaluate("""
+                if (!window.__ht_pop_primed) {
+                    window.__ht_pop_primed = false;
+                    document.addEventListener('scroll', function _htScroll() {
+                        window.__ht_pop_primed = true;
+                        document.removeEventListener('scroll', _htScroll);
+                    }, {once: false, passive: true});
+                }
+            """)
+
+            # 6. CDP 鼠标 + 点击
+            _log.info("[Pop-under] CDP 可信点击发起 (%d, %d)，等待弹窗…", safe_x, safe_y)
+            _cdp_mouse_move(cdp, start_x, start_y, safe_x, safe_y, steps=move_steps)
+            time.sleep(random.uniform(0.05, 0.15))
+            _cdp_click(cdp, safe_x, safe_y)
+
+            # 7. 等待弹窗 — ★ 挂死修复：循环内只枚举窗口句柄，不再读 p.url。
+            #    Page.url 会 switch_to.window + current_url，弹窗加载中可无限挂起
+            #    （实测把 3s 超时拖成 28s 卡死，并导致 HumanModel 心跳丢失）。
+            deadline = time.time() + max_wait
+            while time.time() < deadline:
+                time.sleep(0.3)
+                pages_now = context.pages
+                new_pages = [p for p in pages_now if id(p) not in pages_before_ids]
+                if new_pages:
                     popunder_page = new_pages[-1]
-                break
+                    break
 
         if popunder_page is None:
             _log.warning("Pop-under 弹窗未创建（%d s 内无新标签）", max_wait)
+            _cleanup_page_triggers(page_id)  # ★ H2/M3: 失败路径清理页面守卫，允许后续重试
             return False, None, {"triggered": False, "reason": "no_new_tab"}
 
-        # 8. URL
-        try:
-            pop_url = popunder_page.url or ""
-        except Exception:
-            pop_url = ""
+        # 8. URL — ★ 挂死修复：守护线程+超时兑底读取（见 _safe_page_url）
+        pop_url = _safe_page_url(popunder_page)
 
         # 9. 等待加载（P0-2）—— stealth 注入统一由 guardian 阶段 2b 执行，
         # 避免跨线程重复 evaluate
@@ -593,11 +664,24 @@ def trigger_popunder(
         except Exception:
             load_state = "timeout_or_error"
 
-        # 10. ★ P0-1 修复：异步守护线程（不阻塞原站浏览）+ P0-4 激活弹窗
-        _log.info(
-            "[Pop-under] 弹窗已创建: %s, 停留 %d s (异步守护), 加载=%s",
-            pop_url[:100] if pop_url else "(blank)", stay, load_state,
+        # ★ H2 修复: 渲染确认——URL 为空/about: 或加载超时都视为"未确认"，
+        #   避免"打开但没加载出来"虚记为成功（联盟侧 0 展示但系统计已触发）
+        _unconfirmed = (
+            (not pop_url) or pop_url.startswith("about:")
+            or load_state != "domcontentloaded"
         )
+        _effective_triggered = not _unconfirmed
+        if _unconfirmed:
+            _log.warning(
+                "[Pop-under] 弹窗渲染未确认 (url=%s, load=%s)，记为 unconfirmed",
+                (pop_url[:80] if pop_url else "(blank)"), load_state,
+            )
+            _cleanup_page_triggers(page_id)  # ★ 允许后续重试
+        else:
+            _log.info(
+                "[Pop-under] 弹窗已确认渲染: %s, 停留 %d s (异步守护), 加载=%s",
+                pop_url[:100], stay, load_state,
+            )
         guardian = threading.Thread(
             target=_guard_stay_and_close,
             args=(popunder_page, page, stay, _inject_popunder_stealth),
@@ -605,11 +689,15 @@ def trigger_popunder(
         )
         guardian.start()
         _ACTIVE_GUARDIANS.append(guardian)
-        _LAST_POPUNDER_TS = time.time()
+        with _LAST_POPUNDER_LOCK:  # ★ M1: 写锁保护
+            _LAST_POPUNDER_TS = time.time()
 
         # 立即返回，不阻塞——原站浏览继续！
-        return True, popunder_page, {
-            "triggered": True,
+        # ★ H2: triggered 区分 confirmed / unconfirmed，供统计层区分有效曝光
+        return _effective_triggered, popunder_page, {
+            "triggered": _effective_triggered,
+            "unconfirmed": _unconfirmed,
+            "adopted_existing": _adopted,
             "url": pop_url[:200],
             "stay_actual": stay,
             "load_state": load_state,
@@ -619,6 +707,7 @@ def trigger_popunder(
 
     except Exception as e:
         _log.warning("[Pop-under] 触发异常: %s: %s", type(e).__name__, e)
+        _cleanup_page_triggers(page_id)  # ★ H2/M3: 异常路径也清理页面守卫
         return False, None, {"triggered": False, "reason": f"exception:{type(e).__name__}"}
 
 
@@ -669,7 +758,7 @@ def self_test() -> Dict[str, bool]:
     )
     results["unknown_rejected"] = not is_ip_safe_for_hilltopads(None)
     results["hosting_isp_rejected"] = not is_ip_safe_for_hilltopads(
-        {"ip_type": "", "isp": "Amazon Web Services"}
+        {"ip_type": "", "isp": "DigitalOcean LLC"}
     )
     # ★ P0-1 异步机制 —— ★ P2 修复：真实签名校验（旧版硬编码恒 True，
     # 无法拦截"守护线程被误删/参数变动"回归）

@@ -543,6 +543,8 @@ class Keyboard:
 
     def __init__(self, driver):
         self.driver = driver
+        # ★ 修复: Ctrl+A/Meta+A 全选支持 —— 修饰键按下状态位（CDP modifiers）
+        self._modifiers = 0
 
     # Playwright键名 -> (windowsVirtualKeyCode, key, code)
     _CDP_KEY_MAP = {
@@ -558,6 +560,15 @@ class Keyboard:
         "Enter": (13, "Enter", "Enter"),
         "Tab": (9, "Tab", "Tab"),
         "Escape": (27, "Escape", "Escape"),
+        "Backspace": (8, "Backspace", "Backspace"),
+    }
+
+    # 修饰键: vk, key, code, CDP modifiers位
+    _MOD_KEY_MAP = {
+        "Control": (17, "Control", "ControlLeft", 2),
+        "Meta": (91, "Meta", "MetaLeft", 4),
+        "Shift": (16, "Shift", "ShiftLeft", 8),
+        "Alt": (18, "Alt", "AltLeft", 1),
     }
 
     _SELENIUM_KEY_MAP = {
@@ -566,10 +577,53 @@ class Keyboard:
         "ArrowLeft": Keys.ARROW_LEFT, "ArrowRight": Keys.ARROW_RIGHT,
         "End": Keys.END, "Home": Keys.HOME, "Space": Keys.SPACE,
         "Enter": Keys.ENTER, "Tab": Keys.TAB, "Escape": Keys.ESCAPE,
+        "Backspace": Keys.BACKSPACE,
     }
 
+    def down(self, key: str, **kwargs):
+        """按住键（不释放）—— Playwright Keyboard.down 兼容，支持修饰键组合 Ctrl+A。"""
+        _mod = self._MOD_KEY_MAP.get(key)
+        if _mod:
+            vk, key_name, code, mod_bit = _mod
+            self._modifiers |= mod_bit
+            try:
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "windowsVirtualKeyCode": vk,
+                    "key": key_name, "code": code,
+                    "modifiers": self._modifiers,
+                })
+                return
+            except Exception:
+                pass  # 降级到 ActionChains
+        try:
+            mapped = self._SELENIUM_KEY_MAP.get(key, key)
+            ActionChains(self.driver).key_down(mapped).perform()
+        except Exception:
+            pass
+
+    def up(self, key: str, **kwargs):
+        """释放键 —— Playwright Keyboard.up 兼容。"""
+        _mod = self._MOD_KEY_MAP.get(key)
+        if _mod:
+            vk, key_name, code, mod_bit = _mod
+            self._modifiers &= ~mod_bit
+            try:
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp", "windowsVirtualKeyCode": vk,
+                    "key": key_name, "code": code,
+                    "modifiers": self._modifiers,
+                })
+                return
+            except Exception:
+                pass
+        try:
+            mapped = self._SELENIUM_KEY_MAP.get(key, key)
+            ActionChains(self.driver).key_up(mapped).perform()
+        except Exception:
+            pass
+
     def press(self, key: str, **kwargs):
-        """按键（CDP keyDown+keyUp，失败降级到ActionChains）。"""
+        """按键（CDP keyDown+keyUp，携带当前修饰键状态；失败降级到ActionChains）。"""
         cdp_key = self._CDP_KEY_MAP.get(key)
         if cdp_key:
             vk, key_name, code = cdp_key
@@ -577,11 +631,28 @@ class Keyboard:
                 self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
                     "type": "keyDown", "windowsVirtualKeyCode": vk,
                     "key": key_name, "code": code,
+                    "modifiers": self._modifiers,
                 })
                 time.sleep(0.02)
                 self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
                     "type": "keyUp", "windowsVirtualKeyCode": vk,
                     "key": key_name, "code": code,
+                    "modifiers": self._modifiers,
+                })
+                return
+            except Exception:
+                pass
+        # 单字符键：CDP 派发（携带修饰键，保证 Ctrl+A 语义）
+        if isinstance(key, str) and len(key) == 1 and key.isprintable():
+            try:
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "text": key, "key": key,
+                    "code": f"Key{key.upper()}", "modifiers": self._modifiers,
+                })
+                time.sleep(0.02)
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp", "key": key,
+                    "code": f"Key{key.upper()}", "modifiers": self._modifiers,
                 })
                 return
             except Exception:
@@ -768,9 +839,22 @@ class Page:
         self._network_interception_enabled = False
         self._cdp_listener = None
         self._request_id_map = {}
+        # ★ 窗口句柄绑定：None=主页面（沿用焦点语义）；非空=弹窗等副标签，
+        #   操作前自动切到绑定窗口，避免共享driver焦点被其它标签篡改
+        self._window_handle = None
         self.mouse = Mouse(driver)
         self.keyboard = Keyboard(driver)
         Page._set_current_page(self)
+
+    def _focus_window(self):
+        """★ 若绑定了窗口句柄且当前焦点不在其上，先切换焦点（失败不阻断）"""
+        if not self._window_handle:
+            return
+        try:
+            if self.driver.current_window_handle != self._window_handle:
+                self.driver.switch_to.window(self._window_handle)
+        except Exception:
+            pass
 
     @property
     def context(self):
@@ -780,6 +864,7 @@ class Page:
     @property
     def url(self) -> str:
         try:
+            self._focus_window()
             return self.driver.current_url or ""
         except Exception:
             return ""
@@ -826,7 +911,32 @@ class Page:
     def close(self, timeout: int = 10000, **kwargs):
         """关闭页面标签"""
         try:
-            # Selenium中关闭当前窗口
+            if self._window_handle:
+                # ★ 绑定句柄的弹窗页：先切到自身再关闭，防止误关主窗口
+                _switched = False
+                try:
+                    self.driver.switch_to.window(self._window_handle)
+                    _switched = True
+                except Exception:
+                    pass  # 句柄已失效（窗口已自然死亡），跳过关闭
+                if not _switched:
+                    return
+                try:
+                    self.driver.close()
+                except Exception:
+                    return
+                # 焦点归还主站（或第一个剩余窗口）
+                try:
+                    _main_h = getattr(self._context, "_main_window_handle", None)
+                    _hs = self.driver.window_handles
+                    if _main_h and _main_h in _hs:
+                        self.driver.switch_to.window(_main_h)
+                    elif _hs:
+                        self.driver.switch_to.window(_hs[0])
+                except Exception:
+                    pass
+                return
+            # 主页面沿用旧逻辑：关闭当前窗口
             if len(self.driver.window_handles) > 1:
                 self.driver.close()
                 # 切换回最后一个窗口
@@ -856,6 +966,7 @@ class Page:
         ok = True
 
         try:
+            self._focus_window()
             # 设置referer（通过CDP）
             if referer:
                 try:
@@ -949,6 +1060,7 @@ class Page:
 
     def wait_for_load_state(self, state: str = "load", timeout: int = 30000):
         """等待加载状态"""
+        self._focus_window()
         self._wait_for_load_state(state, timeout)
 
     def wait_for_selector(self, selector: str, timeout: int = 30000, **kwargs) -> Optional[ElementHandle]:
@@ -972,6 +1084,7 @@ class Page:
     def evaluate(self, script: str, arg=None) -> Any:
         """执行JavaScript"""
         try:
+            self._focus_window()
             js = self._prepare_script(script, arg)
             if arg is not None and not isinstance(arg, (str, int, float, bool)):
                 # ElementHandle传参
@@ -1115,7 +1228,21 @@ class Page:
     def bring_to_front(self):
         """将窗口置前"""
         try:
-            self.driver.switch_to.window(self.driver.current_window_handle)
+            if self._window_handle:
+                # ★ 绑定句柄的窗口（如弹窗）：切到自身并OS级前置
+                self.driver.switch_to.window(self._window_handle)
+                try:
+                    self.driver.execute_cdp_cmd("Page.bringToFront", {})
+                except Exception:
+                    pass
+            else:
+                # 主页面：焦点可能已被弹窗篡夺，切回context记录的主窗口
+                _main_h = getattr(self._context, "_main_window_handle", None)
+                if _main_h:
+                    try:
+                        self.driver.switch_to.window(_main_h)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1247,6 +1374,22 @@ class Page:
                 pass
 
 
+# ========== CDP Session 兼容类 ==========
+class _CDPSession:
+    """模拟 Playwright CDPSession：.send(method, params) -> driver.execute_cdp_cmd"""
+
+    def __init__(self, driver, page=None):
+        self.driver = driver
+        self.page = page
+
+    def send(self, method: str, params: Dict = None) -> Any:
+        """发送 CDP 命令（如 Input.dispatchMouseEvent / Input.dispatchKeyEvent）"""
+        return self.driver.execute_cdp_cmd(method, params or {})
+
+    def close(self):
+        pass
+
+
 # ========== BrowserContext 兼容类 ==========
 class BrowserContext:
     """模拟 Playwright BrowserContext"""
@@ -1263,6 +1406,13 @@ class BrowserContext:
         # 创建默认page
         self._main_page = Page(driver, context=self)
         self._pages.append(self._main_page)
+
+        # ★ 窗口动态跟踪：记录主窗口句柄 + 弹窗句柄→Page映射
+        try:
+            self._main_window_handle = driver.current_window_handle
+        except Exception:
+            self._main_window_handle = None
+        self._handle_pages = {}
 
         # 应用init scripts和request interception到driver
         self._apply_context_config()
@@ -1608,9 +1758,43 @@ class BrowserContext:
         """关闭context（在Selenium中关闭driver）"""
         pass  # driver在Browser级别关闭
 
+    def new_cdp_session(self, page=None):
+        """创建 CDP 会话（Playwright BrowserContext.new_cdp_session 兼容）。
+
+        Selenium 下所有页面共享同一 chromedriver 的 CDP 通道，
+        因此返回一个把 .send(method, params) 映射到 driver.execute_cdp_cmd 的包装对象。
+        popunder_trigger 依赖它派发 isTrusted 的 Input.dispatchMouseEvent/KeyEvent。
+        """
+        return _CDPSession(self.driver, page)
+
     @property
     def pages(self) -> List[Page]:
-        return self._pages
+        """★ 动态返回当前所有标签页（含弹窗）。
+        旧实现只返回静态 _pages（永远只有主页面），导致 popunder_trigger
+        和广告落地页检测永远看不到新开的标签。现按 driver.window_handles
+        实时构建：主窗口复用 _main_page（保持焦点语义），其余窗口创建
+        绑定句柄的 Page 并按句柄缓存（保证对象身份稳定，支持 id() 去重）。
+        """
+        try:
+            handles = list(self.driver.window_handles)
+        except Exception:
+            return list(self._pages)
+        result: List[Page] = []
+        for h in handles:
+            if self._main_window_handle and h == self._main_window_handle:
+                result.append(self._main_page)
+                continue
+            p = self._handle_pages.get(h)
+            if p is None:
+                p = Page(self.driver, context=self)
+                p._window_handle = h
+                self._handle_pages[h] = p
+            result.append(p)
+        # 清理已关闭窗口的缓存
+        for h in list(self._handle_pages.keys()):
+            if h not in handles:
+                self._handle_pages.pop(h, None)
+        return result
 
 
 # ========== Browser 兼容类 ==========

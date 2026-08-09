@@ -20,7 +20,7 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "3.6.8"
+APP_VERSION = "26.8.9.3"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -1739,34 +1739,75 @@ _file_handler.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, logging.StreamHandler()])
 
 # ★ 5.2 Chromium僵尸进程清理（启动时执行一次 + 每30分钟定时清理）
-def _cleanup_zombie_chromium():
-    """清理运行超过10分钟的僵尸chromium进程"""
+def _cleanup_zombie_chromium(min_minutes=10):
+    """清理孤儿 chrome/chromedriver 僵尸进程（父进程已死且运行超 min_minutes 分钟）
+
+    ★ 修复：旧代码匹配 'chromium' in comm，但实际进程名是 chrome/chromedriver，
+    永远匹配不上，导致 7/31 以来 4 组 chromedriver+chrome 僵尸进程长期残留
+    （占用内存/端口，诱发新任务 chromedriver 异常死亡）。
+    现在：① 进程名匹配 chrome/chromedriver；② 只清理 PPID==1 的孤儿组根进程
+    （父进程已死，正在使用的 chromedriver 父进程是 python，不会误杀）；
+    ③ 运行超 min_minutes（默认10）分钟；④ 连带清理该孤儿组全部后代进程。
+    ★ 2026-08-08 优化：看门狗强制中断后（chromedriver 被 SIGKILL），chrome 主进程
+    必然变孤儿且无法优雅关闭，此时传 min_minutes=0 立即清理，避免残留窗口期。
+    """
     import subprocess as _sp
     import os as _os_z
     try:
-        # 查找运行超过10分钟的chromium进程（排除当前进程的父进程）
+        # 查找 chrome/chromedriver 进程
         _my_pid = _os_z.getpid()
         result = _sp.run(['ps', '-eo', 'pid,ppid,etime,comm'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            for line in result.stdout.strip().split('\n')[1:]:
-                parts = line.split()
-                if len(parts) >= 4 and 'chromium' in parts[3].lower():
-                    pid, ppid, etime = int(parts[0]), int(parts[1]), parts[2]
-                    # 跳过当前进程树
-                    if pid == _my_pid or ppid == _my_pid:
-                        continue
-                    # 检查运行时间是否超过10分钟（格式: MM:SS 或 HH:MM:SS）
-                    try:
-                        if ':' in etime:
-                            time_parts = etime.split(':')
-                            minutes = int(time_parts[-2]) if len(time_parts) >= 2 else 0
-                            if len(time_parts) == 3:
-                                minutes += int(time_parts[0]) * 60
-                            if minutes >= 10:
-                                _sp.run(['kill', '-9', str(pid)], timeout=2)
-                                log.info(f"🧹 清理僵尸chromium进程: PID={pid}, 运行时间={etime}")
-                    except Exception:
-                        pass
+        if result.returncode != 0:
+            return
+        procs = []
+        for line in result.stdout.strip().split('\n')[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            comm = parts[3].lower()
+            # ★ 修复：进程名是 chromedriver / chrome（旧代码匹配 'chromium' 永远不命中）
+            if 'chromedriver' not in comm and 'chrome' not in comm:
+                continue
+            try:
+                procs.append((int(parts[0]), int(parts[1]), parts[2]))
+            except Exception:
+                continue
+        if not procs:
+            return
+        # 找孤儿组根：PPID==1 且运行超10分钟
+        roots = []
+        for pid, ppid, etime in procs:
+            if ppid != 1:
+                continue
+            try:
+                if ':' in etime:
+                    time_parts = etime.split(':')
+                    minutes = int(time_parts[-2]) if len(time_parts) >= 2 else 0
+                    if len(time_parts) == 3:
+                        minutes += int(time_parts[0]) * 60
+                else:
+                    minutes = float(etime) / 60
+                if minutes >= min_minutes:
+                    roots.append(pid)
+            except Exception:
+                pass
+        if not roots:
+            return
+        # 收集孤儿组全部后代（chrome 主进程的子进程 PPID 指向 chrome 主进程）
+        victim_set = set(roots)
+        changed = True
+        while changed:
+            changed = False
+            for pid, ppid, _e in procs:
+                if ppid in victim_set and pid not in victim_set:
+                    victim_set.add(pid)
+                    changed = True
+        for pid in sorted(victim_set):
+            try:
+                _sp.run(['kill', '-9', str(pid)], timeout=2)
+                log.info(f"🧹 清理僵尸chrome进程: PID={pid}")
+            except Exception:
+                pass
     except Exception as e:
         log.debug(f"僵尸进程清理异常: {e}")
 
@@ -3002,30 +3043,35 @@ def human_model_tick(source):
 
 
 def ensure_human_model_alive():
-    """保证真人模型心跳存在：心跳丢失>20s就自动重启 supervisor + 重设 running。
+    """保证真人模型心跳存在：心跳丢失>20s 或已失活就自动重启 supervisor + 重设 running。
 
     返回 True（调用方不用再判断），但日志会记录每次重启事件。
+    ★ F3 修复: running=False（supervisor 因心跳丢>30s 已标失活）时也必须重启，
+      否则真人模型在本任务剩余时间永久停摆。
     """
     global human_model_thread
     try:
         with human_model_lock:
             s = human_model_state
             running = s.get("running", False)
-            if not running:
-                return True
             hb = s.get("last_heartbeat", 0)
-        if time.time() - hb > 20:
-            log.warning("[HumanModel] 心跳丢失 20s，重启 supervisor 并重设 running=True")
-            human_model_stop_event.set()
-            time.sleep(0.6)
-            human_model_stop_event.clear()
-            with human_model_lock:
-                human_model_state["last_heartbeat"] = time.time()
-                human_model_state["running"] = True
-                human_model_state["last_source"] = "ensure_alive_reboot"
-                t = threading.Thread(target=_human_model_supervisor_loop, daemon=True)
-                t.start()
-                human_model_thread = t
+        _need_reboot = (not running) or (time.time() - hb > 20)
+        if not _need_reboot:
+            return True
+        log.warning(
+            "[HumanModel] 真人模型失活或心跳丢失(running=%s, age=%.1fs)，"
+            "重启 supervisor 并重设 running=True", running, time.time() - hb
+        )
+        human_model_stop_event.set()
+        time.sleep(0.6)
+        human_model_stop_event.clear()
+        with human_model_lock:
+            human_model_state["last_heartbeat"] = time.time()
+            human_model_state["running"] = True
+            human_model_state["last_source"] = "ensure_alive_reboot"
+            t = threading.Thread(target=_human_model_supervisor_loop, daemon=True)
+            t.start()
+            human_model_thread = t
     except Exception as _e:
         log.debug(f"[HumanModel] ensure_alive 异常忽略: {_e}")
     return True
@@ -3816,7 +3862,7 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         target_ad = random.choice(_unclicked)
         ad_x = target_ad["x"]
         ad_y = target_ad["y"]
-        # 记录已点击位置（50px粒度去重）
+        # 记录已点击位置（50px粒度去重）—— key 用冒号，与失败清理保持一致（★ Bug#2 修复）
         _ad_clicked_positions.add(f"{ad_x//50}:{ad_y//50}")
         log.info(f"🎯 [广告点击][{stage}] 概率命中(prob={prob:.4f})，发现{len(ad_positions)}个可见广告，准备点击({ad_x},{ad_y})")
 
@@ -3865,14 +3911,26 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
                 log.debug(f"P0-3 语义检查异常(忽略): {_rce_e}")
 
         # 8. 点击广告
+        # ★ F6 修复: 点击异常时不计入点击数/冷却/去重，否则"假点击"会占掉每日上限且收益为0
+        _click_ok = False
         try:
             page.mouse.click(ad_x, ad_y)
-        except Exception:
-            pass
+            _click_ok = True
+        except Exception as _click_e:
+            log.warning(f"⚠️ [广告点击] 点击失败(元素可能已刷新/页面导航): {str(_click_e)[:80]}，不计数不占冷却")
+            # 从去重集合移除该位置，允许后续重试
+            try:
+                _ad_clicked_positions.discard(f"{int(ad_x//50)}:{int(ad_y//50)}")
+            except Exception:
+                pass
 
-        _today_clicks = record_ad_click(1)
-        _ad_click_last_ts = time.time()  # ★ 更新冷却时间戳
-        log.info(f"🖱️ [广告点击] 已执行点击（今日累计 {_today_clicks} 次，冷却{_ad_click_cooldown}s）")
+        if _click_ok:
+            _today_clicks = record_ad_click(1)
+            _ad_click_last_ts = time.time()  # ★ 更新冷却时间戳
+            log.info(f"🖱️ [广告点击] 已执行点击（今日累计 {_today_clicks} 次，冷却{_ad_click_cooldown}s）")
+        else:
+            # ★ F6: 点击失败直接返回，不执行"点击后等待/落地页处理"，避免误报点击成功
+            return False, current_x, current_y
 
         # 9. 点击后等待
         ad_click_wait_cfg = config.get("ad_click_wait", {"min": 2, "max": 20})
@@ -3922,7 +3980,7 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         return False, current_x, current_y
 
 
-def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config, user_agent=""):
+def perform_real_search(page, target_url, selected_engine_id, selected_keyword, stats, current_x, current_y, config, user_agent="", task_deadline=None):
     """
     执行完整搜索引擎搜索跳转流程（带真人模拟），支持所有搜索引擎
     :param page: 浏览器页面
@@ -3933,6 +3991,7 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
     :param current_x, current_y: 当前鼠标坐标
     :param config: 系统配置
     :param user_agent: 当前浏览器UA字符串（用于判断Mac/Win平台）
+    :param task_deadline: 任务截止时间戳（看门狗保底，防止CDP冻结）
     :return: (success, current_x, current_y)
     """
     from urllib.parse import urlparse
@@ -4192,7 +4251,11 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             _post_title = (page.title() or "").lower()
             _captcha_keywords = ["captcha", "recaptcha", "unusual traffic", "not a robot",
                                  "验证", "人机验证", "安全检测", "robot", "blocked",
-                                 "sorry", "access denied", "403"]
+                                 "sorry", "access denied", "403",
+                                 # ★ 多语言 CAPTCHA/拦截页覆盖（日/韩/俄）
+                                 "アクセス", "拒否", "ロボット", "再試行", "bot",
+                                 "접근", "차단", "사람", "로봇",
+                                 "доступ", "запрещ", "робот", "капч", "проверк"]
             if any(kw in _post_title for kw in _captcha_keywords):
                 log.warning(f"🔍 [真搜索] 检测到CAPTCHA/拦截页面: title={page.title()[:60]}, url={_post_url[:80]}")
                 _captcha_detected = True
@@ -4246,6 +4309,11 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
             if resolved != href and (target_host in resolved or target_host_nowww in resolved):
                 return True
             return False
+
+        # ★ deadline 检查：进入 Playwright 密集调用区前确认未超时
+        if task_deadline and time.time() >= task_deadline:
+            log.warning(f"⏱️ [deadline] perform_real_search: deadline已到({time.time()-task_deadline:.1f}s)，放弃搜索链接查找")
+            return False, current_x, current_y
 
         # 遍历搜索结果中的 a 标签
         for selector in result_selectors:
@@ -4309,7 +4377,12 @@ def perform_real_search(page, target_url, selected_engine_id, selected_keyword, 
                         log.warning(f"🔍 [真搜索] 前20个链接样本: {_samples[:5]}")
             except Exception as _js_err:
                 log.warning(f"🔍 [真搜索] JS兜底搜索失败: {str(_js_err)[:100]}")
-        
+
+        # ★ deadline 检查：点击+等待导航前再次确认
+        if target_link_found and task_deadline and time.time() >= task_deadline:
+            log.warning(f"⏱️ [deadline] perform_real_search: deadline已到，放弃点击搜索结果")
+            return False, current_x, current_y
+
         if target_link_found:
             # 滚动到可见（加超时保护，避免元素已脱离DOM导致卡死）
             try:
@@ -4358,6 +4431,86 @@ stats = {
     "country_video_views": {}  # key: country_code, value: count
 }
 _stats_lock = threading.Lock()  # 保护 stats 字典的并发读写
+
+# ========== ★ 保险绳主动看门狗 ==========
+# 解决：Playwright API 调用冻结时，被动 _check_rope 无法执行，
+# 导致任务卡死远超 deadline。看门狗在独立线程中监控 deadline，
+# 到期后强制关闭 page，中断所有冻结的 Playwright CDP 调用。
+_rope_watchdog_event = threading.Event()  # set() 取消看门狗
+_rope_watchdog_fired = False
+_ROPE_WATCHDOG_GRACE_S = 60  # deadline 到达后给检查点的宽限期（秒）
+
+def _rope_watchdog(deadline, page_ref, label=""):
+    """主动看门狗：deadline 到达时软提醒，宽限期后强制中断卡死的浏览器进程。
+
+    ★ 修复1（任务计划被误杀）：旧实现到期后会 ① 强制 page.close()（selenium_bridge 下
+    若存在 Popunder 弹窗窗口，会关掉主窗口并切换到广告弹窗页，后续浏览跑在广告页上）
+    ② 全局置 task_running=False——这是计划级开关，直接导致 413 任务计划在首个任务
+    deadline 到达时整体中止（"计划未完成(1/413)"），任务计划根本无法执行。
+
+    ★ 修复2（任务卡死）：纯软提醒依赖 _check_rope 检查点能执行到；若主线程卡死在
+    Selenium/CDP 调用上（如 chromedriver 已死、Selenium 客户端无限重试 Connection
+    refused），检查点永远执行不到，任务无限卡死（2026-08-08 实测卡死 14 分钟）。
+    因此：到期后先软提醒，再等待宽限期（正常任务由 _cancel_rope_watchdog 取消）；
+    宽限期后仍未截断 = 主线程卡死，强制杀掉本任务 chromedriver/chrome 进程，
+    卡死的调用立即抛异常 → 主线程异常处理 → 本任务标记失败 → 计划自动进入下一任务。
+    不写 task_running（计划级开关）、不 page.close()（Popunder 会切窗口）。
+    """
+    global _rope_watchdog_fired
+    try:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return  # deadline 已过，不需要看门狗
+        # 等待直到 deadline 或被取消
+        cancelled = _rope_watchdog_event.wait(timeout=remaining)
+        if cancelled:
+            return  # 任务正常结束，取消看门狗
+        # deadline 到达：标记+提醒，先给检查点一个宽限期
+        _rope_watchdog_fired = True
+        log.warning(
+            f"🐕 [看门狗] deadline 到达({label})，浏览预算耗尽，"
+            f"将在下一个检查点截断本任务（不影响计划内后续任务）"
+        )
+        # 宽限期：等待检查点正常截断（任务结束会 set event 取消看门狗）
+        if _rope_watchdog_event.wait(timeout=_ROPE_WATCHDOG_GRACE_S):
+            return  # 任务已正常结束
+        # ★ 宽限期后仍未结束 → 主线程卡死（Selenium 调用冻结/无限重试）→ 强制中断
+        log.error(
+            f"🐕 [看门狗] 宽限期{_ROPE_WATCHDOG_GRACE_S}s后任务仍未截断({label})，"
+            f"判定主线程卡死，强制中断浏览器进程（本任务将失败，计划继续下一任务）"
+        )
+        try:
+            _driver = getattr(page_ref, "driver", None)
+            if _driver is not None:
+                _selenium_bridge._kill_driver_processes(_driver)
+                try:
+                    _selenium_bridge._unregister_driver(_driver)
+                except Exception:
+                    pass
+            # ★ 2026-08-08：chromedriver 被强杀后 chrome 主进程必然成孤儿且无法优雅关闭，
+            # 立即清理（min_minutes=0，只清 PPID==1 孤儿，不影响其他任务），
+            # 避免残留窗口期（原实现要等运行超10分钟+30分钟定时才清）
+            try:
+                _cleanup_zombie_chromium(min_minutes=0)
+            except Exception:
+                pass
+        except Exception as e:
+            log.debug(f"🐕 [看门狗] 强制中断异常: {e}")
+    except Exception as e:
+        log.debug(f"🐕 [看门狗] 异常退出: {e}")
+
+def _start_rope_watchdog(deadline, page_ref, label=""):
+    """启动保险绳看门狗线程"""
+    global _rope_watchdog_fired
+    _rope_watchdog_event.clear()
+    _rope_watchdog_fired = False
+    t = threading.Thread(target=_rope_watchdog, args=(deadline, page_ref, label), daemon=True, name="rope-watchdog")
+    t.start()
+    return t
+
+def _cancel_rope_watchdog():
+    """取消保险绳看门狗（任务正常结束时调用）"""
+    _rope_watchdog_event.set()
 
 def _safe_stats_inc(key, amount=1):
     """线程安全地递增 stats 计数"""
@@ -7304,7 +7457,9 @@ HTML_TEMPLATE = r"""
             // ★ 必须注入的默认关键词（每层都要有）
             // "chapter" 通过 includes() 匹配可覆盖 chapter1~chapter3000 所有章节链接
             const MUST_HAVE_KWS = ['chapter', 'home'];
-            const MUST_HAVE_FBS = ['https://freestoryweb.com/'];
+            // ★ 2026-08-09：不再强制注入硬编码首页兜底链接（原 MUST_HAVE_FBS 塞入
+            // freestoryweb.com 首页等无广告页，导致任务访问的页面没有广告）。
+            // 兜底链接严格只来自关键词探索中“确认含广告代码的页面”，空则留空。
 
             for (let i = 1; i <= 5; i++) {
                 const layerKey = 'layer_' + i;
@@ -7330,15 +7485,12 @@ HTML_TEMPLATE = r"""
                 }
                 
                 if (fbTextarea) {
-                    // 如果该层有爬取数据则用之，否则用合并池
+                    // 如果该层有爬取数据则用之，否则用合并池（均来自含广告页面）
                     let fbs = (data && data.fallback_urls && data.fallback_urls.length > 0) ? [...data.fallback_urls]
                             : (mergedFbs.length > 0 ? [...mergedFbs] : []);
                     // ★ 每层最多保存20个兜底链接
                     if (fbs.length > 20) fbs = fbs.slice(0, 20);
-                    // ★ 强制注入首页兜底链接
-                    for (const mf of MUST_HAVE_FBS) {
-                        if (!fbs.includes(mf)) fbs.unshift(mf);
-                    }
+                    // ★ 2026-08-09：不注入任何非广告页兜底链接，fbs 为空则保持为空
                     fbTextarea.value = fbs.join(',');
                 }
             }
@@ -7623,28 +7775,42 @@ class StructuredLogger:
             content += f"、失败原因：{fail_reason}"
         self._add_log("任务结果", content)
     
-    def info(self, message):
+    def _fmt(self, message, args):
+        """★ 修复（2026-08-09）：兼容 %s 风格格式化参数（如 log.info("x=%s", v)），
+        避免 StructuredLogger.warning() takes 2 positional arguments but 4 were given 类报错"""
+        if args:
+            try:
+                return message % args
+            except Exception:
+                return message
+        return message
+
+    def info(self, message, *args):
+        message = self._fmt(message, args)
         timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
         self.messages.append(f"{timestamp} <span class='log-info'>[INFO]</span> {message}")
         if len(self.messages) > self.max_lines:
             self.messages.pop(0)
         logging.info(f"[worker] {message}")
 
-    def error(self, message):
+    def error(self, message, *args):
+        message = self._fmt(message, args)
         timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
         self.messages.append(f"{timestamp} <span class='log-error'>[ERROR]</span> {message}")
         if len(self.messages) > self.max_lines:
             self.messages.pop(0)
         logging.error(f"[worker] {message}")
 
-    def debug(self, message):
+    def debug(self, message, *args):
+        message = self._fmt(message, args)
         timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
         self.messages.append(f"{timestamp} <span class='log-info'>[DEBUG]</span> {message}")
         if len(self.messages) > self.max_lines:
             self.messages.pop(0)
         logging.debug(f"[worker] {message}")
 
-    def warning(self, message):
+    def warning(self, message, *args):
+        message = self._fmt(message, args)
         timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
         self.messages.append(f"{timestamp} <span class='log-warning'>[WARNING]</span> {message}")
         if len(self.messages) > self.max_lines:
@@ -10133,7 +10299,7 @@ def click_back_home_button(page, target_url, current_x, current_y, config):
     
     return False, current_x, current_y
 
-def click_link_containing_text(page, text_list, current_x, current_y, config):
+def click_link_containing_text(page, text_list, current_x, current_y, config, task_deadline=None):
     """
     在页面上找到包含任一指定文本的链接并点击
     text_list: 字符串列表，链接文本包含其中任一个即可匹配（不区分大小写）
@@ -10182,6 +10348,11 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
         except Exception:
             _base_url = ""
 
+        # ★ deadline 检查：进入 Playwright 调用前确认未超时
+        if task_deadline and time.time() >= task_deadline:
+            log.warning(f"⏱️ [deadline] click_link_containing_text: deadline已到(JS匹配前)，跳过")
+            return False, current_x, current_y
+
         # ★ 使用 JS evaluate 在浏览器内完成链接匹配（比Python逐一遍历CDP快10倍+）
         for attempt in range(2):
             try:
@@ -10191,6 +10362,8 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                         const candidates = [];
                         const seenHref = new Set();
                         const baseUrl = window.location.href;
+                        // ★ 无广告页过滤：与兜底URL池一致，避免点进 DMCA/隐私政策等无广告页浪费任务
+                        const NO_AD = ['/about', '/contact', '/privacy', '/refund', '/dmca', '/faq', '/terms', '/tos', '/cookie', '/sitemap', '/login', '/register', '/account'];
                         for (const link of links) {
                             const href = (link.getAttribute('href') || '').trim();
                             if (!href || href.startsWith('mailto:') || href.startsWith('tel:') ||
@@ -10201,6 +10374,8 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                             let normalized = href;
                             try { normalized = new URL(href, baseUrl).href; } catch(e) {}
                             if (seenHref.has(normalized)) continue;
+                            // ★ 无广告路径过滤：命中即跳过
+                            if (NO_AD.some(p => normalized.toLowerCase().includes(p))) continue;
                             for (const kw of keywords) {
                                 if (!kw) continue;
                                 if (text.includes(kw) || hrefLow.includes(kw) || normalized.toLowerCase().includes(kw)) {
@@ -10232,6 +10407,10 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                 continue
         
         if target_href:
+            # ★ deadline 检查：Playwright 调用前检查是否已超时
+            if task_deadline and time.time() >= task_deadline:
+                log.warning(f"⏱️ [deadline] click_link_containing_text: deadline已到，跳过链接点击")
+                return False, current_x, current_y
             # 使用更稳定的方式：先获取href，然后点击或导航
             try:
                 # 重新查找，确保元素存在（用规范化后的 href 反向匹配）
@@ -10292,6 +10471,9 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
                             _plw = config.get("page_load_wait", {"min": 1, "max": 8})
                             wait_load = random.uniform(float(_plw.get("min", 1)), float(_plw.get("max", 8)))
                             _click_deadline = time.time() + 15  # 最多等15s
+                            # ★ deadline 感知：保险绳到期时不再傻等，立即结束等待（避免白耗预算）
+                            if task_deadline:
+                                _click_deadline = min(_click_deadline, task_deadline)
                             while time.time() < _click_deadline:
                                 if not task_running:
                                     log.warning("⛔ 点击后等待中任务被停止")
@@ -10325,7 +10507,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config):
     
     return False, current_x, current_y
 
-def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_y, config, final_fallback_url=None):
+def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_y, config, final_fallback_url=None, task_deadline=None):
     """
     在页面上找到包含任一指定文本的链接并点击，如果找不到则尝试使用 fallback_urls
     text_list: 字符串列表；若为空则不做文本匹配，直接走 fallback_urls
@@ -10344,7 +10526,7 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
     _has_kw = bool(text_list and any(str(k).strip() for k in text_list))
     if _has_kw:
         try:
-            success, new_x, new_y = click_link_containing_text(page, text_list, current_x, current_y, config)
+            success, new_x, new_y = click_link_containing_text(page, text_list, current_x, current_y, config, task_deadline=task_deadline)
             if success:
                 log.info("✅ 通过关键词链接跳转成功")
                 return True, new_x, new_y
@@ -10413,6 +10595,10 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
         log.warning(f"⚠️ 未找到关键词链接，尝试使用 {len(_fbs)} 个兜底URL...")
         _consecutive_fail = 0
         for url in _fbs:
+            # ★ deadline 感知：保险绳已到期的话不再逐个试兜底URL（避免白耗 20-40s）
+            if task_deadline and time.time() >= task_deadline:
+                log.warning(f"⏱️ [deadline] click_link_with_fallback: 保险绳已到期，跳过剩余兜底URL尝试")
+                break
             try:
                 log.info(f"🚀 尝试兜底URL: {url}")
                 page.goto(url, wait_until="domcontentloaded", timeout=10000)
@@ -11780,7 +11966,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
         if _resumed_plan and _resumed_status:
             _done_count = sum(1 for s in _resumed_status if s == "已完成")
             _total_count = len(_resumed_status)
-            if _done_count > 0 and _done_count < _total_count:
+            if _done_count < _total_count:
                 log.info(f"📋 检测到当天未完成的计划，断点恢复！已完成 {_done_count}/{_total_count}，从第 {_done_count+1} 个任务继续")
                 daily_plan = _resumed_plan
                 current_plan = _resumed_plan
@@ -11917,10 +12103,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 continue
 
             # ========== ★ P2-5：为本任务开启 suicide watchdog（30 min 硬上限） ==========
-            _start_task_global_watchdog(
-                f"{task_idx+1}/{total_tasks if 'total_tasks' in dir() else len(tasks_list)}@{task.get('proxy_country','??')}",
-                seconds=1800,
-            )
+            # ★ 修复（2026-08-08）：必须等"等待计划开始时间"结束后再启动！
+            # 原实现在任务迭代开始就计时，而多天计划任务排期可能在未来数小时
+            # （等待 4215s 实测），等待期被计入 30 分钟硬上限 → 等待>30min 必然
+            # 触发 os._exit(24) 自杀，整个计划断点丢失（实测 14:00:49 自杀）。
             enter_site_time = None  # 进入网站（首页加载完成）时间锚点（放这里防止单分支未定义）
 
             # 更新当前任务索引
@@ -11932,6 +12118,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
             
             if not task_running:
                 log.warning("⛔ 任务已停止（任务清单遍历中）")
+                _cancel_task_global_watchdog()  # ★ P2-5: break 前取消 suicide watchdog，防止 30min 后误自杀
                 break
                         
             # ========== Step B: 使用任务计划中预定的代理国家（v1.60） ==========
@@ -11946,6 +12133,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 available_proxies = get_available_proxies(proxy_pool_enabled)
                 if not available_proxies:
                     log.error("❌ 没有可用代理（工作时间内），跳过本任务")
+                    _cancel_task_global_watchdog()  # ★ P2-5: continue 前取消 suicide watchdog
                     _safe_stats_inc("fail")
                     _safe_stats_inc("total")
                     continue
@@ -12020,7 +12208,15 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 log.info(f"⏳ 等待 {wait_sec:.1f} 秒后开始任务...")
                 if not interruptible_sleep(wait_sec):
                     log.warning("⛔ 任务已停止（等待中）")
+                    _cancel_task_global_watchdog()  # ★ P2-5: break 前取消 suicide watchdog
                     break
+            
+            # ★ 修复：suicide watchdog 在等待结束后、任务真正开始执行前启动，
+            # 等待期（可能数小时）不计入 30 分钟硬上限
+            _start_task_global_watchdog(
+                f"{task_idx+1}/{total_tasks if 'total_tasks' in dir() else len(tasks_list)}@{task.get('proxy_country','??')}",
+                seconds=1800,
+            )
             
             # 增加总任务计数
             _safe_stats_inc("total")
@@ -12088,8 +12284,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 return {"success": False, "error": f"{type(e).__name__}: {e}"}
                         
                         # 使用线程池执行器，设置45秒超时
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(_fetch_proxy_with_timeout)
+                        # ★ F10 修复: 不使用 with(其__exit__会shutdown(wait=True)无限等待)，超时即放弃
+                        _executor = ThreadPoolExecutor(max_workers=1)
+                        try:
+                            future = _executor.submit(_fetch_proxy_with_timeout)
                             try:
                                 proxy_info = future.result(timeout=45)
                                 log.info(f"✅ IPDeep代理获取完成")
@@ -12099,6 +12297,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             except Exception as e:
                                 log.error(f" IPDeep代理获取失败: {type(e).__name__}: {e}")
                                 proxy_info = {"success": False, "error": f"{type(e).__name__}: {e}"}
+                        finally:
+                            _executor.shutdown(wait=False, cancel_futures=True)  # 超时即放弃，后台线程由daemon兜底
                         
                         # 记录获取结果
                         if proxy_info and proxy_info.get("success"):
@@ -12240,6 +12440,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 "city": resolved_ip_info.get("city") or _city,
                                 "timezone": resolved_ip_info.get("timezone") or _timezone,
                                 "language": resolved_ip_info.get("language") or _language,
+                                # ★ Bug#5 修复: fallback dict 也透传 IP 质量字段，避免机房 IP 绕过过滤
+                                "isp": ip_info.get("isp") or resolved_ip_info.get("isp") or None,
+                                "asn": ip_info.get("asn") or resolved_ip_info.get("asn") or None,
+                                "ip_type": ip_info.get("type") or resolved_ip_info.get("ip_type") or None,
                             }
                             if not resolved_ip_info["timezone"]:
                                 # ★ 严禁回退到 Etc/UTC！该时区与任何真实用户不匹配，极易被风控标记。
@@ -12695,8 +12899,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             return None, err_msg
                     
                     # 使用线程池执行器实现超时保护
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(_do_launch)
+                    # ★ F10 修复: 不使用 with(其__exit__会shutdown(wait=True)无限等待)，超时即放弃
+                    _launch_executor = ThreadPoolExecutor(max_workers=1)
+                    try:
+                        future = _launch_executor.submit(_do_launch)
                         try:
                             browser, error = future.result(timeout=_max_wait_sec)
                             return browser, error
@@ -12708,6 +12914,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             exec_err = f"执行器异常: {type(e).__name__}: {str(e)[:200]}"
                             log.error(f"❌ {exec_err}")
                             return None, exec_err
+                    finally:
+                        _launch_executor.shutdown(wait=False, cancel_futures=True)  # 超时即放弃，后台线程由daemon兜底
 
                 def _minimal_launch_kwargs():
                     args = [
@@ -13776,6 +13984,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 if not fingerprint or not fingerprint.get('language') or not fingerprint.get('timezone'):
                     log.error("❌ 指纹信息不完整，无法继续任务")
                     _safe_stats_inc("fail")
+                    _cancel_task_global_watchdog()  # ★ P2-5: 任务级 continue 前取消 suicide watchdog
                     continue
 
                 browser_success = True
@@ -13888,6 +14097,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, f"浏览器启动失败或指纹不一致: {consistency_details}")
+                    _cancel_task_global_watchdog()  # ★ P2-5: 任务级 continue 前取消 suicide watchdog
                     continue
                 
                 # ==================== 页面 & 广告模块 ====================
@@ -13902,6 +14112,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     _safe_stats_inc("fail")
                     task_time = time.time() - task_start_time
                     log.task_result(task_time, False, False, "没有勾选的目标网站")
+                    _cancel_task_global_watchdog()  # ★ P2-5: 任务级 continue 前取消 suicide watchdog
                     continue
                 for _url_idx, target_url in enumerate(_active_urls):
                     log.info(f"🔗 串联浏览: 第{_url_idx+1}/{len(_active_urls)}个网站 - {target_url}")
@@ -13962,7 +14173,24 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         search_mode = config.get("seo", {}).get("search_mode", "direct_referer")
                         already_on_target = False
                         current_x, current_y = 0, 0  # 初始化鼠标坐标（避免 UnboundLocalError）
-                        
+
+                        # ★ 提前计算保险绳 deadline + 启动看门狗（保护 perform_real_search 等前置流程）
+                        # 修复: 原 deadline 在 L14210 才计算，导致搜索阶段 Playwright CDP 冻结时无任何保护
+                        if enter_site_time is None:
+                            enter_site_time = time.time()
+                        _sd_cfg_early = config.get("session_duration", {})
+                        _sd_median_e = float(_sd_cfg_early.get("median_sec", 180))
+                        _sd_sigma_e = float(_sd_cfg_early.get("sigma", 0.7))
+                        _sd_cap_e = float(_sd_cfg_early.get("hard_cap_sec", 600))
+                        import math as _math_e
+                        _sd_mu_e = _math_e.log(_sd_median_e)
+                        _cfg_stay_min_e = float(config.get("total_stay", {}).get("min", 80))
+                        _rope_floor_e = max(60, _cfg_stay_min_e)
+                        _session_secs = min(_sd_cap_e, max(_rope_floor_e, _math_e.exp(random.gauss(_sd_mu_e, _sd_sigma_e))))
+                        task_deadline = enter_site_time + _session_secs
+                        log.info(f"⏱️ [停留-00] 提前锚定保险绳: Session={_session_secs:.0f}s, deadline={time.strftime('%H:%M:%S', time.localtime(task_deadline))}")
+                        _start_rope_watchdog(task_deadline, page, label=f"第{_url_idx+1}轮")
+
                         # ★ P0-2: 流量来源多样化（防止100%搜索流量被审计识别）
                         # 真实网站流量分布: ~60%搜索 + ~20%直接 + ~10%社媒 + ~10%外链
                         _traffic_diversity_cfg = config.get("traffic_diversity", {})
@@ -14068,7 +14296,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 搜索引擎模式（默认/回退）
                         if _traffic_source == "search" and search_mode == "real_search":
                             # 执行完整搜索跳转流程（带真人模拟，支持所有搜索引擎）
-                            search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config, user_agent=user_agent)
+                            search_success, current_x, current_y = perform_real_search(page, target_url, selected_engine_id, selected_keyword, page_behavior_stats, current_x, current_y, config, user_agent=user_agent, task_deadline=task_deadline)
                             if search_success:
                                 log.info(f"🔍 [真搜索] 已成功跳转至目标页，跳过直接导航")
                                 already_on_target = True
@@ -14091,6 +14319,24 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             int(loop_cfg.get("max", 1))
                         )
                         chapter_loop_count = max(1, chapter_loop_count)
+
+                        # ★ 轮数自适应：总浏览预算不足时强制单轮
+                        # 原因：预算被多轮切碎后每层停留只剩 10~20s，触发 GA4/Ads 短停留判定（机器人特征）
+                        # 基准：每轮最低 = 各层 min_stay 地板之和 + 页面切换开销约60s
+                        _sess_avail = _session_secs if '_session_secs' in dir() else 0.0
+                        _floor_total_hint = sum(
+                            float(web_config.get(f"layer_{li}", {}).get("min_stay", 10) or 10)
+                            for li in range(1, 6)
+                        )
+                        _floor_total_hint = max(_floor_total_hint, 100.0)
+                        _min_per_loop = _floor_total_hint + 60  # 层地板总和 + 切换开销
+                        if chapter_loop_count > 1 and _sess_avail < _min_per_loop * chapter_loop_count:
+                            log.warning(
+                                f"🔄 轮数自适应: Session预算={_sess_avail:.0f}s < 每轮最低{_min_per_loop:.0f}s×{chapter_loop_count}轮，"
+                                f"强制改为单轮（避免每层停留过短被判定机器人流量）"
+                            )
+                            chapter_loop_count = 1
+                            loop_interval = 0.0
 
                         # 随机：每轮间隔（秒，不计入每轮浏览时长，仅轮与轮之间的停顿）
                         loop_interval = random.uniform(
@@ -14140,23 +14386,15 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             except Exception as _rce_e:
                                 log.debug(f"P2-4 漏斗异常(忽略): {_rce_e}")
 
-                        # ★ 修正逻辑：配置时长优先，保险绳保底
-                        #   每轮独立随机，但总时长不超过对数正态保险绳
-                        if enter_site_time is None:
-                            enter_site_time = time.time()
-                        # ★ 对数正态采样（中位数180s，95%分位≈540s，硬上限600s）
+                        # ★ 保险绳 deadline 已在流量多样化之前提前计算（保护 perform_real_search）
+                        # _session_secs / task_deadline 已在上方设置，此处仅输出详细日志
+                        _cfg_stay_min_for_rope = float(config.get("total_stay", {}).get("min", 80))
+                        _cfg_stay_max_for_rope = float(config.get("total_stay", {}).get("max", 300))
                         _sd_cfg = config.get("session_duration", {})
                         _sd_median = float(_sd_cfg.get("median_sec", 180))
                         _sd_sigma = float(_sd_cfg.get("sigma", 0.7))
                         _sd_cap = float(_sd_cfg.get("hard_cap_sec", 600))
-                        import math as _math
-                        _sd_mu = _math.log(_sd_median)
-                        # ★ 修复：保险绳下限必须≥配置的浏览时长最小值，避免deadline提前截断浏览
-                        _cfg_stay_min_for_rope = float(config.get("total_stay", {}).get("min", 80))
-                        _cfg_stay_max_for_rope = float(config.get("total_stay", {}).get("max", 300))
-                        _rope_floor = max(60, _cfg_stay_min_for_rope)  # 不低于配置min，且绝对不低于60s
-                        _session_secs = min(_sd_cap, max(_rope_floor, _math.exp(random.gauss(_sd_mu, _sd_sigma))))
-                        task_deadline = enter_site_time + _session_secs
+                        _rope_floor = max(60, _cfg_stay_min_for_rope)
                         # ========== ★ 停留日志：进入网站锚点 + Session保险绳参数（用于排查广告收益低） ==========
                         log.info(
                             f"⏱️ [停留-01] enter_site_time锚点: {time.strftime('%H:%M:%S', time.localtime(enter_site_time))}, "
@@ -14177,7 +14415,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 f"⏱️ [停留-02/警告] Session保险绳={_session_secs:.0f}s < 建议值{_BROWSE_DURATION_WARN_S:.0f}s，"
                                 f"广告可能有填充但 ActiveView 计数被折损。建议把 config.total_stay.min 至少调到 {int(_BROWSE_DURATION_WARN_S)+10}s"
                             )
-                        
+
+                        # 看门狗已在上方提前启动，此处不再重复启动
+
                         round_total_stays = []
                         remaining_time = task_deadline - time.time()  # 剩余可运行时间
                         
@@ -14192,20 +14432,55 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         total_task_stay = sum(round_total_stays)
 
                         # 每轮每层停留时长矩阵：round_layer_stays[轮][层] = 该轮时长 × (层比率/总比率)
-                        # ★ 纯比率瓜分：严格保证 Σ(各层) = 该轮时长，不再用 min_stay 抬高（避免总时长超标）
+                        # ★ 每层停留地板：按比率瓜分后，若某层低于其 min_stay，从富余层按富余比例借时补齐。
+                        # 纯比率瓜分会让首页/内容页只有 10~20s，触发 GA4/Ads 短停留判定（诱导跳转/爬虫特征）
+                        # ★ 2026-08-09：每轮随机深度（≥3层，从L1逐级深入），并与该轮停留时长关联：
+                        #   停留越长的轮越可能深入更多层（短停留只走3层，长停留走4~5层）
                         round_layer_stays = []
+                        round_depths = []  # 每轮随机深度（层数）
                         for _ridx, _rt in enumerate(round_total_stays):
-                            _per_layer = [_rt * (_l["ratio"] / total_ratio) for _l in layers]
+                            # —— 随机深度：时长越长越深 ——
+                            if _rt >= 300:
+                                _round_depth = random.randint(4, len(layers))
+                            elif _rt >= 180:
+                                _round_depth = random.randint(3, len(layers))
+                            else:
+                                _round_depth = 3
+                            _round_depth = min(_round_depth, len(layers))
+                            round_depths.append(_round_depth)
+                            _active_layers = layers[:_round_depth]  # 只对本轮实际走的层瓜分停留
+                            _per_layer = [_rt * (_l["ratio"] / total_ratio) for _l in _active_layers]
+                            # 迭代借贷：先满足所有层地板，再从富余层按富余量比例扣除
+                            _layers_n = len(_active_layers)
+                            for _iter in range(_layers_n + 2):
+                                _need_total = 0.0
+                                _surplus_total = 0.0
+                                for i, _l in enumerate(_active_layers):
+                                    if _per_layer[i] < _l["min_stay"]:
+                                        _need_total += _l["min_stay"] - _per_layer[i]
+                                    else:
+                                        _surplus_total += _per_layer[i] - _l["min_stay"]
+                                if _need_total <= 1e-6 or _surplus_total <= 1e-6:
+                                    break
+                                # 从富余层按富余量比例借时
+                                for i, _l in enumerate(_active_layers):
+                                    if _per_layer[i] > _l["min_stay"]:
+                                        _per_layer[i] -= _need_total * ((_per_layer[i] - _l["min_stay"]) / _surplus_total)
+                                # 补齐不足层到地板
+                                for i, _l in enumerate(_active_layers):
+                                    if _per_layer[i] < _l["min_stay"]:
+                                        _per_layer[i] = _l["min_stay"]
                             round_layer_stays.append(_per_layer)
 
                         log.info(
                             f"🎯 浏览循环次数: {chapter_loop_count}次，每轮间隔: {loop_interval:.1f}秒，"
                             f"各轮随机时长: {', '.join(f'{s:.1f}s' for s in round_total_stays)}，"
+                            f"各轮随机深度: {', '.join(f'L{len(round_layer_stays[i])}层' for i in range(len(round_layer_stays)))}，"
                             f"任务总浏览时长≈{total_task_stay:.1f}秒（=各轮之和，不含前置/取IP/间隔）"
                         )
                         for _ridx in range(chapter_loop_count):
                             log.info(
-                                f"📊 第{_ridx+1}轮每层停留(L1-L{len(layers)}): "
+                                f"📊 第{_ridx+1}轮每层停留(L1-L{len(round_layer_stays[_ridx])}): "
                                 + ", ".join(f"L{i+1}≈{round_layer_stays[_ridx][i]:.1f}s" for i in range(len(round_layer_stays[_ridx])))
                             )
     
@@ -14659,7 +14934,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     f"被前置流程消耗），重新锚定到首页加载完成时刻，新预算={_new_budget:.0f}s"
                                 )
                                 task_deadline = time.time() + _new_budget
-                        
+                                # ★ 重锚后重启看门狗（用新 deadline）—— 先取消旧看门狗，避免旧 deadline 提前掐断会话
+                                _cancel_rope_watchdog()
+                                _start_rope_watchdog(task_deadline, page, label=f"重锚-第{_url_idx+1}轮")
+
                         def _check_rope(stage_desc=""):
                             if not task_running:
                                 raise RuntimeError("任务已停止")
@@ -14685,17 +14963,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 )
                                 if _ok:
                                     log.info(
-                                        f"[HilltopAds] Pop-under 弹窗触发成功: "
+                                        f"[HilltopAds] Pop-under 弹窗触发成功"
+                                        f"{'(收养存量自然弹窗)' if _diag.get('adopted_existing') else '(CDP点击触发)'}: "
                                         f"url={_diag.get('url','')[:80]} "
                                         f"stay={_diag.get('stay_actual',0)}s"
                                     )
                                 elif _diag.get("reason") not in ("probability_skip", "cooldown"):
-                                    log.debug(
+                                    # ★ 可观测修复：跳过原因升级为 info，便于区分 CDP 触发 vs 自然弹窗
+                                    log.info(
                                         f"[HilltopAds] Pop-under 跳过: {_diag.get('reason','')}"
                                     )
                                 return _ok, _diag
                             except Exception as _ht_e:
-                                log.debug(f"[HilltopAds] 弹窗触发异常(忽略): {_ht_e}")
+                                # ★ F7 修复: 广告触发关键路径异常不能静默，升级为 warning
+                                log.warning(f"⚠️ [HilltopAds] 弹窗触发异常: {type(_ht_e).__name__}: {str(_ht_e)[:120]}")
                                 return False, None
 
                         current_x, current_y = 100, 100
@@ -14741,7 +15022,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             _try_hilltopads_popunder(page, context, config, resolved_ip_info)
                             log.info(f"🚪 跳出型任务完成：首页停留{_bounce_stay:.0f}s后离开")
                         if not _is_bounce:
-                            log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮走完 L1→L{len(layers)}，任务总时长=各轮之和）")
+                            log.info(f"🔄 网页浏览模式循环次数: {chapter_loop_count}次（每轮从L1逐级深入随机走3~5层，任务总时长=各轮之和）")
                         if not _is_bounce:
                             for loop_idx in range(chapter_loop_count):
                                 try:
@@ -14790,7 +15071,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 layer1_cfg = layers[0]
                                 success_list, current_x, current_y = click_link_with_fallback(
                                     page, layer1_cfg["keywords"], layer1_cfg["fallback_urls"],
-                                    current_x, current_y, config
+                                    current_x, current_y, config, task_deadline=task_deadline
                                 )
                                 if success_list:
                                     page_behavior_stats["clicks"] += 1
@@ -14817,9 +15098,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 else:
                                     log.warning(f"⚠️ 第{loop_idx+1}轮进入列表页失败，本轮跳过深层")
 
-                                # 尝试更深层浏览：layer_3 → layer_4 → layer_5
+                                # 尝试更深层浏览：layer_3 → ... → layer_{随机深度}（2026-08-09：不再固定走满5层，
+                                # 每轮随机深度 round_depths[loop_idx]（≥3层），且必须从 L1 开始逐级深入）
                                 _broken = False
-                                for level_idx in range(2, len(layers)):
+                                _round_depth = round_depths[loop_idx] if loop_idx < len(round_depths) else len(layers)
+                                if _round_depth < len(layers):
+                                    log.info(f"🛤️ 第{loop_idx+1}轮随机深度: 只走到 L{_round_depth}（本层时长{sum(_layer_stays):.0f}s，未深入更深层）")
+                                for level_idx in range(2, _round_depth):
                                     if not success_list:
                                         break
                                     try:
@@ -14837,7 +15122,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     log.info(f"→ 进入 layer_{level_idx+1}")
                                     success_click, current_x, current_y = click_link_with_fallback(
                                         page, target_layer["keywords"], target_layer["fallback_urls"],
-                                        current_x, current_y, config
+                                        current_x, current_y, config, task_deadline=task_deadline
                                     )
                                     if success_click:
                                         page_behavior_stats["clicks"] += 1
@@ -14880,7 +15165,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 back_keywords = list(back_links) + list(back_home_links)
                                 success_back, current_x, current_y = click_link_with_fallback(
                                     page, back_keywords, [], current_x, current_y, config,
-                                    final_fallback_url=target_url,
+                                    final_fallback_url=target_url, task_deadline=task_deadline,
                                 )
                                 if success_back:
                                     page_behavior_stats["clicks"] += 1
@@ -15112,6 +15397,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 层级浏览中已经做了很多行为模拟
                         if load_success:
                             log.info("页面层级浏览已完成真人行为模拟")
+                            # ★ 任务正常完成，取消看门狗
+                            _cancel_rope_watchdog()
                         
                         log.behavior_module(
                             total_behavior_stats["mouse_moves"],
@@ -15347,6 +15634,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             if current_plan and task_idx < len(current_plan.get('tasks', [])):
                                 current_plan['tasks'][task_idx]['status'] = "失败"
                     finally:
+                        # ★ 取消看门狗（无论正常结束还是异常退出都要取消）
+                        _cancel_rope_watchdog()
                         # 按 page → context → browser 顺序关闭，避免 Chrome 进程残留
                         # 所有 close 操作加 timeout 保护，防止任务失败后卡死
                         import threading as _th
@@ -15446,6 +15735,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 pass
                         # ========== ★ P2-5：本任务正常/异常结束后，取消 suicide watchdog ==========
                         _cancel_task_global_watchdog()
+                        # ★ 修复（2026-08-08）：每个任务结束后立即保存进度，防止进程被
+                        # suicide watchdog 强杀（os._exit(24)）或异常重启时断点丢失——
+                        # 原实现只在全部任务遍历完后才保存，进程被强杀则进度从未落盘
+                        try:
+                            if not _single_task_mode and daily_plan is not None:
+                                _save_plan_progress(daily_plan, tasks_list)
+                        except Exception:
+                            pass
             except Exception as outer_e:
                 log.error(f"外层任务异常: {str(outer_e)}")
                 import traceback
@@ -15463,14 +15760,17 @@ def worker_task(single_task=False, adsl_ip_task=False):
     record_kpi_snapshot()
     
     # ★ 断点恢复：判断是全部完成还是中途停止
-    _all_done = all(t.get("status") == "已完成" for t in tasks_list) if tasks_list else True
-    if _all_done:
-        _clear_plan_progress()
-        log.info("📋 计划全部完成，已清除进度文件")
-    else:
-        _save_plan_progress(daily_plan, tasks_list)
-        _done = sum(1 for t in tasks_list if t.get("status") == "已完成")
-        log.info(f"📋 计划未完成({_done}/{len(tasks_list)})，进度已保存，下次执行将从断点恢复")
+    # 修复：单独任务模式不读写计划进度文件——单任务与计划共用 tasks_list，
+    # 若在此处按 tasks_list 判断会误清/误写 plan_progress.json（曾导致 649 计划断点被删）
+    if not _single_task_mode:
+        _all_done = all(t.get("status") == "已完成" for t in tasks_list) if tasks_list else True
+        if _all_done:
+            _clear_plan_progress()
+            log.info("📋 计划全部完成，已清除进度文件")
+        else:
+            _save_plan_progress(daily_plan, tasks_list)
+            _done = sum(1 for t in tasks_list if t.get("status") == "已完成")
+            log.info(f"📋 计划未完成({_done}/{len(tasks_list)})，进度已保存，下次执行将从断点恢复")
     
     task_running = False
     _single_task_mode = False
@@ -15954,8 +16254,10 @@ def _run_drill_thread(target_url, headless):
                 target_url, headless=headless, log_fn=_log_fn, progress_fn=_progress_fn, with_stealth=True
             )
         # 整体超时保护：120秒
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_drill)
+        # ★ F10 修复: 不使用 with(其__exit__会shutdown(wait=True)无限等待)，超时即放弃
+        _drill_executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = _drill_executor.submit(_do_drill)
             try:
                 report, json_path, html_path = future.result(timeout=120)
             except FuturesTimeout:
@@ -15963,6 +16265,8 @@ def _run_drill_thread(target_url, headless):
                 _drill_state["stage"] = "超时结束"
                 _drill_state["progress"] = 100
                 return
+        finally:
+            _drill_executor.shutdown(wait=False, cancel_futures=True)
         # 保存完整报告用于前端展示
         _drill_state["report"] = (report or {}).get("risk_calc", {})
         _drill_state["full_report"] = report or {}
@@ -16257,7 +16561,11 @@ def _extract_page_links(html, base_url, target_domain):
             continue
         clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         # 同域检查（允许子域名）
-        if parsed.netloc and (target_domain in parsed.netloc or parsed.netloc.endswith('.' + target_domain)):
+        # ★ 2026-08-09：域名比较必须大小写不敏感（DNS 域名本身不区分大小写），
+        #   否则 target_domain='Freestoryweb.com' 会误判真实链接 'freestoryweb.com' 为跨域，
+        #   导致所有出站链接被丢弃 → 兜底链接=0（实测大写输入时探索结果全空）
+        _nl = parsed.netloc.lower()
+        if _nl and (target_domain in _nl or _nl.endswith('.' + target_domain)):
             if not _is_forbidden_url(parsed.path):
                 links.add(clean_url)
     return links
@@ -16279,10 +16587,10 @@ def _is_forbidden_url(url_path):
 
 
 def _is_same_origin(url, target_domain):
-    """检查 URL 是否同域"""
+    """检查 URL 是否同域（大小写不敏感）"""
     try:
         parsed = urlparse(url)
-        return parsed.netloc.split(':')[0] == target_domain
+        return parsed.netloc.split(':')[0].lower() == target_domain
     except Exception:
         return False
 
@@ -16340,7 +16648,10 @@ def _html_has_ad_code(html):
         ('Monumetric', ['monumetric.com', 'broadstreetads.com']),
         ('Infolinks/Adsterra', ['infolinks.com', 'adsterra.com']),
         ('BuySellAds', ['buysellads.com', 'carbonads']),
-        ('Generic', ['/adserve/', '/adserver/', 'data-zone', 'data-adzone', 'data-ad-id', 'data-adunit']),
+        # ★ 2026-08-09：补充常见广告特征，提高广告页识别率（严格兜底含广告页面）
+        ('Generic', ['/adserve/', '/adserver/', 'data-zone', 'data-adzone', 'data-ad-id', 'data-adunit',
+                     '/ads/', 'doubleclick', 'googleadservices', 'adservice.google', 'adnxs.com', 'pubmatic',
+                     'criteo', 'amazon-adsystem', 'advertising.com', 'adroll.com']),
     ]
     for network, sigs in checks:
         for sig in sigs:
@@ -16376,7 +16687,8 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
     - 兜底链接 = 该层页面中，没有匹配到关键词池的页面的 outgoing 链接
     """
     parsed = urlparse(target_url)
-    target_domain = parsed.netloc.split(':')[0]
+    # ★ 2026-08-09：target_domain 统一转小写，保证后续同域判断大小写不敏感
+    target_domain = parsed.netloc.split(':')[0].lower()
 
     mgr = keyword_explore_manager
     mgr['is_running'] = True
@@ -16501,13 +16813,14 @@ def _crawl_keyword_explore(target_url, max_layer=5, concurrency=4):
                         all_urls.add(link)
             current_urls = next_layer_urls
 
-        # ★ 回退逻辑：如果所有页面都检测不到广告代码（说明该站广告是JS动态注入），
-        # 则使用全量出站链接作为兜底链接，否则兜底链接为0毫无意义
+        # ★ 2026-08-09 严格化：不再回退全量出站链接。
+        # 原逻辑在 total_ad_pages == 0 时用全量出站链接当兜底（认为广告是JS动态注入），
+        # 但这样会把大量无广告页面（章节列表/分类/首页）塞进兜底池 → 任务访问的页面没有广告。
+        # 现在严格坚持“兜底链接必须来自确认含广告代码的页面”，宁缺毋滥；
+        # 若所有页面都检测不到广告，仅警告提示，兜底链接保持为空。
         if total_ad_pages == 0 and total_no_ad_pages > 0:
             log.warning(f'[关键词探索] ⚠️ 所有 {total_no_ad_pages} 个页面均未在HTML中检测到广告代码')
-            log.warning(f'[关键词探索] ⚠️ 该站可能使用JS动态加载广告，回退为使用全量出站链接作为兜底链接')
-            for layer_num in layer_all_outgoing:
-                layer_fallback_links[layer_num] = layer_all_outgoing[layer_num]
+            log.warning(f'[关键词探索] ⚠️ 该站可能使用JS动态加载广告；为严格保证兜底链接含广告，本层兜底链接保持为空，请更换目标站或手动补充广告页URL')
 
         # 构建报告数据
         total_keywords = sum(len(v) for v in layer_anchor_texts.values())
