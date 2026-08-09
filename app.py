@@ -20,7 +20,7 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "26.8.9.6"
+APP_VERSION = "26.8.9.7"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -7826,6 +7826,15 @@ class StructuredLogger:
             self.messages.pop(0)
         logging.info(f"[worker] {text}")
 
+    def task_marker(self, round_num, total, kind="开始"):
+        """★ 26.8.9.7：任务开始/结束红色标记（与任务分隔线同款样式）"""
+        timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
+        text = f"======={round_num}/{total}任务{kind}======="
+        self.messages.append(f"{timestamp} <span class='log-task-separator'>{text}</span>")
+        while len(self.messages) > self.max_lines:
+            self.messages.pop(0)
+        logging.info(f"[worker] {text}")
+
     def web_round_separator(self, round_num, total):
         timestamp = time.strftime('[%Y-%m-%d %H:%M:%S]')
         text = f"-----{round_num}/{total}轮网页-----"
@@ -12210,6 +12219,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.warning("⛔ 任务已停止（等待中）")
                     _cancel_task_global_watchdog()  # ★ P2-5: break 前取消 suicide watchdog
                     break
+
+            # ★ 26.8.9.7：记录计划等待实际耗时，任务结束汇总时拆分展示
+            _sched_wait_dur = max(0.0, time.time() - task_start_time)
+            # ★ 26.8.9.7：任务开始红色标记
+            log.task_marker(task_idx + 1, total_tasks, "开始")
             
             # ★ 修复：suicide watchdog 在等待结束后、任务真正开始执行前启动，
             # 等待期（可能数小时）不计入 30 分钟硬上限
@@ -15462,6 +15476,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         log.info(
                             f"<span style='color:#ff3333;font-weight:bold'>浏览网站时长（进入网站→任务结束）: {_browse_dur:.1f}秒</span>"
                         )
+                        # ★ 26.8.9.7：三段拆分红字汇总，一眼分辨“慢在哪”（等待/前置/浏览）
+                        log.info(
+                            f"<span style='color:#ff0000;font-weight:bold'>⏱️ 任务耗时三段拆分：等待 {_sched_wait_dur:.1f}s + 前置 {_pre_dur:.1f}s + 浏览 {_browse_dur:.1f}s = 总耗时 {_task_end_time - task_start_time:.1f}s</span>"
+                        )
                         # P1-2 Profile持久化+回访入队
                         if _HAS_RCE:
                             try:
@@ -15577,6 +15595,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             log.info(
                                 f"<span style='color:#ff3333;font-weight:bold'>浏览网站时长（进入网站→任务结束）: {_browse_dur:.1f}秒</span>"
                             )
+                            # ★ 26.8.9.7：异常路径同样输出三段拆分红字汇总
+                            try:
+                                log.info(
+                                    f"<span style='color:#ff0000;font-weight:bold'>⏱️ 任务耗时三段拆分：等待 {_sched_wait_dur:.1f}s + 前置 {_pre_dur:.1f}s + 浏览 {_browse_dur:.1f}s = 总耗时 {_task_end_time - task_start_time:.1f}s</span>"
+                                )
+                            except Exception:
+                                pass
                             # ========== ★ P2-5(2)：异常路径也要审计停留时长 ==========
                             try:
                                 if _est is None:
@@ -15741,6 +15766,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         try:
                             if not _single_task_mode and daily_plan is not None:
                                 _save_plan_progress(daily_plan, tasks_list)
+                        except Exception:
+                            pass
+                        # ★ 26.8.9.7：任务结束红色标记（正常/异常路径都覆盖）
+                        try:
+                            log.task_marker(task_idx + 1, total_tasks, "结束")
                         except Exception:
                             pass
             except Exception as outer_e:
