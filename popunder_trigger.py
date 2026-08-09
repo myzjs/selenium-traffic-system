@@ -285,23 +285,64 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
 
 
 # ============================================================================
-# 安全区计算
+# 点击坐标选择（★ 26.8.9.4 方向反转：优先点击广告元素）
 # ============================================================================
+
+# 广告元素选择器：覆盖 HilltopAds/EvaDav 随机投放域名 + 通用联盟 + 尺寸特征
+_AD_SELECTOR_JS = """
+    'ins.adsbygoogle, .adsbygoogle, [data-ad-client], [data-ad-slot], [data-zone], [data-adzone], '
+    + 'iframe[src*="hilltopads"], iframe[src*="evadav"], iframe[src*="propellerads"], '
+    + 'iframe[src*="curoax"], iframe[src*="pufted"], iframe[src*="bony-teaching"], '
+    + 'iframe[src*="untimely-hello"], iframe[src*="googlesyndication"], iframe[src*="doubleclick"], '
+    + 'iframe[src*="mgid"], iframe[src*="taboola"], iframe[src*="outbrain"], '
+    + 'iframe[src*="ad-maven"], iframe[src*="/ads/"], iframe[src*="/adserve/"], iframe[src*="/adserver/"], '
+    + '[class*="ad-container"], [class*="ad-wrapper"], [class*="ad-unit"], '
+    + '[id*="ad-container"], [id*="ad-wrapper"], '
+    + 'iframe[width="728"][height="90"], iframe[width="300"][height="250"], iframe[width="160"][height="600"]'
+"""
+
+
+def _get_visible_ad_rects(page: Any) -> List[Tuple[int, int, int, int]]:
+    """获取当前视口内可见的广告元素矩形（用于 CDP 点击命中广告触发 popunder）"""
+    rects: List[Tuple[int, int, int, int]] = []
+    try:
+        rs = page.evaluate("""() => {
+            const vw = window.innerWidth || 1280;
+            const vh = window.innerHeight || 720;
+            const seen = new Set();
+            const out = [];
+            document.querySelectorAll(%s).forEach(el => {
+                if (seen.has(el)) return;
+                seen.add(el);
+                const r = el.getBoundingClientRect();
+                const w = Math.round(r.width || 0);
+                const h = Math.round(r.height || 0);
+                if (w < 50 || h < 50) return;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return;
+                if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return;
+                out.push({x: Math.round(r.x), y: Math.round(r.y), w: w, h: h});
+            });
+            return out;
+        }""" % _AD_SELECTOR_JS)
+        if rs:
+            for r in rs:
+                rects.append((int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])))
+    except Exception:
+        pass
+    return rects
+
 
 def _get_ad_bounding_boxes(page: Any) -> List[Tuple[int, int, int, int]]:
     boxes = []
     try:
         rects = page.evaluate("""() => {
-            const ads = document.querySelectorAll(
-                'ins.adsbygoogle, iframe[src*="googleads"], iframe[src*="doubleclick"], '
-                + '[id*="google_ads"], [class*="adsbygoogle"], '
-                + 'div[data-ad], div[id*="adngin"], iframe[src*="adnxs"]'
-            );
+            const ads = document.querySelectorAll(%s);
             return Array.from(ads).map(el => {
                 const r = el.getBoundingClientRect();
                 return {x: r.x, y: r.y, w: r.width, h: r.height};
             }).filter(r => r.w > 10 && r.h > 10);
-        }""")
+        }""" % _AD_SELECTOR_JS)
         if rects:
             for r in rects:
                 boxes.append((int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])))
@@ -315,18 +356,34 @@ def _pick_safe_coordinates(
     viewport: Dict[str, int],
     margin: int = 60,
 ) -> Tuple[int, int]:
+    """★ 26.8.9.4 方向反转：popunder 脚本的点击监听挂在广告链路上，
+    必须点中广告元素才会弹窗——旧实现故意避开广告区导致 no_new_tab。
+    现策略：优先随机命中视口内可见广告（带抖动），无广告时才退回安全区随机。
+    """
     vw, vh = viewport.get("width", 1280), viewport.get("height", 720)
     # ★ 二次审计修复：page 为 None 时直接返回随机坐标（self_test 场景）
     if page is None:
         return random.randint(80, vw - 80), random.randint(100, vh - 100)
+
+    # 首选：命中可见广告元素（中心区域 + 抖动，避开边缘 10%）
+    ad_rects = _get_visible_ad_rects(page)
+    if ad_rects:
+        ax, ay, aw, ah = random.choice(ad_rects)
+        x = ax + int(aw * random.uniform(0.15, 0.85))
+        y = ay + int(ah * random.uniform(0.15, 0.85))
+        _log.info("[Pop-under] 坐标选中广告元素 (ad=%d,%d,%d,%d -> click=%d,%d)",
+                  ax, ay, aw, ah, x, y)
+        return max(1, min(x, vw - 2)), max(1, min(y, vh - 2))
+
+    # 兑底：无可见广告 → 安全区随机（避开可能的不可见广告监听区）
     ad_boxes = _get_ad_bounding_boxes(page)
     for _attempt in range(30):
         x = random.randint(80, vw - 80)
         y = random.randint(100, vh - 100)
         safe = True
-        for ax, ay, aw, ah in ad_boxes:
-            if (ax - margin <= x <= ax + aw + margin and
-                    ay - margin <= y <= ay + ah + margin):
+        for bx, by, bw, bh in ad_boxes:
+            if (bx - margin <= x <= bx + bw + margin and
+                    by - margin <= y <= by + bh + margin):
                 safe = False
                 break
         if safe:
