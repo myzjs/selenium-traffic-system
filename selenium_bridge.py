@@ -84,9 +84,62 @@ def _unregister_driver(driver):
             pass
 
 
+# ★ 26.8.9.6：chromedriver HTTP 通道单条命令读超时（秒）。
+# 超时后抛异常由上层 try/except 捕获，保险绳检查点得以恢复控制。
+_CHROMEDRIVER_HTTP_TIMEOUT_S = 60.0
+
+
+def _launch_chrome_with_timeout(chrome_options):
+    """★ 26.8.9.6 卡死根治：启动 Chrome 并给 chromedriver HTTP 通道注入读超时。
+
+    Selenium 4.46 的 webdriver.Chrome() 默认构造的 RemoteConnection
+    timeout=None，当 chrome/chromedriver 在某条命令上挂死（窗口切换、
+    current_url 读取、CDP 调用等）时，urllib3 会无限阻塞在 socket 读上
+    → 主线程冻结（实测冻结 14 分钟+，单任务跑 1085s），看门狗即使强杀
+    进程也救不了已卡在系统调用里的主线程。
+    此处手动构造 Service + ChromiumRemoteConnection（带 ClientConfig.timeout），
+    把单条命令限制在 _CHROMEDRIVER_HTTP_TIMEOUT_S 内，超时抛异常后
+    上层检查点/_check_rope 即可正常截断任务。
+    """
+    from selenium.webdriver.chromium.remote_connection import ChromiumRemoteConnection
+    from selenium.webdriver.remote.client_config import ClientConfig
+    from selenium.webdriver.remote.webdriver import WebDriver as _RemoteWebDriver
+    from selenium.webdriver.common.driver_finder import DriverFinder
+
+    service = Service()
+    finder = DriverFinder(service, chrome_options)
+    if finder.get_browser_path():
+        chrome_options.binary_location = finder.get_browser_path()
+        chrome_options.browser_version = None
+    service.path = service.env_path() or finder.get_driver_path()
+    service.start()
+
+    client_config = ClientConfig(
+        remote_server_addr=service.service_url,
+        keep_alive=True,
+        timeout=_CHROMEDRIVER_HTTP_TIMEOUT_S,
+    )
+    executor = ChromiumRemoteConnection(
+        remote_server_addr=service.service_url,
+        browser_name="chrome",
+        vendor_prefix="goog",
+        keep_alive=True,
+        ignore_proxy=chrome_options._ignore_local_proxy,
+        client_config=client_config,
+    )
+    driver = _RemoteWebDriver(command_executor=executor, options=chrome_options)
+    driver.service = service  # _kill_driver_processes / force_quit_all 依赖此属性
+    return driver
+
+
 def _kill_driver_processes(driver):
-    """强杀某个 driver 关联的 chrome 与 chromedriver 进程（兜底）。"""
+    """强杀某个 driver 关联的 chrome 与 chromedriver 进程（兜底）。
+
+    ★ 26.8.9.6 增强：service.process 引用失效时，按 --port 扫描 /proc
+    命令行兜底找出 chromedriver，确保看门狗强杀真实生效。
+    """
     pids = []
+    port = None
     try:
         # chromedriver 进程pid
         svc = getattr(driver, "service", None)
@@ -94,6 +147,10 @@ def _kill_driver_processes(driver):
             proc = getattr(svc, "process", None)
             if proc is not None and proc.pid:
                 pids.append(proc.pid)
+            try:
+                port = urllib.parse.urlparse(getattr(svc, "service_url", "") or "").port
+            except Exception:
+                port = None
     except Exception:
         pass
     try:
@@ -105,11 +162,30 @@ def _kill_driver_processes(driver):
             pids.append(int(browser_pid))
     except Exception:
         pass
+    # ★ 兜底：按端口扫 /proc 命令行，找出引用丢失的 chromedriver
+    if port:
+        try:
+            needle = f"--port={port}".encode()
+            for pid_dir in os.listdir("/proc"):
+                if not pid_dir.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid_dir}/cmdline", "rb") as f:
+                        cmd = f.read()
+                    if b"chromedriver" in cmd and needle in cmd:
+                        pids.append(int(pid_dir))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    killed = set()
     for pid in pids:
         try:
             os.kill(pid, _signal.SIGKILL)
+            killed.add(pid)
         except Exception:
             pass
+    return killed
 
 
 def force_quit_all():
@@ -1934,8 +2010,9 @@ class Chromium:
 
         # 终极修复：Selenium 4.45+ 会自动调用 Selenium Manager
         # 已移除系统中的旧版 chromedriver v108，Selenium Manager 将自动下载 v149
+        # ★ 26.8.9.6：改用带 HTTP 读超时的启动器，杜绝 chromedriver 通道无限阻塞
         try:
-            driver = webdriver.Chrome(options=chrome_options)
+            driver = _launch_chrome_with_timeout(chrome_options)
         except Exception as e:
             error_msg = str(e)
             # 如果是因为找不到驱动，尝试手动指定 Chrome 二进制路径后重试
@@ -1943,7 +2020,7 @@ class Chromium:
                 if chrome_binary:
                     chrome_options.binary_location = chrome_binary
                     try:
-                        driver = webdriver.Chrome(options=chrome_options)
+                        driver = _launch_chrome_with_timeout(chrome_options)
                     except Exception as e2:
                         raise RuntimeError(f"Chrome启动失败: {e}; 指定binary后仍失败: {e2}")
                 else:
