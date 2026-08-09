@@ -705,11 +705,10 @@ def trigger_popunder(
             _cleanup_page_triggers(page_id)  # ★ H2/M3: 失败路径清理页面守卫，允许后续重试
             return False, None, {"triggered": False, "reason": "no_new_tab"}
 
-        # 8. URL — ★ 挂死修复：守护线程+超时兑底读取（见 _safe_page_url）
-        pop_url = _safe_page_url(popunder_page)
-
-        # 9. 等待加载（P0-2）—— stealth 注入统一由 guardian 阶段 2b 执行，
-        # 避免跨线程重复 evaluate
+        # 8/9. 加载与 URL 确认 — ★ 26.8.9.5：弹窗经广告网络多级重定向，
+        #    刚打开瞬间多为 about:blank，旧实现立即判 unconfirmed 会误杀已成功的触发。
+        #    现策略：先等 domcontentloaded，再轮询 URL 直至离开 about:（重定向预算内），
+        #    仍不离开才计 unconfirmed（HilltopAds 按弹窗存活结算，守护线程不受影响）。
         load_state = "unknown"
         try:
             popunder_page.wait_for_load_state(
@@ -717,9 +716,15 @@ def trigger_popunder(
                 timeout=cfg.get("popunder_load_timeout_ms", 10000),
             )
             load_state = "domcontentloaded"
-            time.sleep(1.5)
         except Exception:
             load_state = "timeout_or_error"
+
+        pop_url = _safe_page_url(popunder_page)
+        _url_deadline = time.time() + float(cfg.get("popunder_url_redirect_wait_s", 6.0))
+        while ((not pop_url) or pop_url.startswith("about:")) and time.time() < _url_deadline:
+            time.sleep(0.5)
+            pop_url = _safe_page_url(popunder_page)
+        time.sleep(1.5)
 
         # ★ H2 修复: 渲染确认——URL 为空/about: 或加载超时都视为"未确认"，
         #   避免"打开但没加载出来"虚记为成功（联盟侧 0 展示但系统计已触发）
