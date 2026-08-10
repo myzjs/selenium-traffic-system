@@ -79,11 +79,9 @@ def _get_referral_pool(lang: str) -> list:
 # ---- 测试用例 ----
 
 def test_pools_exist():
-    """至少有英文、中文、日文、德文四个池子"""
+    """至少有英文、中文两个池子"""
     assert "en" in REFERRAL_POOLS, "缺少英文外链池"
     assert "zh" in REFERRAL_POOLS, "缺少中文外链池"
-    assert "ja" in REFERRAL_POOLS, "缺少日文外链池"
-    assert "de" in REFERRAL_POOLS, "缺少德文外链池"
 
 
 def test_english_pool_size():
@@ -94,16 +92,6 @@ def test_english_pool_size():
 def test_chinese_pool_size():
     """中文外链池至少 10 个"""
     assert len(REFERRAL_POOLS.get("zh", [])) >= 10, f"中文外链池数量不足: {len(REFERRAL_POOLS.get('zh', []))}"
-
-
-def test_japanese_pool_size():
-    """日文外链池至少 8 个"""
-    assert len(REFERRAL_POOLS.get("ja", [])) >= 8, f"日文外链池数量不足: {len(REFERRAL_POOLS.get('ja', []))}"
-
-
-def test_german_pool_size():
-    """德文外链池至少 8 个"""
-    assert len(REFERRAL_POOLS.get("de", [])) >= 8, f"德文外链池数量不足: {len(REFERRAL_POOLS.get('de', []))}"
 
 
 def test_all_urls_are_https():
@@ -136,8 +124,6 @@ def test_language_matching_exact():
     """精确语言匹配"""
     assert _get_referral_pool("en") == REFERRAL_POOLS["en"]
     assert _get_referral_pool("zh") == REFERRAL_POOLS["zh"]
-    assert _get_referral_pool("ja") == REFERRAL_POOLS["ja"]
-    assert _get_referral_pool("de") == REFERRAL_POOLS["de"]
 
 
 def test_language_matching_prefix():
@@ -146,8 +132,6 @@ def test_language_matching_prefix():
     assert _get_referral_pool("en-GB") == REFERRAL_POOLS["en"]
     assert _get_referral_pool("zh-CN") == REFERRAL_POOLS["zh"]
     assert _get_referral_pool("zh-TW") == REFERRAL_POOLS["zh"]
-    assert _get_referral_pool("ja-JP") == REFERRAL_POOLS["ja"]
-    assert _get_referral_pool("de-DE") == REFERRAL_POOLS["de"]
 
 
 def test_unknown_language_fallback():

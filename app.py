@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.5 = 2026-08-10 第五次改动
-APP_VERSION = "26.8.10.5"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.6 = 2026-08-10 第六次改动
+APP_VERSION = "26.8.10.6"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2363,32 +2363,6 @@ _REFERRAL_POOLS = {
         "https://www.douban.com/note/123456789/",
         "https://www.xiaohongshu.com/discovery/item/123456789abcdef",
         "https://www.guokr.com/article/123456/",
-    ],
-    # 日文外链池（10+）
-    "ja": [
-        "https://www.itmedia.co.jp/news/articles/2401/15/news012.html",
-        "https://www.gizmodo.jp/2024/02/ai-tools-review.html",
-        "https://japan.zdnet.com/article/35234567/",
-        "https://www.asahi.com/articles/ASDF12345.html",
-        "https://www.yomiuri.co.jp/tech/20240120-OYT1T50000/",
-        "https://qiita.com/example/items/abc123def456",
-        "https://teratail.com/questions/1234567",
-        "https://note.com/example/n/n12345abcde",
-        "https://www.lifehacker.jp/2024/02/productivity-tips.html",
-        "https://www.huffingtonpost.jp/2024/01/10/digital-marketing_a_23456789/",
-    ],
-    # 德文外链池（10+）
-    "de": [
-        "https://www.heise.de/news/KI-Tools-im-Test-1234567.html",
-        "https://www.spiegel.de/netzwelt/web/tipps-fuer-mehr-website-besucher-a-1234567.html",
-        "https://www.zeit.de/digital/internet/2024-01/seo-tipps-website",
-        "https://www.golem.de/news/kuenstliche-intelligenz-2402-123456.html",
-        "https://www.computerbase.de/2024-01/best-laptops-test/",
-        "https://www.handelsblatt.com/technik/it/24/12345678.html",
-        "https://www.wiwo.de/technologie/digitale-welt/12345678-all.html",
-        "https://www.stern.de/gesundheit/gesunder-lebensstil-12345678.html",
-        "https://www.focus.de/gesundheit/tipps/12345678.html",
-        "https://www.t-online.de/digital/ratgeber/id_12345678/seo-tipps.html",
     ],
 }
 
