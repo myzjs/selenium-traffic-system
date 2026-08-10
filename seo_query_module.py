@@ -52,6 +52,252 @@ DEFAULT_SEO_CONFIG = {
     "referer_mode": "dynamic"
 }
 
+# ==================== 地域化 Referer 扩展配置 ====================
+# 国家/地区 → 本地搜索引擎 URL 模板（地域一致 Referer 用）
+# 值格式为完整搜索 URL 模板，末尾以 "=" 结尾以便拼接 URL 编码关键词。
+# 覆盖 Google 本地域名 + 非 Google 国家（RU→Yandex, CN→Baidu, KR→Naver 等）。
+REGION_SEARCH_ENGINE_MAP: Dict[str, str] = {
+    "US": "https://www.google.com/search?q=",
+    "GB": "https://www.google.co.uk/search?q=",
+    "CA": "https://www.google.ca/search?q=",
+    "AU": "https://www.google.com.au/search?q=",
+    "NZ": "https://www.google.co.nz/search?q=",
+    "DE": "https://www.google.de/search?q=",
+    "FR": "https://www.google.fr/search?q=",
+    "JP": "https://www.google.co.jp/search?q=",
+    "IT": "https://www.google.it/search?q=",
+    "ES": "https://www.google.es/search?q=",
+    "NL": "https://www.google.nl/search?q=",
+    "PL": "https://www.google.pl/search?q=",
+    "PT": "https://www.google.pt/search?q=",
+    "SE": "https://www.google.se/search?q=",
+    "NO": "https://www.google.no/search?q=",
+    "DK": "https://www.google.dk/search?q=",
+    "FI": "https://www.google.fi/search?q=",
+    "BR": "https://www.google.com.br/search?q=",
+    "MX": "https://www.google.com.mx/search?q=",
+    "IN": "https://www.google.co.in/search?q=",
+    "ID": "https://www.google.co.id/search?q=",
+    "SG": "https://www.google.com.sg/search?q=",
+    "HK": "https://www.google.com.hk/search?q=",
+    "TW": "https://www.google.com.tw/search?q=",
+    "KR": "https://search.naver.com/search.naver?query=",
+    "RU": "https://yandex.ru/search/?text=",
+    "CN": "https://www.baidu.com/s?wd=",
+}
+
+# 默认兜底国家（未映射到本地域名时使用美国 Google）
+DEFAULT_SEARCH_REGION = "US"
+
+# 多语言关键词池（中性、真实、长尾，每语言 >= 30 条）
+# 用于地域化 Referer，保证关键词与目标语言/地域一致，避免英文词塞进日文/德文 referer。
+EXTENDED_KEYWORD_POOLS: Dict[str, List[str]] = {
+    "de": [
+        "romane online lesen kostenlos",
+        "kostenlose bücher online lesen",
+        "fantasy romane deutsch lesen",
+        "romane für anfänger empfehlung",
+        "spannende krimis online lesen",
+        "beste romane aller zeiten",
+        "kostenlos ebooks herunterladen",
+        "liebesromane online lesen",
+        "bücher lesen ohne anmeldung",
+        "thriller bücher empfehlung",
+        "klassiker der weltliteratur lesen",
+        "online bücherei kostenlos",
+        "roman reihen lesen kostenlos",
+        "fantasy buch empfehlung deutsch",
+        "krimi reihe lesen online",
+        "neue bücher erscheinungen",
+        "bücher für regentage",
+        "abenteuer romane lesen",
+        "sci fi romane deutsch",
+        "jugendbücher online lesen",
+        "historische romane empfehlung",
+        "bücher lesen zuhause",
+        "roman schreiben anleitung",
+        "besten bücher des jahres",
+        "kostenlose leseprobe bücher",
+        "romane für den urlaub",
+        "mystery bücher online lesen",
+        "wortschatz verbessern bücher",
+        "buchclub empfehlungen",
+        "lesen entspannung tipps",
+        "webromane deutsch lesen",
+        "bestseller romane 2026",
+    ],
+    "fr": [
+        "lire des romans en ligne gratuit",
+        "livres gratuits en ligne",
+        "meilleur roman à lire",
+        "lire gratuitement sans inscription",
+        "romans fantastiques à lire",
+        "livres de poche recommandés",
+        "lire des livres numériques",
+        "romans policiers en ligne",
+        "livres à lire cet été",
+        "bibliothèque en ligne gratuite",
+        "lire des ebooks gratuitement",
+        "romans d'aventure en ligne",
+        "livres pour se détendre",
+        "série de romans à lire",
+        "livres contemporains recommandés",
+        "lecture en ligne gratuite",
+        "romans historiques à lire",
+        "top livres de l'année",
+        "lire des nouvelles gratuites",
+        "livres young adult à lire",
+        "romans d'amour en ligne",
+        "lecture numérique gratuite",
+        "livres à lire pendant les vacances",
+        "meilleures lectures françaises",
+        "romans de science fiction en ligne",
+        "livres de développement personnel",
+        "lire des chapitres gratuits",
+        "plateforme de lecture en ligne",
+        "livres à découvrir",
+        "romans de fantasy français",
+        "lecture loisir recommandation",
+        "romans et livres audio gratuits",
+    ],
+    "ja": [
+        "小説 無料 オンライン 読む",
+        "ネット小説 無料 読み放題",
+        "おすすめ 小説 ランキング",
+        "小説 読み方 初心者",
+        "ファンタジー小説 無料",
+        "恋愛小説 無料 読む",
+        "ライトノベル 無料 サイト",
+        "web小説 おすすめ",
+        "小説 を読む 方法",
+        "ミステリー小説 おすすめ",
+        "長編小説 無料 読む",
+        "小説家 になる方法",
+        "名作小説 無料 読む",
+        "新刊 小説 おすすめ",
+        "小説 ダウンロード 無料",
+        "冒険小説 無料 読む",
+        "歴史小説 おすすめ",
+        "小説 をたくさん読む コツ",
+        "ホラー小説 無料",
+        "青春小説 おすすめ",
+        "小説 一覧 無料",
+        "読書 の やり方 初心者",
+        "小説 あらすじ 検索",
+        "連載小説 無料 読む",
+        "短編小説 無料 読む",
+        "電子書籍 無料 小説",
+        "小説 まとめ ランキング",
+        "おすすめ 本 2026",
+        "小説 を読む 時間",
+        "小説 完結 おすすめ",
+        "異世界小説 無料",
+        "小説 感想 まとめ",
+    ],
+    "ko": [
+        "소설 무료로 읽기",
+        "웹소설 무료 읽기",
+        "추천 소설 순위",
+        "로맨스 소설 무료",
+        "판타지 소설 무료 읽기",
+        "소설 읽는 방법",
+        "무료 책 읽기 사이트",
+        "베스트셀러 소설 추천",
+        "장편 소설 무료",
+        "소설가 되는 방법",
+        "미스터리 소설 추천",
+        "무협 소설 무료",
+        "역사 소설 추천",
+        "새 책 출간 소식",
+        "전자책 무료 소설",
+        "소설 다운로드 무료",
+        "모험 소설 추천",
+        "공포 소설 무료 읽기",
+        "청소년 소설 추천",
+        "짧은 소설 무료",
+        "소설 감상평 모음",
+        "독서 초보 추천 책",
+        "연재 소설 무료 읽기",
+        "소설 원고 쓰는 법",
+        "명작 소설 무료 읽기",
+        "이세계 소설 무료",
+        "책 추천 2026",
+        "소설 줄거리 검색",
+        "감성 소설 추천",
+        "소설 읽는 시간 줄이기",
+        "웹툰 소설 원작",
+        "소설 클럽 추천",
+    ],
+    "es": [
+        "leer novelas gratis en línea",
+        "libros gratis para leer",
+        "mejores novelas para leer",
+        "leer sin registrarse gratis",
+        "novelas de fantasía en línea",
+        "libros recomendados 2026",
+        "leer libros digitales gratis",
+        "novelas románticas en línea",
+        "leer gratis por internet",
+        "biblioteca en línea gratis",
+        "descargar libros gratis",
+        "novelas de misterio en línea",
+        "libros para relajarse",
+        "serie de novelas para leer",
+        "novelas contemporáneas",
+        "leer cuentos gratis",
+        "novelas históricas en línea",
+        "mejores lecturas del año",
+        "libros para jóvenes",
+        "novelas de aventura en línea",
+        "lectura en línea sin costo",
+        "libros para vacaciones",
+        "novelas de ciencia ficción",
+        "libros de desarrollo personal",
+        "leer capítulos gratis",
+        "plataforma de lectura en línea",
+        "libros por descubrir",
+        "novelas de fantasía en español",
+        "lectura de ocio recomendación",
+        "libros y audiolibros gratis",
+        "novelas de terror en línea",
+        "leer todos los días",
+    ],
+    "it": [
+        "leggere romanzi gratis online",
+        "libri gratis da leggere",
+        "migliori romanzi da leggere",
+        "leggere senza registrazione",
+        "romanzi fantasy online",
+        "libri consigliati 2026",
+        "leggere libri digitali gratis",
+        "romanzi rosa online",
+        "leggere gratis su internet",
+        "biblioteca online gratis",
+        "scaricare libri gratis",
+        "romanzi gialli online",
+        "libri per rilassarsi",
+        "serie di romanzi da leggere",
+        "romanzi contemporanei",
+        "leggere racconti gratis",
+        "romanzi storici online",
+        "migliori letture dell'anno",
+        "libri per ragazzi",
+        "romanzi d'avventura online",
+        "lettura online gratuita",
+        "libri per le vacanze",
+        "romanzi di fantascienza",
+        "libri di crescita personale",
+        "leggere capitoli gratis",
+        "piattaforma di lettura online",
+        "libri da scoprire",
+        "romanzi fantasy in italiano",
+        "lettura per passione",
+        "libri e audiolibri gratis",
+        "romanzi horror online",
+        "leggere ogni giorno",
+    ],
+}
+
 
 class SEOConfigValidator:
     """SEO配置校验器"""
@@ -468,6 +714,66 @@ class SEOConfigQuery:
             homepage = self.get_engine_homepage(engine_url)
             logger.info(f"静态Referer: {homepage}")
             return homepage or engine_url
+    
+    # ==================== 地域化 Referer（P1-9） ====================
+    
+    def _get_multilingual_keywords(self, language: str) -> List[str]:
+        """
+        获取指定语言的关键词池（配置池 + 模块级多语言池合并去重）
+        
+        :param language: 语言代码（如 'en'、'ja'、'de'）
+        :return: 关键词列表
+        """
+        language = (language or "").lower()
+        config_pool = self.get_keywords_by_language(language)
+        extended_pool = EXTENDED_KEYWORD_POOLS.get(language, [])
+        # 配置池优先，扩展池补充，dict.fromkeys 保序去重
+        merged = list(dict.fromkeys(list(config_pool) + list(extended_pool)))
+        return merged
+    
+    def get_local_search_engine_url(self, country_code: str) -> str:
+        """
+        根据国家代码获取本地搜索引擎 URL 模板
+        
+        :param country_code: 国家/地区代码（如 'JP'、'DE'、'CN'），大小写不敏感
+        :return: 本地搜索引擎 URL 模板；未映射时兜底美国 Google
+        """
+        country_code = (country_code or "").upper()
+        engine_url = REGION_SEARCH_ENGINE_MAP.get(country_code)
+        if not engine_url:
+            engine_url = REGION_SEARCH_ENGINE_MAP[DEFAULT_SEARCH_REGION]
+            logger.warning(f"国家 '{country_code}' 未配置本地搜索引擎，兜底使用 {DEFAULT_SEARCH_REGION}: {engine_url}")
+        return engine_url
+    
+    def generate_referer_for_region(
+        self,
+        country_code: str,
+        language: str,
+        keyword: str = None
+    ) -> Optional[str]:
+        """
+        根据 国家代码 + 语言 生成地域一致的搜索 Referer。
+        内部选择该国家本地搜索引擎域名 + 对应语言的关键词，返回
+        `https://<local_domain>/search?q=<urlencoded keyword>` 形式。
+        
+        :param country_code: 国家/地区代码（如 'US'、'JP'、'DE'、'CN'）
+        :param language: 语言代码（如 'en'、'ja'、'de'），用于选择匹配的关键词池
+        :param keyword: 关键词（可选，不传则从对应语言池随机选取）
+        :return: 地域化 Referer URL；无可选关键词时返回 None
+        """
+        engine_url = self.get_local_search_engine_url(country_code)
+        
+        if not keyword:
+            keywords = self._get_multilingual_keywords(language)
+            if not keywords:
+                logger.error(f"语言 '{language}' 没有可用的地域化关键词")
+                return None
+            keyword = random.choice(keywords)
+        
+        encoded_keyword = urllib.parse.quote(keyword)
+        referer = f"{engine_url}{encoded_keyword}"
+        logger.info(f"地域化生成Referer: country={country_code}, lang={language}, referer={referer}")
+        return referer
     
     def get_engine_homepage(self, engine_url: str) -> Optional[str]:
         """

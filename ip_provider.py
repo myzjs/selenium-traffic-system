@@ -183,16 +183,26 @@ class IPProvider:
                 proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}" if proxy_username else f"http://{proxy_host}:{proxy_port}"
                 ip_info = self._get_ip_details(proxy_url)
 
+                # ★ P0-3: 拒绝机房/代理IP类型（datacenter/proxy/vpn/hosting/business）
+                _detected_type = (ip_info or {}).get("ip_type") or (ip_info or {}).get("type")
+                if is_high_risk_ip(_detected_type):
+                    logger.warning(f"[IPDeep] 高危IP类型已拒绝: type={_detected_type}, ip={ip_info.get('ip')}")
+                    return {
+                        "success": False,
+                        "error": "IPDeep机房/代理IP已拒绝",
+                        "detail": {"ip": ip_info.get("ip"), "ip_type": _detected_type},
+                    }
+
                 # IP 去重检查
-                exit_ip = ip_info.get("ip", "未知")
-                if exit_ip != "未知" and check_ip_used_recently(exit_ip):
+                exit_ip = (ip_info or {}).get("ip") or ""
+                if exit_ip and exit_ip != "未知" and check_ip_used_recently(exit_ip):
                     logger.warning(f"[IPDeep] IP {exit_ip} 在去重间隔内已使用过，重新获取...")
                     if attempt < max_retries - 1:
                         time.sleep(1)
                         continue
 
                 # 记录IP使用
-                if exit_ip != "未知":
+                if exit_ip and exit_ip != "未知":
                     record_ip_use(exit_ip)
 
                 result = {
@@ -330,9 +340,9 @@ class IPProvider:
                         data = resp.json()
                         result = api["parser"](data)
                     if result.get("success") and result.get("ip"):
-                        # 如果仅获取到IP（无地理信息），用ip-api.com补全
+                        # 如果仅获取到IP（无地理信息），用ip-api.com补全（复用同一出口代理，避免直连暴露本机真IP）
                         if result.get("_ip_only") and not result.get("country_code"):
-                            geo = self._enrich_ip_geo(result["ip"])
+                            geo = self._enrich_ip_geo(result["ip"], proxy_url=proxy_url)
                             if geo:
                                 result.update(geo)
                         logger.info(f"[IP详情] 通过 {api['name']} 获取: {result.get('ip')} ({result.get('country_code', '?')})")
@@ -345,26 +355,24 @@ class IPProvider:
                 time.sleep(1)
 
         logger.warning("[IP详情] 所有API失败(2轮)，无法获取出口IP信息")
-        # ★ 审计修复#10：所有API失败时不应返回success:True，避免下游用"未知"作为IP地址
+        # ★ 审计修复#10 + I4：所有API失败时返回 success:False 且不伪造国家/时区，由上层决定舍弃该IP
         return {
             "success": False,
             "error": "所有IP详情API均不可达",
-            "ip": "未知",
-            "country": "United States",
-            "country_code": "US",
-            "region": "Unknown",
-            "city": "Unknown",
-            "timezone": "America/New_York",
-            "isp": "Unknown",
-            "language": "en-US"
+            "ip": "",
         }
 
-    def _enrich_ip_geo(self, ip: str) -> Dict:
-        """用ip-api.com补全IP地理信息（直连，不走代理）"""
+    def _enrich_ip_geo(self, ip: str, proxy_url: str = None) -> Dict:
+        """用ip-api.com补全IP地理信息（优先走调用方传入的代理，避免直连暴露本机真IP）"""
         try:
+            req_kwargs = {"timeout": 5}
+            if proxy_url:
+                req_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            else:
+                logger.warning("[IP详情] 未能走代理补全Geo信息，将直连ip-api.com（可能暴露本机真IP）")
             resp = requests.get(
                 f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,timezone,isp",
-                timeout=5
+                **req_kwargs
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -396,6 +404,19 @@ def _get_language_from_country(country_code: str) -> str:
         "SA": "ar-SA", "AE": "ar-AE", "EG": "ar-EG"
     }
     return lang_map.get(country_code.upper(), "en-US")
+
+
+# ============================================================
+# 高危IP类型判断（机房/代理/VPN/Hosting 等）
+# ============================================================
+_HIGH_RISK_IP_TYPES = {"datacenter", "proxy", "vpn", "hosting", "business"}
+
+
+def is_high_risk_ip(ip_type: str) -> bool:
+    """判断连接类型是否属于机房/代理等高风险 IP 类型（用于拒绝该IP）"""
+    if not ip_type:
+        return False
+    return str(ip_type).strip().lower() in _HIGH_RISK_IP_TYPES
 
 
 # ============================================================
@@ -508,10 +529,11 @@ def check_ip_used_recently(ip: str) -> bool:
 
 
 def record_ip_use(ip: str):
-    """记录IP使用时间"""
+    """记录IP使用时间（变更后立即持久化）"""
     with _used_ips_lock:
         _used_ips[ip] = time.time()
         logger.debug(f"[IP去重] 记录IP使用: {ip}")
+    _save_dedup_state()
 
 
 def get_used_ips_count() -> int:
@@ -554,13 +576,14 @@ def check_c_segment_diversity(ip: str) -> bool:
 
 
 def record_c_segment_use(ip: str):
-    """记录IP的C段使用"""
+    """记录IP的C段使用（变更后立即持久化）"""
     c_seg = get_c_segment(ip)
     with _c_segment_lock:
         if c_seg not in _c_segment_usage:
             _c_segment_usage[c_seg] = []
         _c_segment_usage[c_seg].append(time.time())
     logger.debug(f"[C段分散] 记录C段使用: {c_seg}.0/24 (IP: {ip})")
+    _save_dedup_state()
 
 
 def get_c_segment_stats() -> Dict:
@@ -612,6 +635,77 @@ _used_ips = {}  # {ip: timestamp}
 _used_ips_lock = threading.Lock()
 PROXY_CACHE_TTL = 60  # 代理缓存TTL（秒），★ 从600s降60s，防止session过期后缓存返回失效凭证
 IP_REUSE_INTERVAL = 24 * 3600  # IP去重间隔（秒），★ 24小时去重（设计要求）
+
+
+# ============================================================
+# IP去重状态持久化（P1-10）：_used_ips(24h) 与 _c_segment_usage(C段/24)
+# 保存到脚本同目录 .risk_state/ip_dedup_state.json，启动加载、变更保存、后台定期保存
+# ============================================================
+_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".risk_state")
+_STATE_FILE = os.path.join(_STATE_DIR, "ip_dedup_state.json")
+_STATE_SAVE_INTERVAL = 60  # 定期自动持久化间隔（秒）
+_STATE_LOCK = threading.Lock()
+_state_save_stop = threading.Event()
+
+
+def _load_dedup_state():
+    """启动时加载去重状态到内存（过滤已过期项）"""
+    global _used_ips, _c_segment_usage
+    try:
+        if not os.path.exists(_STATE_FILE):
+            return
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        now = time.time()
+        loaded_ips = data.get("ip_last_use", {}) or {}
+        loaded_c = data.get("c_segment_usage", {}) or {}
+        _used_ips = {
+            ip: float(ts) for ip, ts in loaded_ips.items()
+            if (now - float(ts)) <= IP_REUSE_INTERVAL
+        }
+        window_sec = C_SEGMENT_WINDOW_HOURS * 3600
+        _c_segment_usage = {
+            seg: [float(ts) for ts in timestamps if (now - float(ts)) < window_sec]
+            for seg, timestamps in loaded_c.items()
+        }
+        logger.info(f"[IP去重] 已从持久化恢复去重状态: {len(_used_ips)} 个IP, {len(_c_segment_usage)} 个C段")
+    except Exception as e:
+        logger.warning(f"[IP去重] 加载持久化状态失败（使用空状态）: {e}")
+        _used_ips = {}
+        _c_segment_usage = {}
+
+
+def _save_dedup_state(force: bool = False):
+    """将内存去重状态保存到磁盘（原子写 + 锁，防止并发写坏文件）"""
+    with _STATE_LOCK:
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            with _used_ips_lock, _c_segment_lock:
+                data = {
+                    "ip_last_use": dict(_used_ips),
+                    "c_segment_usage": dict(_c_segment_usage),
+                }
+            tmp = _STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _STATE_FILE)
+        except Exception as e:
+            logger.warning(f"[IP去重] 持久化状态保存失败: {e}")
+
+
+def _periodic_save_loop():
+    """后台线程：定期自动持久化，避免进程异常退出丢失状态"""
+    while not _state_save_stop.wait(_STATE_SAVE_INTERVAL):
+        _save_dedup_state()
+
+
+def _start_periodic_save():
+    threading.Thread(target=_periodic_save_loop, args=(), daemon=True).start()
+
+
+# 模块加载即恢复上次运行的去重状态，并启动后台定期保存线程
+_load_dedup_state()
+_start_periodic_save()
 
 
 if __name__ == "__main__":

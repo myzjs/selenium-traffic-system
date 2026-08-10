@@ -35,10 +35,8 @@ _DEFAULT_IPDEEP_API_URL = ""
 _DEFAULT_IPDEEP_API_USER = ""
 _DEFAULT_IPDEEP_API_PWD = ""
 
-# IP去重机制：记录IP和使用时间，12小时内不重复
-_used_ips = {}  # {ip: timestamp}
-_used_ips_lock = threading.Lock()  # 线程锁保护 _used_ips
-IP_REUSE_INTERVAL = 12 * 3600  # 12小时 = 43200秒
+# IP去重：统一复用 ip_provider.check_ip_used_recently / record_ip_use（24h去重，持久化到 .risk_state/ip_dedup_state.json）
+from ip_provider import check_ip_used_recently, record_ip_use
 
 # 配置日志
 logging.basicConfig(
@@ -122,15 +120,9 @@ def check_auth(auth_header, request_type="unknown"):
 
 def get_or_refresh_ipdeep_proxy(api_url, api_user=None, api_pwd=None):
     """从IPDeep API获取代理信息，并按目标站访问速度筛选节点。"""
-    global _current_ipdeep_proxy, _last_update, _used_ips
+    global _current_ipdeep_proxy, _last_update
 
     now = time.time()
-
-    # 线程安全清理过期IP
-    with _used_ips_lock:
-        expired_ips = [ip for ip, ts in _used_ips.items() if (now - ts) > IP_REUSE_INTERVAL]
-        for ip in expired_ips:
-            del _used_ips[ip]
 
     max_retries = 3
     speed_threshold = 8.0
@@ -172,14 +164,11 @@ def get_or_refresh_ipdeep_proxy(api_url, api_user=None, api_pwd=None):
             ip_info = get_ip_details_proxy(proxy_url)
             exit_ip = ip_info.get("ip", "未知")
 
-            # 线程安全检查IP是否已使用
-            with _used_ips_lock:
-                if exit_ip in _used_ips:
-                    ip_age = now - _used_ips[exit_ip]
-                    if ip_age < IP_REUSE_INTERVAL:
-                        logger.warning(f"IP {exit_ip} 在 {int(ip_age/3600)} 小时内用过，继续获取新IP...")
-                        time.sleep(1)
-                        continue
+            # 统一去重检查（复用 ip_provider，24h 去重，与 ip_provider 口径一致）
+            if exit_ip and check_ip_used_recently(exit_ip):
+                logger.warning(f"IP {exit_ip} 在去重间隔内用过，继续获取新IP...")
+                time.sleep(1)
+                continue
 
             target_fast, target_detail, target_elapsed, target_reachable = validate_target_site_proxy(
                 proxy_url,
@@ -201,9 +190,9 @@ def get_or_refresh_ipdeep_proxy(api_url, api_user=None, api_pwd=None):
             if target_fast:
                 logger.info(f"✓ 目标站快节点通过: {target_detail}")
                 proxy_data = candidate
-                with _used_ips_lock:
-                    _used_ips[exit_ip] = now
-                logger.info(f"✓ 新IP确认: {exit_ip} (已记录，12小时内不重复)")
+                if exit_ip and exit_ip != "未知":
+                    record_ip_use(exit_ip)
+                logger.info(f"✓ 新IP确认: {exit_ip} (已记录去重)")
                 break
 
             if target_reachable:
@@ -221,8 +210,8 @@ def get_or_refresh_ipdeep_proxy(api_url, api_user=None, api_pwd=None):
 
     if proxy_data is None and best_slow_candidate is not None:
         best_elapsed, proxy_data, best_exit_ip = best_slow_candidate
-        with _used_ips_lock:
-            _used_ips[best_exit_ip] = now
+        if best_exit_ip and best_exit_ip != "未知":
+            record_ip_use(best_exit_ip)
         logger.warning(
             f"连续 {max_retries} 次未找到 <= {speed_threshold:.0f}s 的快节点，"
             f"使用本轮最快可用节点: ip={best_exit_ip}, time={best_elapsed:.2f}s"
@@ -299,18 +288,12 @@ def get_ip_details_proxy(proxy_url):
             logger.warning(f"API {api['name']} 失败: {e}", exc_info=True)
             continue
     
-    # 所有API都失败时，返回默认数据
-    logger.warning("所有IP查询API都失败，使用默认数据")
+    # 所有API都失败时不伪造地理信息，由上层决定舍弃当前IP
+    logger.warning("所有IP查询API都失败，不伪造地理信息")
     return {
-        "success": True,
-        "ip": "1.1.1.1",
-        "country": "United States",
-        "country_code": "US",
-        "region": "California",
-        "city": "Los Angeles",
-        "timezone": "America/Los_Angeles",
-        "isp": "Cloudflare, Inc.",
-        "language": "en-US"
+        "success": False,
+        "error": "所有IP查询API均不可达",
+        "ip": "",
     }
 
 

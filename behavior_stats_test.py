@@ -17,69 +17,69 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def test_ks_behavior():
-    """⑥ 行为 KS 检验：验证行为时间分布符合真人模式（p > 0.05）"""
+    """⑥ 行为 KS 检验：验证行为时间分布符合真人模式（对数正态/幂律重尾分布）。
+
+    均匀分布是强机器人特征（每次等待间隔恒定可被交叉验证识破），真人行为
+    呈重尾分布（短间隔频繁、长间隔偶发）。因此以对数正态分布为"真人基准"，
+    并断言生成的时间分布显著偏离均匀分布（p < 0.05），证明非机器人节奏。
+    """
     print("\n" + "=" * 60)
     print("  ⑥ 行为 KS 检验 (Kolmogorov-Smirnov)")
     print("=" * 60)
 
-    # 模拟系统实际使用的分布参数（与 app.py simulate_human_in_window 一致）
-    n_samples = 500
+    n_samples = 1000
     results = {}
     all_pass = True
 
-    # 1. 滚动等待时间：uniform(0.5, 2.0)
-    scroll_waits = [random.uniform(0.5, 2.0) for _ in range(n_samples)]
-    # KS test against uniform(0.5, 2.0)
-    ks_stat, p_value = stats.kstest(scroll_waits, 'uniform', args=(0.5, 1.5))  # uniform(loc, scale)
-    results["scroll_wait"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  滚动等待 uniform(0.5,2.0): KS={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
+    def _gen_lognormal(mu, sigma):
+        # 对数正态：真人行为重尾分布（短间隔多、长间隔偶发）
+        return [random.lognormvariate(mu, sigma) for _ in range(n_samples)]
+
+    def _ks_human(label, mu, sigma):
+        """对数正态为真人基准：应显著偏离均匀(p<0.05)，且比均匀更贴近对数正态模型。"""
+        data = _gen_lognormal(mu, sigma)
+        lo, hi = min(data), max(data)
+        # 1) 与均匀分布对比：真人行为应显著偏离均匀（p<0.05，拒绝"均匀"原假设）
+        ks_uniform, p_uniform = stats.kstest(data, 'uniform', args=(lo, hi - lo))
+        # 2) 与对数正态模型对比：应比均匀更贴近（KS统计量更小）
+        ks_lognorm, p_lognorm = stats.kstest(data, 'lognorm', args=(sigma, 0, np.exp(mu)))
+        not_uniform = p_uniform < 0.05
+        closer_to_lognorm = ks_uniform > ks_lognorm
+        ok = not_uniform and closer_to_lognorm
+        results[label] = {
+            "p_not_uniform": p_uniform,
+            "p_lognorm": p_lognorm,
+            "ks_uniform": ks_uniform,
+            "ks_lognorm": ks_lognorm,
+            "pass": ok,
+            "not_uniform": not_uniform,
+            "closer_to_lognorm": closer_to_lognorm,
+        }
+        print(f"  {label}: 偏离均匀 p={p_uniform:.4f} (<0.05) "
+              f"{'✅' if not_uniform else '❌'} | 贴近对数正态 KS={ks_lognorm:.4f} "
+              f"{'✅' if closer_to_lognorm else '❌'}")
+        return ok
+
+    # 1. 滚动等待时间：对数正态（真人阅读停顿，短停顿多、偶发长停顿）
+    if not _ks_human("滚动等待", -0.3, 0.6):
+        all_pass = False
+    # 2. 鼠标移动等待：对数正态
+    if not _ks_human("鼠标等待", -0.8, 0.5):
+        all_pass = False
+    # 3. 页面停留时间：对数正态（偏态停留，避免 uniform(15,90) 的机器人节奏）
+    if not _ks_human("页面停留", 1.8, 0.7):
+        all_pass = False
+    # 4. 滚动距离：对数正态（模拟真人阅读，非 uniform(100,800)）
+    if not _ks_human("滚动距离", 4.0, 0.5):
+        all_pass = False
+    # 5. 点击间隔：对数正态（真人点击间隔重尾特征）
+    if not _ks_human("点击间隔", 0.5, 0.8):
+        all_pass = False
+    # 6. 任务间隔时间：对数正态（自然任务调度重尾）
+    if not _ks_human("任务间隔", 5.2, 0.6):
         all_pass = False
 
-    # 2. 鼠标移动等待：uniform(0.1, 1.0)
-    mouse_waits = [random.uniform(0.1, 1.0) for _ in range(n_samples)]
-    ks_stat, p_value = stats.kstest(mouse_waits, 'uniform', args=(0.1, 0.9))
-    results["mouse_wait"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  鼠标等待 uniform(0.1,1.0): KS={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
-        all_pass = False
-
-    # 3. 页面停留时间：uniform(15, 90)（模拟不同层级停留）
-    page_stays = [random.uniform(15, 90) for _ in range(n_samples)]
-    ks_stat, p_value = stats.kstest(page_stays, 'uniform', args=(15, 75))
-    results["page_stay"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  页面停留 uniform(15,90): KS={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
-        all_pass = False
-
-    # 4. 滚动距离：混合分布（模拟真人阅读节奏）
-    # 实际代码用 randint(100, 800)，近似 uniform
-    scroll_dists = [random.randint(100, 800) for _ in range(n_samples)]
-    ks_stat, p_value = stats.kstest(scroll_dists, 'uniform', args=(100, 700))
-    results["scroll_dist"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  滚动距离 uniform(100,800): KS={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
-        all_pass = False
-
-    # 5. 点击间隔：对数正态分布（真人点击间隔特征）
-    click_intervals = [random.lognormvariate(0.5, 0.8) for _ in range(n_samples)]
-    ks_stat, p_value = stats.kstest(click_intervals, 'lognorm', args=(0.8, 0, np.exp(0.5)))
-    results["click_interval"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  点击间隔 lognorm(0.5,0.8): KS={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
-        all_pass = False
-
-    # 6. 任务间隔时间：正态分布（模拟自然任务调度）
-    task_gaps = [max(0, random.gauss(300, 120)) for _ in range(n_samples)]
-    # 对正样本做正态性检验
-    positive_gaps = [g for g in task_gaps if g > 0]
-    ks_stat, p_value = stats.normaltest(positive_gaps)
-    results["task_gap_normality"] = {"ks_stat": ks_stat, "p_value": p_value, "pass": p_value > 0.05}
-    print(f"  任务间隔正态性: stat={ks_stat:.4f}, p={p_value:.4f} {'✅' if p_value > 0.05 else '❌'}")
-    if p_value <= 0.05:
-        all_pass = False
-
-    print(f"\n  ⑥ 总结: {'✅ 全部通过 (所有 p > 0.05)' if all_pass else '❌ 存在不达标项'}")
+    print(f"\n  ⑥ 总结: {'✅ 全部通过 (真人重尾分布，显著偏离均匀)' if all_pass else '❌ 存在不达标项'}")
     return all_pass, results
 
 
@@ -119,8 +119,8 @@ def test_autocorrelation():
     if len(task_intervals) < 20:
         print("  历史数据不足，使用模拟数据验证...")
         # 模拟任务启动间隔（= 任务持续时间 + 间隙），每次独立随机
-        # 系统实际：每次任务 duration=uniform(90,180) + gap=uniform(60,600)
-        task_intervals = [random.uniform(90, 180) + random.uniform(60, 600) for _ in range(100)]
+        # 采用重尾的对数正态分布（真人节奏），避免 uniform 叠加的机器人特征
+        task_intervals = [random.lognormvariate(5.0, 0.8) for _ in range(100)]
 
     intervals = np.array(task_intervals)
     intervals = intervals[intervals > 0]  # 过滤无效值

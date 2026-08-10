@@ -20,7 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-APP_VERSION = "26.8.9.7"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.1 = 2026-08-10 第一次改动
+APP_VERSION = "26.8.10.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -77,6 +78,84 @@ try:
 except Exception as _e:
     _popunder = None
     _HAS_POPUNDER = False
+
+# ========== ★ P0-2 站点频率控制（业务层：防止单站点高频访问被风控判定机器流量） ==========
+# 同一站点在短时间窗口内被高频反复访问是 AdSense/HilltopAds 最易识别的机器特征。
+# 用内存+落盘记录"站点→最近访问时间戳"，强制最小访问间隔 + 窗口内访问上限。
+_SITE_MIN_INTERVAL_SEC = 180.0          # 同一站点两次访问最小间隔（3分钟）
+_SITE_MAX_PER_WINDOW = 8               # 24小时窗口内单站点最大访问次数
+_SITE_WINDOW_HOURS = 24
+_SITE_FREQ_LOCK = threading.RLock()
+# {host: [timestamp, ...]} 仅记录最近窗口内的访问
+_SITE_VISITS = {}
+_SITE_FREQ_STATE = os.path.join(BASE_DIR if 'BASE_DIR' in dir() else os.path.dirname(os.path.abspath(__file__)), ".risk_state", "site_freq.json")
+
+
+def check_site_frequency(host: str) -> bool:
+    """检查是否允许访问该站点。返回 True 表示允许。"""
+    if not host:
+        return True
+    host = host.lower()
+    now = time.time()
+    cutoff = now - _SITE_WINDOW_HOURS * 3600
+    with _SITE_FREQ_LOCK:
+        ts_list = _SITE_VISITS.get(host, [])
+        ts_list = [t for t in ts_list if t > cutoff]
+        _SITE_VISITS[host] = ts_list
+        # 窗口内访问数已达上限
+        if len(ts_list) >= _SITE_MAX_PER_WINDOW:
+            return False
+        # 距上次访问过近
+        if ts_list and (now - ts_list[-1]) < _SITE_MIN_INTERVAL_SEC:
+            return False
+        return True
+
+
+def record_site_visit(host: str):
+    """记录一次站点访问。"""
+    if not host:
+        return
+    host = host.lower()
+    now = time.time()
+    cutoff = now - _SITE_WINDOW_HOURS * 3600
+    with _SITE_FREQ_LOCK:
+        ts_list = [t for t in _SITE_VISITS.get(host, []) if t > cutoff]
+        ts_list.append(now)
+        _SITE_VISITS[host] = ts_list
+        try:
+            os.makedirs(os.path.dirname(_SITE_FREQ_STATE), exist_ok=True)
+            with open(_SITE_FREQ_STATE, "w", encoding="utf-8") as _f:
+                json.dump({k: v[-_SITE_MAX_PER_WINDOW:] for k, v in _SITE_VISITS.items()}, _f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def _load_site_freq_state():
+    """启动时加载站点访问记录（跨进程持久化）。"""
+    try:
+        if os.path.exists(_SITE_FREQ_STATE):
+            with open(_SITE_FREQ_STATE, "r", encoding="utf-8") as _f:
+                data = json.load(_f)
+            _SITE_VISITS.update(data or {})
+    except Exception:
+        pass
+
+
+def _rt_logsample(mid, sigma, clip_min, clip_max):
+    """对数正态采样（右偏、带长尾，符合真人阅读/停留特征），替代均匀分布。
+
+    均匀分布是时序分类器最易识破的机器人特征；真人行为多为对数正态/
+    幂律分布。返回 [clip_min, clip_max] 内、以 mid 为中位数的右偏时长。
+    """
+    import math as _m
+    try:
+        v = _m.exp(random.gauss(_m.log(max(mid, 1e-3)), float(sigma)))
+    except Exception:
+        v = float(mid)
+    return max(float(clip_min), min(float(clip_max), v))
+
+
+_load_site_freq_state()
 
 # ★ P0-1: TLS/JA3指纹伪装 - 使用curl_cffi模拟Chrome TLS指纹（替代原生requests的Python TLS特征）
 try:
@@ -1041,7 +1120,11 @@ def generate_daily_tasks_legacy(cfg):
         proxy = random.choice(proxy_by_country.get(chosen_country, proxy_pool_enabled))
         
         # 随机执行时长（网页浏览模式：任务时长=浏览网页时长，与配置一致）
-        browse_duration = random.uniform(total_stay_cfg["min"], total_stay_cfg["max"])
+        # ★ P1-5 对数正态替换均匀分布（右偏长尾，符合真人阅读特征）
+        browse_duration = _rt_logsample(
+            (total_stay_cfg["min"] + total_stay_cfg["max"]) / 2.0, 0.35,
+            total_stay_cfg["min"], total_stay_cfg["max"]
+        )
         task_duration = browse_duration
         actual_end = actual_start + task_duration
         
@@ -1325,7 +1408,11 @@ def generate_daily_tasks(cfg):
                 continue
             chosen_country = select_country_by_quota(countries_at, country_quota_used, country_quota_target) or random.choice(countries_at)
             proxy = random.choice(proxy_by_country.get(chosen_country, proxy_pool_enabled))
-            browse_duration = random.uniform(total_stay_cfg["min"], total_stay_cfg["max"])
+            # ★ P1-5 对数正态替换均匀分布（右偏长尾，符合真人特征）
+            browse_duration = _rt_logsample(
+                (total_stay_cfg["min"] + total_stay_cfg["max"]) / 2.0, 0.35,
+                total_stay_cfg["min"], total_stay_cfg["max"]
+            )
             actual_end = actual_start + browse_duration
             actual_end_utc = (today_local_start_utc + _dt.timedelta(seconds=actual_end) - today_utc_start).total_seconds()
             actual_start_epoch = int((today_utc_start + _dt.timedelta(seconds=actual_start_utc)).timestamp())
@@ -1527,11 +1614,14 @@ def _qa_site_host(url):
     return host.lower()
 
 
-def _qa_session_paths(site_url, country):
+def _qa_session_paths(site_url, country, fp_id=None):
     import os
     site = _qa_safe_name(_qa_site_host(site_url))
     cc = _qa_safe_name((country or "US").upper())
-    base_dir = os.path.join(os.getcwd(), QA_SESSION_DIR, site, cc)
+    # ★ P1-8 Cookie 与指纹绑定：按站点+国家+指纹身份隔离会话存储，
+    # 避免"每次任务指纹变化 + 复用同一套第一方Cookie"的异常组合被风控关联。
+    fp = _qa_safe_name(fp_id)[:12] if fp_id else "_nofp"
+    base_dir = os.path.join(os.getcwd(), QA_SESSION_DIR, site, cc, fp)
     return base_dir, os.path.join(base_dir, "storage_state.json"), os.path.join(base_dir, "meta.json")
 
 
@@ -1577,11 +1667,11 @@ def _qa_load_json(path, default=None):
         return default
 
 
-def prepare_qa_storage_state(site_url, country):
-    """内部 QA 会话：按站点+国家加载第一方会话状态；7天封存旧状态。"""
+def prepare_qa_storage_state(site_url, country, fp_id=None):
+    """内部 QA 会话：按站点+国家+指纹身份加载第一方会话状态；7天封存旧状态。"""
     import os
     import shutil
-    base_dir, state_path, meta_path = _qa_session_paths(site_url, country)
+    base_dir, state_path, meta_path = _qa_session_paths(site_url, country, fp_id)
     os.makedirs(base_dir, exist_ok=True)
     now = time.time()
     meta = _qa_load_json(meta_path, {}) or {}
@@ -1611,7 +1701,7 @@ def prepare_qa_storage_state(site_url, country):
     return state_path, state_path, meta_path
 
 
-def save_qa_storage_state(context, site_url, country, state_path, meta_path):
+def save_qa_storage_state(context, site_url, country, state_path, meta_path, fp_id=None):
     """保存内部 QA 第一方会话状态，不做全局清空。"""
     import os
     if not context or not state_path or not meta_path:
@@ -1628,9 +1718,12 @@ def save_qa_storage_state(context, site_url, country, state_path, meta_path):
     meta["last_saved_at"] = now
     meta["site_host"] = _qa_site_host(site_url)
     meta["country"] = (country or "US").upper()
+    if fp_id:
+        meta["fp_id"] = fp_id
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     log.info(f"[QA会话] 已保存第一方Cookie/localStorage: {meta['country']}/{meta['site_host']}")
+    return state
 
 
 # ★ P2-9: 跨会话行为画像记忆（每个站点+国家维护独立的行为模式，跨任务复用）
@@ -3209,33 +3302,28 @@ def simulate_human_in_window(page, duration, stats, current_x, current_y, config
                 # ★ 滚动次数限制：达到配置上限后跳过
                 if _scroll_done >= _scroll_max:
                     continue
-                # ★ 2.1 惯性滚动模型：初始速度v0从配置scroll_pixels读取
+                # ★ P1-6 惯性滚动模型：改用 CDP 真实 wheel 事件（isTrusted=true），
+                # 替代原 JS 注入 scrollBy（非可信事件，易被风控探针识别）。
                 _v0 = _rnd.uniform(float(scroll_cfg.get("min", 200)), float(scroll_cfg.get("max", 1000)))  # 初始速度 px/s
                 _direction = -1 if _rnd.random() < 0.15 else 1
-                _inertia_js = """
-                    (v0, direction) => {
-                        return new Promise(resolve => {
-                            let v = v0 * direction;
-                            let totalDist = 0;
-                            const decay = 0.88;
-                            const minV = 20;
-                            function frame() {
-                                if (Math.abs(v) < minV) { resolve(totalDist); return; }
-                                window.scrollBy(0, v * 0.016);
-                                totalDist += Math.abs(v * 0.016);
-                                v *= decay;
-                                requestAnimationFrame(frame);
-                            }
-                            requestAnimationFrame(frame);
-                        });
-                    }
-                """
+                _scrolled = 0
                 try:
-                    _scrolled = page.evaluate(_inertia_js, [_v0, _direction])
-                    _scrolled = int(abs(_scrolled or 0))
+                    _v = abs(_v0)
+                    _decay = 0.88
+                    _minv = 20
+                    _travel = 0
+                    _step_count = 0
+                    while _v >= _minv and _step_count < 40 and _travel < 8000:
+                        _step = max(1, int(round(_v * 0.016))) * _direction
+                        page.mouse.wheel(0, _step)
+                        _travel += abs(_step)
+                        _v *= _decay
+                        _step_count += 1
+                        _t.sleep(0.016)
+                    _scrolled = _travel
                 except Exception:
-                    _scrolled = _rnd.randint(int(scroll_cfg.get("min", 100)), int(scroll_cfg.get("max", 800)))
-                    page.evaluate(f"window.scrollBy(0, {_scrolled * _direction})")
+                    page.mouse.wheel(0, int(float(scroll_cfg.get("max", 800))) * _direction)
+                    _scrolled = int(float(scroll_cfg.get("max", 800)))
                 stats["scrolls"] += 1
                 _scroll_done += 1
                 stats["scroll_distance"] += _scrolled
@@ -8547,14 +8635,47 @@ def generate_fingerprint(ip_info):
     random.shuffle(fonts_shuffled)
     
     # 真实显卡 vendor/renderer 组合（用于 WebGL UNMASKED_VENDOR/RENDERER，避免返回随机串被识别）
-    _gpu_combos = [
+    # ★ P1-7 GPU 池扩充 + 平台匹配：原仅 6 组且混入 Apple/Direct3D，
+    # 与 Linux UA 平台冲突、跨会话易聚类。扩充为按 UA 平台匹配的真实 GPU 池。
+    _gpu_pool_windows = [
         ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
         ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
         ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
         ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
         ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-        ("Google Inc. (Apple)", "ANGLE (Apple, Apple M1, OpenGL 4.1)"),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"),
     ]
+    _gpu_pool_macos = [
+        ("Google Inc. (Apple)", "ANGLE (Apple, Apple M1, OpenGL 4.1)"),
+        ("Google Inc. (Apple)", "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)"),
+        ("Google Inc. (Apple)", "ANGLE (Apple, Apple M2, OpenGL 4.1)"),
+        ("Google Inc. (Apple)", "ANGLE (Apple, Apple M3 Pro, OpenGL 4.1)"),
+        ("Google Inc. (Apple)", "ANGLE (Apple, Intel(R) Iris(TM) Plus Graphics 645, OpenGL 4.1)"),
+        ("Google Inc. (Apple)", "ANGLE (Apple, AMD Radeon Pro 5600M, OpenGL 4.1)"),
+    ]
+    _gpu_pool_linux = [
+        ("Google Inc. (Mesa)", "ANGLE (Mesa, Mesa Intel(R) UHD Graphics 620, OpenGL 4.5)"),
+        ("Google Inc. (Mesa)", "ANGLE (Mesa, Mesa Intel(R) UHD Graphics 630, OpenGL 4.5)"),
+        ("Google Inc. (Mesa)", "ANGLE (Mesa, Mesa Intel(R) Iris(R) Xe Graphics, OpenGL 4.5)"),
+        ("Google Inc. (Mesa)", "ANGLE (Mesa, Mesa AMD Radeon RX 580, OpenGL 4.5)"),
+        ("Google Inc. (Mesa)", "ANGLE (Mesa, Mesa AMD Radeon RX 6600, OpenGL 4.5)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650, OpenGL 4.6)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060, OpenGL 4.6)"),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060, OpenGL 4.6)"),
+    ]
+    _ua_l = (user_agent or "").lower()
+    if "mac os x" in _ua_l or "macintosh" in _ua_l:
+        _gpu_combos = _gpu_pool_macos
+    elif "linux" in _ua_l:
+        _gpu_combos = _gpu_pool_linux
+    else:
+        _gpu_combos = _gpu_pool_windows
     _gpu_vendor, _gpu_renderer = random.choice(_gpu_combos)
     
     # P2-2 指纹独立种子（不再共享 random 状态）
@@ -11926,7 +12047,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 country_code = "US"
                 selected_proxy = {"proxy_api_url": "", "proxy_user": "", "proxy_pwd": ""}
             for i in range(task_count):
-                browse_duration = random.uniform(stay_min, stay_max)
+                # ★ P1-5 用对数正态替换均匀分布生成停留时长（右偏长尾，符合真人特征）
+                browse_duration = _rt_logsample(
+                    (stay_min + stay_max) / 2.0, 0.35, stay_min, stay_max
+                )
                 tasks.append({
                     "idx": i + 1,
                     "plan_time": _now_utc.astimezone().strftime('%Y-%m-%d %H:%M:%S'),
@@ -12496,8 +12620,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
 
                         # ========== ★ P0-1/P0-4/P1-1 风控钩子：IP/账户/时段准入 ==========
                         if _HAS_RCE and exit_ip and exit_ip != "未知":
-                            # adv_id 占位：后续若接入多账户配置，可从 task/account 取
-                            _adv_id = current_task.get("adv_account_id") or ""
+                            # ★ P0-1 多账户接入：优先取任务级 adv_account_id，其次全局配置，
+                            # 让 isolate_pool/adv_isolation 按真实账户做隔离，而非全部归并 "default"
+                            _adv_id = (current_task.get("adv_account_id") or config.get("adv_account_id") or "").strip()
                             # 构造一个稳定 device_id (基于 fingerprint_id 或任务+UA的hash)
                             # ⚠️ 此时指纹浏览器尚未启动，fingerprint_id/user_agent/selected_ua 均不存在，
                             # 若仅用 国别|语言 会导致同国所有任务指纹相同、被 FP 30 天互斥全部拒绝，
@@ -12625,7 +12750,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             log.warning(f"⚠️ 平台 {selected_engine_id} 没有可用关键词，舍弃 IP 换下一个")
                             continue
                         
-                        generated_referer = seo_query.generate_referer(selected_engine_id, selected_keyword)
+                        # ★ P1-9 地域化 Referer：按 IP 国家选本地搜索引擎域名 + 对应语言关键词，
+                        # 避免"日本IP却产生英文美国谷歌 referer"。无地域化能力时回退旧逻辑。
+                        if hasattr(seo_query, "generate_referer_for_region"):
+                            generated_referer = seo_query.generate_referer_for_region(
+                                cc_upper, language, keyword=selected_keyword
+                            ) or seo_query.generate_referer(selected_engine_id, selected_keyword)
+                        else:
+                            generated_referer = seo_query.generate_referer(selected_engine_id, selected_keyword)
                         if not generated_referer:
                             log.warning(f"⚠️ Referer 生成失败，舍弃 IP 换下一个")
                             continue
@@ -12711,7 +12843,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     webgl = fingerprint["webgl"]
                     webgl_vendor = fingerprint.get("webgl_vendor", "Google Inc. (Intel)")
                     webgl_renderer = fingerprint.get("webgl_renderer", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)")
-                    canvas_noise_seed = int(fingerprint.get("canvas_noise_seed", 12345))
+                    # ★ P2-2 指纹种子稳定化：用 fp_id 绑定稳定 canvas 噪声种子，替代硬编码 12345，
+                    # 避免所有任务共享相同 canvas 噪声基线（指纹关联）
+                    _fp_seed_id = current_task.get("fingerprint_id") or fingerprint.get("fingerprint_id") or ""
+                    if _HAS_RCE and _fp_seed_id:
+                        try:
+                            canvas_noise_seed = int(_rce.get_stable_canvas_seed(_fp_seed_id))
+                        except Exception:
+                            canvas_noise_seed = int(fingerprint.get("canvas_noise_seed", 12345))
+                    else:
+                        canvas_noise_seed = int(fingerprint.get("canvas_noise_seed", 12345))
                     hardware_concurrency = int(fingerprint.get("hardware_concurrency", 8))
                     device_memory = int(fingerprint.get("device_memory", 8))
                     color_depth = int(fingerprint.get("color_depth", 24))
@@ -12848,15 +12989,28 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.warning("WebRTC防泄漏已禁用（可能导致IP泄漏风险）")
                 
                 # ★ 7.1 DNS-over-HTTPS：防止系统级DNS查询泄露真实地理位置
-                _launch_args.extend([
-                    "--dns-over-https-templates=https://dns.google/dns-query",
-                    "--dns-over-https-mode=secure",
-                ])
-                
-                # P2-3 DNS 解析分散
+                # P2-3 DNS 解析分散：按 IP 国家挑选本地 DNS 解析器，替换固定 dns.google
+                _doh_tpl = "https://dns.google/dns-query"  # 兜底
                 if _HAS_RCE:
                     _dns_pool = _rce.dns_diversity.pick_resolver(country or 'US')
                     log.info(f"🌐 P2-3 DNS解析器: {_dns_pool}")
+                    # 把解析器 IP 映射为对应 DoH 模板（Google/Cloudflare/OpenDNS/Quad9/运营商）
+                    _doh_map = {
+                        "8.8.8.8": "https://dns.google/dns-query",
+                        "8.8.4.4": "https://dns.google/dns-query",
+                        "1.1.1.1": "https://cloudflare-dns.com/dns-query",
+                        "1.0.0.1": "https://cloudflare-dns.com/dns-query",
+                        "208.67.222.222": "https://doh.opendns.com/dns-query",
+                        "9.9.9.9": "https://dns.quad9.net/dns-query",
+                    }
+                    for _ip in (_dns_pool or []):
+                        if _ip in _doh_map:
+                            _doh_tpl = _doh_map[_ip]
+                            break
+                _launch_args.extend([
+                    f"--dns-over-https-templates={_doh_tpl}",
+                    "--dns-over-https-mode=secure",
+                ])
                 
                 _launch_args.extend([
                         f"--lang={_launch_lang}",
@@ -13054,7 +13208,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         _first_url = config.get("target_url", "")
                     qa_storage_state_path, qa_save_state_path, qa_meta_path = prepare_qa_storage_state(
                         _first_url,
-                        current_task.get("proxy_country", "US")
+                        current_task.get("proxy_country", "US"),
+                        current_task.get("fingerprint_id") or fingerprint_id if 'fingerprint_id' in dir() else None
                     )
                     log.info(f"[QA会话] 使用全局session策略: {get_global_session_mode()}")
                 else:
@@ -14128,7 +14283,25 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     log.task_result(task_time, False, False, "没有勾选的目标网站")
                     _cancel_task_global_watchdog()  # ★ P2-5: 任务级 continue 前取消 suicide watchdog
                     continue
+                # ★ P0-2 站点频率控制：单站点高频访问是机器流量最强信号。
+                # 对每个目标站点做最小访问间隔 + 窗口内访问上限校验，超限则跳过该站点。
+                _site_skipped = []
+                for _u in _active_urls:
+                    _host_chk = urllib.parse.urlparse(_u).netloc.lower()
+                    if not check_site_frequency(_host_chk):
+                        _site_skipped.append(_host_chk)
+                if _site_skipped:
+                    log.warning(
+                        f"⛔ P0-2 站点频控：以下站点超频，本次跳过 ({_SITE_MAX_PER_WINDOW}次/{_SITE_WINDOW_HOURS}h, "
+                        f"间隔≥{_SITE_MIN_INTERVAL_SEC:.0f}s): {_site_skipped}"
+                    )
+                _site_skipped_set = set(_site_skipped)
                 for _url_idx, target_url in enumerate(_active_urls):
+                    _host_now = urllib.parse.urlparse(target_url).netloc.lower()
+                    if _host_now in _site_skipped_set:
+                        log.info(f"⏭️ P0-2 跳过超频站点: {target_url}")
+                        continue
+                    record_site_visit(_host_now)
                     log.info(f"🔗 串联浏览: 第{_url_idx+1}/{len(_active_urls)}个网站 - {target_url}")
                     final_url = target_url  # 初始化final_url为首页
                     load_success = False
@@ -14942,7 +15115,14 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             _sd_cap3 = float(_sd_cfg3.get("hard_cap_sec", 600))
                             _rope_left = task_deadline - time.time()
                             if _rope_left < _cfg_stay_min_rope2:
-                                _new_budget = min(_sd_cap3, _session_secs if '_session_secs' in dir() else max(_cfg_stay_min_rope2, 120))
+                                # ★ B5 修复：重锚预算不再强制补足到完整配置时长。
+                                # 旧逻辑每次重锚都拉满，形成"会话时长几乎总 ≥ 最小值"的机器规律。
+                                # 改为在 [最小浏览时长, 最小+实际剩余] 范围内对数正态采样，保留随机中断特征。
+                                _sd_full = _session_secs if '_session_secs' in dir() else max(_cfg_stay_min_rope2, 120)
+                                _new_budget = _rt_logsample(
+                                    _cfg_stay_min_rope2 * 1.3, 0.45,
+                                    _cfg_stay_min_rope2, min(_sd_cap3, max(_sd_full, _rope_left + 30))
+                                )
                                 log.warning(
                                     f"⏱️ [保险绳重锚] 旧deadline已过期/不足（剩余={max(0, _rope_left):.1f}s < 最小浏览{_cfg_stay_min_rope2:.0f}s，"
                                     f"被前置流程消耗），重新锚定到首页加载完成时刻，新预算={_new_budget:.0f}s"
@@ -15710,7 +15890,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     _save_url,
                                     current_task.get("proxy_country", "US") if 'current_task' in locals() else "US",
                                     locals().get("qa_save_state_path"),
-                                    locals().get("qa_meta_path")
+                                    locals().get("qa_meta_path"),
+                                    current_task.get("fingerprint_id") if 'current_task' in locals() else None
                                 )
                             except Exception as _qa_e:
                                 log.warning(f"[QA会话] 保存失败: {str(_qa_e)[:120]}")

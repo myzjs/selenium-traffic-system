@@ -86,6 +86,16 @@ def _ip_c_segment(ip: str) -> str:
     return ip or "unknown"
 
 
+def _normalize_adv_id(adv_id: Optional[str]) -> str:
+    """归一化广告账户 ID：空/未指定时落到 '__default_adv__' 命名空间。
+
+    关键：即使 adv_id 为主调用方传入的 'default' 占位，也必须在统一的
+    命名空间内严格执行隔离，绝不直接放行（否则多账号会相互穿透关联）。
+    """
+    adv = (adv_id or "").strip()
+    return adv or "__default_adv__"
+
+
 def _safe_exp(x: float) -> float:
     try:
         return math.exp(x)
@@ -156,6 +166,28 @@ class _IsolatePool:
         except Exception as e:
             _log.warning("isolate_pool 保存失败: %s", e)
 
+    @staticmethod
+    def derive_keys(
+        adv_id: Optional[str],
+        ip: str,
+        fingerprint: str,
+        ua: str,
+        asn: Optional[str] = None,
+    ) -> Tuple[str, str, str, str]:
+        """
+        纯函数（无锁、无状态、无副作用）：把 (adv_id, ip, fingerprint, ua, asn)
+        归一为隔离键 (归一化 adv, c_seg, asn, fp)。
+
+        供单测验证：
+          - 不同 adv_id → 归一化 adv 不同 → 键空间完全不相交（互不污染）；
+          - 同 adv_id + 同资源 → 键相同 → 互斥判定命中。
+        """
+        adv = _normalize_adv_id(adv_id)
+        c_seg = _ip_c_segment(ip)
+        asn_val = (asn or c_seg).strip()
+        fp = str(fingerprint or ua or "anon").strip()[:128]
+        return (adv, c_seg, asn_val, fp)
+
     # --------- API ---------- #
     def allow(
         self,
@@ -169,49 +201,44 @@ class _IsolatePool:
     ) -> Tuple[bool, str]:
         """
         返回 (是否允许使用该组合, 拒绝原因)。
-        adv_id 为空字符串时视为"未指定账户"，直接放行 (弱约束)。
+        adv_id 为空/占位时归一为 '__default_adv__'，隔离判定依然严格生效（不再直接放行）。
         asn 缺失时用 ip 粗粒度近似（但不精确，推荐调用方从 ip_info 传 ASN）。
         """
-        if not adv_id:
-            return True, ""
-        adv_id = str(adv_id).strip()
-        c_seg = _ip_c_segment(ip)
-        asn_val = (asn or c_seg).strip()
-        fp = str(fingerprint or ua or "anon").strip()[:128]
+        adv, c_seg, asn_val, fp = self.derive_keys(adv_id, ip, fingerprint, ua, asn)
 
         now = time.time()
         with self._lock:
             # C 段 7 天
-            c_last = self._c[adv_id].get(c_seg, 0.0)
+            c_last = self._c[adv].get(c_seg, 0.0)
             if now - c_last < self.C_SEG_WINDOW and c_last > 0:
                 remain = self.C_SEG_WINDOW - (now - c_last)
-                reason = f"P0-1:C段重复 adv={adv_id} c_seg={c_seg} 剩余{remain/3600:.1f}h"
+                reason = f"P0-1:C段重复 adv={adv} c_seg={c_seg} 剩余{remain/3600:.1f}h"
                 _decision_log("P0-1 reject", reason=reason, ip=ip)
                 return False, reason
             # ASN 7 天
-            asn_last = self._asn[adv_id].get(asn_val, 0.0)
+            asn_last = self._asn[adv].get(asn_val, 0.0)
             if now - asn_last < self.ASN_WINDOW and asn_last > 0:
                 remain = self.ASN_WINDOW - (now - asn_last)
-                reason = f"P0-1:ASN重复 adv={adv_id} asn={asn_val} 剩余{remain/3600:.1f}h"
+                reason = f"P0-1:ASN重复 adv={adv} asn={asn_val} 剩余{remain/3600:.1f}h"
                 _decision_log("P0-1 reject", reason=reason, ip=ip)
                 return False, reason
             # FP 30 天
-            fp_last = self._fp[adv_id].get(fp, 0.0)
+            fp_last = self._fp[adv].get(fp, 0.0)
             if now - fp_last < self.FP_WINDOW and fp_last > 0:
                 remain = self.FP_WINDOW - (now - fp_last)
-                reason = f"P0-1:FP重复 adv={adv_id} fp_prefix={fp[:16]} 剩余{remain/86400:.1f}d"
+                reason = f"P0-1:FP重复 adv={adv} fp_prefix={fp[:16]} 剩余{remain/86400:.1f}d"
                 _decision_log("P0-1 reject", reason=reason)
                 return False, reason
 
             # 写入记录
-            self._c[adv_id][c_seg] = now
-            self._asn[adv_id][asn_val] = now
-            self._fp[adv_id][fp] = now
+            self._c[adv][c_seg] = now
+            self._asn[adv][asn_val] = now
+            self._fp[adv][fp] = now
             # 顺便清理 10% 过期项（避免内存无限涨）
             self._gc_locked()
         if persist:
             self._save()
-        _decision_log("P0-1 allow", adv_id=adv_id, c_seg=c_seg, asn=asn_val)
+        _decision_log("P0-1 allow", adv_id=adv, c_seg=c_seg, asn=asn_val)
         return True, ""
 
     def _gc_locked(self) -> None:
@@ -566,6 +593,23 @@ class _AdvIsolation:
         except Exception as e:
             _log.warning("adv_isolation 保存失败: %s", e)
 
+    @staticmethod
+    def derive_keys(
+        adv_id: Optional[str], device_id: str, ip: str, ua: Optional[str] = None
+    ) -> Tuple[str, str, str]:
+        """
+        纯函数（无锁、无状态、无副作用）：把 (adv_id, device_id, ip, ua)
+        归一为隔离键 (归一化 adv, device_key, ip_key)。
+
+        供单测验证：
+          - 不同 adv_id → 归一化 adv 不同 → (ip,adv)/(adv,device) 键空间不相交；
+          - 同 adv_id + 同 device/ip → 键相同 → 互斥判定命中。
+        """
+        adv = _normalize_adv_id(adv_id)
+        device_key = (device_id + (ua or "")).strip()[:96]
+        ip_key = (ip or "").strip()
+        return (adv, device_key, ip_key)
+
     def can_acquire(
         self,
         adv_id: str,
@@ -575,11 +619,11 @@ class _AdvIsolation:
         *,
         persist: bool = True,
     ) -> Tuple[bool, str]:
-        if not adv_id or not device_id:
-            return True, ""
-        device_key = (device_id + (ua or "")).strip()[:96]
-        ip_key = (ip or "").strip()
-        adv = str(adv_id).strip()
+        """
+        返回 (是否允许获取该设备×IP资源, 拒绝原因)。
+        adv_id 为空/占位时归一为 '__default_adv__'，隔离判定依然严格生效（不再直接放行）。
+        """
+        adv, device_key, ip_key = self.derive_keys(adv_id, device_id, ip, ua)
 
         now = time.time()
         with self._lock:
@@ -1351,6 +1395,19 @@ class _FingerprintSeed:
 fingerprint_seed = _FingerprintSeed()
 
 
+def get_stable_canvas_seed(fp_id: str) -> int:
+    """
+    便捷纯函数：为 fp_id 返回稳定的 canvas 噪声种子（替代硬编码 12345）。
+
+    保证：
+      - 同 fp_id → 相同种子（30 天内稳定，见 _FingerprintSeed.get）；
+      - 不同 fp_id → 绝大多数情况下不同种子（随机 31-bit 派生）；
+      - 返回值恒为正 31-bit 非零整数，避免退化为固定基线。
+    """
+    seed = fingerprint_seed.get(fp_id)
+    return (seed % 2 ** 31) or 1
+
+
 class _DNSDiversity:
     """
     每个国家一个 DNS 池：Google / Cloudflare / OpenDNS / Quad9 / 本地运营商（混合）。
@@ -1583,6 +1640,7 @@ __all__ = [
     "copula",
     "exposure_cv",
     "fingerprint_seed",
+    "get_stable_canvas_seed",
     "dns_diversity",
     "funnel",
     "cpl_simulator",

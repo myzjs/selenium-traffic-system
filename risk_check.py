@@ -629,7 +629,7 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
                 hit_risk_words.append(f"{kw}(in {k})")
     ua_risk["risk_keywords_hit"] = hit_risk_words
     ua_risk["ua_risk_flag"] = len(hit_risk_words) > 0
-    ua_risk["fixed_chrome_version"] = re.search(r"Chrome\/120\.0\.0\.0", ua) is not None
+    ua_risk["fixed_chrome_version"] = re.search(r"Chrome\/\d+\.0\.0\.0", ua) is not None
 
     report["http_header_deep"] = header_deep
     report["http_header"] = {
@@ -1005,7 +1005,7 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
         risk_detail.append(f"🔴 UA包含自动化关键词：{hit_risk_words}")
     if ua_risk.get("fixed_chrome_version"):
         score += RISK_WEIGHT["ua_version_fixed"]
-        risk_detail.append("🟠 UA使用固定Chrome120版本，多样性不足")
+        risk_detail.append("🟠 UA使用固定Chrome版本（.0.0.0冻结构建），多样性不足")
 
     # 请求头完整性
     if header_deep.get("missing_count", 0) > 3:
@@ -1132,7 +1132,7 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     report["risk_calc"]["risk_reason_list"] = risk_detail
     report["risk_calc"]["detection_dimensions"] = {
         "自动化检测": "✅" if not (auto_probe.get("nav_webdriver") or pw_residuals) else "❌",
-        "指纹伪装": "✅" if (canvas_data.get("has_noise_hook") and webgl_info.get("has_hook") and finger.get("battery_api_exist")) else "⚠️",
+        "指纹伪装": "✅" if (canvas_noise_present and not webgl_info.get("renderer_suspicious") and finger.get("battery_api_exist")) else "⚠️",
         "HTTP请求头": "✅" if header_deep.get("completeness_pct", 0) >= 90 and header_deep.get("ua_sec_ch_ua_version_match") else "⚠️",
         "设备一致性": "✅" if not dev_con.get("viewport_larger_than_screen") and hw_info.get("hc_reasonable") else "⚠️",
         "时区/地理": "✅" if tz_info.get("tz_match") else "❌",
@@ -1149,8 +1149,29 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
 # 攻防演练运行器
 # ============================================================
 
-_STEALTH_INIT_SCRIPT = r"""
+def build_stealth_script(seed: int) -> str:
+    """构建带一次性随机种子的反检测注入脚本。
+
+    同一 seed 输出稳定、不同 seed 输出不同：GPU/屏幕/插件/mediaDevices/
+    localStorage 键名等指纹硬编码值均基于 seed 确定性生成（mulberry32），
+    避免所有会话共享同一 "机器签名" 而被交叉验证识破。
+    """
+    seed = (int(seed) & 0x7fffffff) or 1
+    return r"""
 (function() {
+    // ===== 基于 seed 的一次性确定性 PRNG（mulberry32）=====
+    let _s = (__SEED__) >>> 0 || 1;
+    function _rnd() {
+        let t = _s += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+    function _pick(arr) { return arr[Math.floor(_rnd() * arr.length)]; }
+    function _hex(n) { let s = ''; const C = '0123456789abcdef'; for (let i = 0; i < n; i++) s += C[Math.floor(_rnd() * 16)]; return s; }
+    // 设置被hook函数的 length（真机参数个数，防 fn.length 探测识破）
+    function _setLen(fn, n) { try { Object.defineProperty(fn, 'length', {value: n}); } catch(e) {} }
+
     // ===== 中心 toString 原生伪装：防御 Function.prototype.toString.call(fn) 检测（CreepJS/AdSense 核心检测点）=====
     const _nativeMask = new Map();
     try {
@@ -1166,7 +1187,15 @@ _STEALTH_INIT_SCRIPT = r"""
     const _maskNative = function(fn, name) {
         try { _nativeMask.set(fn, 'function ' + name + '() { [native code] }'); } catch(e) {}
     };
-    try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true}); } catch(e) {}
+
+    // ===== navigator.webdriver -> false（真机为 false；保留 prototype getter 的 toString 伪装）=====
+    try {
+        const _webdriverGetter = function webdriver() { return false; };
+        _setLen(_webdriverGetter, 0);
+        _maskNative(_webdriverGetter, 'webdriver');
+        Object.defineProperty(Navigator.prototype, 'webdriver', {get: _webdriverGetter, configurable: true});
+    } catch(e) {}
+
     // 清除 cdc_ / 自动化残留
     try {
         for (const k of Object.getOwnPropertyNames(window)) {
@@ -1178,82 +1207,196 @@ _STEALTH_INIT_SCRIPT = r"""
         delete window.__fxdriver_evaluate; delete window.__driver_unwrapped;
         delete window._Selenium_IDE_Recorder; delete window.callSelenium;
     } catch(e) {}
-    // Canvas 噪声 hook（使用toString保护）
+
+    // ===== Canvas 噪声 hook（覆盖 getImageData + toDataURL；length 与真机一致，toString 原生伪装）=====
     (function() {
-        let _s = (Math.floor(Math.random()*2147483647)) >>> 0 || 1;
-        const _rnd = function(){ _s = (_s*1103515245+12345)&0x7fffffff; return _s/0x7fffffff; };
         const _orig = CanvasRenderingContext2D.prototype.getImageData;
-        const _hooked = function() {
+        const _hooked = function getImageData(sx, sy, sw, sh) {
             const d = _orig.apply(this, arguments);
             try { const a=d.data; for (let i=0;i<a.length;i+=4){ if(_rnd()<0.02){ const n=(_rnd()*3|0)-1; a[i]=Math.max(0,Math.min(255,a[i]+n)); a[i+1]=Math.max(0,Math.min(255,a[i+1]+n)); a[i+2]=Math.max(0,Math.min(255,a[i+2]+n)); } } } catch(e) {}
             return d;
         };
-        // 注册到中心 toString 伪装（同时防御 fn.toString() 与 Function.prototype.toString.call(fn)）
+        _setLen(_hooked, 4); // 真机 CanvasRenderingContext2D.getImageData.length === 4
         _maskNative(_hooked, 'getImageData');
         CanvasRenderingContext2D.prototype.getImageData = _hooked;
+
+        // toDataURL 噪声：先对 1x1 像素加噪再导出，保证 toDataURL 指纹每次不同
+        const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        const _hookedToDataURL = function toDataURL(type, quality) {
+            try {
+                if (this.width > 16 && this.height > 16) {
+                    const ctx = this.getContext('2d');
+                    if (ctx) {
+                        const img = ctx.getImageData(0, 0, 1, 1);
+                        const idx = Math.floor(_rnd() * 4);
+                        img.data[idx] = Math.max(0, Math.min(255, img.data[idx] + (_rnd() * 5 | 0)));
+                        ctx.putImageData(img, 0, 0);
+                    }
+                }
+            } catch(e) {}
+            return _origToDataURL.apply(this, arguments);
+        };
+        _setLen(_hookedToDataURL, 0); // 真机 HTMLCanvasElement.toDataURL.length === 0
+        _maskNative(_hookedToDataURL, 'toDataURL');
+        HTMLCanvasElement.prototype.toDataURL = _hookedToDataURL;
     })();
-    // WebGL hook（同样保护toString）- GPU指纹从真实设备池随机选择
+
+    // ===== WebGL hook：GPU 池按 UA 平台匹配（Windows/macOS/Linux），按 seed 随机选取 =====
     (function() {
-        // 真实 GPU 设备池（避免固定值被 AdSense 收录为指纹）
-        const _gpuPool = [
-            {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
-            {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)'},
-            {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M2, OpenGL 4.1)'},
-        ];
-        const _gpu = _gpuPool[Math.floor(Math.random() * _gpuPool.length)];
+        const _ua = navigator.userAgent || '';
+        let _platform = 'linux';
+        if (/Windows/i.test(_ua)) { _platform = 'windows'; }
+        else if (/Macintosh|Mac OS X/i.test(_ua)) { _platform = 'macos'; }
+        // 各平台真实 GPU 池（扩至几十个，避免固定值被 AdSense 收录为指纹）
+        const _POOLS = {
+            windows: [
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) HD Graphics 520 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) HD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(R) Plus Graphics 640 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(R) Plus Graphics 655 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(R) Xe MAX Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Super Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 570 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+                {vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 6800 Direct3D11 vs_5_0 ps_5_0, D3D11)'},
+            ],
+            macos: [
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M1, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M1 Max, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M1 Ultra, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M2, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M2 Pro, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M2 Max, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M3, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M3 Pro, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Apple M3 Max, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, Intel(R) Iris(TM) Plus Graphics 645, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, AMD Radeon Pro 5500M, OpenGL 4.1)'},
+                {vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, AMD Radeon Pro 5600M, OpenGL 4.1)'},
+            ],
+            linux: [
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa Intel(R) UHD Graphics 620, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa Intel(R) UHD Graphics 630, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa Intel(R) HD Graphics 520, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa Intel(R) Iris(R) Xe Graphics, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa AMD Radeon RX 580, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa AMD Radeon RX 6600, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (Mesa)', renderer: 'ANGLE (Mesa, Mesa AMD Radeon RX 6700 XT, OpenGL 4.5)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650, OpenGL 4.6)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 2060, OpenGL 4.6)'},
+                {vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060, OpenGL 4.6)'},
+            ],
+        };
+        const _pool = _POOLS[_platform] || _POOLS.linux;
+        const _gpu = _pool[Math.floor(_rnd() * _pool.length)];
         const patch = function(proto){
             if(!proto||!proto.getParameter) return;
             const o=proto.getParameter;
-            const hooked = function(p){
-                if(p===37445) return _gpu.vendor;
-                if(p===37446) return _gpu.renderer;
+            const hooked = function getParameter(p){
+                // 同时覆盖标准与 unmasked 常量，使 headless 下 RENDERER 探针不泄漏 SwiftShader
+                if (p === 7936 || p === 37445) return _gpu.vendor;   // VENDOR / UNMASKED_VENDOR_WEBGL
+                if (p === 7937 || p === 37446) return _gpu.renderer; // RENDERER / UNMASKED_RENDERER_WEBGL
                 return o.call(this,p);
             };
+            _setLen(hooked, 1);
             _maskNative(hooked, 'getParameter');
             proto.getParameter = hooked;
         };
         try { patch(WebGLRenderingContext.prototype); } catch(e) {}
         try { patch(WebGL2RenderingContext.prototype); } catch(e) {}
     })();
-    // 屏幕尺寸伪造（headless 默认 800x600 小于视口，视口>屏幕是典型机器人指纹）
+
+    // ===== 屏幕/视口/色深：按 seed 从分辨率池随机，视口与屏幕一致 =====
     try {
-        const _sw = 1920, _sh = 1080;
+        const _resPool = [[1280,720],[1366,768],[1440,900],[1536,864],[1600,900],[1680,1050],[1920,1080],[2560,1440]];
+        const _res = _pick(_resPool);
+        const _sw = _res[0], _sh = _res[1];
+        const _cd = _rnd() < 0.5 ? 24 : 32;
         Object.defineProperty(screen, 'width', {get: () => _sw, configurable: true});
         Object.defineProperty(screen, 'height', {get: () => _sh, configurable: true});
         Object.defineProperty(screen, 'availWidth', {get: () => _sw, configurable: true});
         Object.defineProperty(screen, 'availHeight', {get: () => (_sh - 40), configurable: true});
-        Object.defineProperty(screen, 'colorDepth', {get: () => 24, configurable: true});
+        Object.defineProperty(screen, 'colorDepth', {get: () => _cd, configurable: true});
+        // 视口与屏幕一致（防"视口>屏幕"机器人指纹）
+        Object.defineProperty(window, 'innerWidth', {get: () => _sw, configurable: true});
+        Object.defineProperty(window, 'innerHeight', {get: () => _sh, configurable: true});
     } catch(e) {}
-    // plugins 伪造
+
+    // ===== plugins：PluginArray 风格对象 + item/namedItem/refresh，数量 3-5 =====
     try {
-        if (!navigator.plugins || navigator.plugins.length === 0) {
-            Object.defineProperty(navigator, 'plugins', { get: () => [{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}], configurable: true });
+        const _pluginPool = [
+            ['Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'],
+            ['Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', ''],
+            ['Native Client', 'internal-nacl-plugin', ''],
+            ['Chromium PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'],
+            ['Chromium PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'],
+            ['Microsoft Edge PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', ''],
+            ['Widevine Content Decryption Module', 'widevinecdmadapter', 'Widevine Content Decryption Module'],
+            ['Google Hangouts', 'hangouts_plugin', 'Google Hangouts'],
+        ];
+        const _count = 3 + Math.floor(_rnd() * 3); // 3..5
+        const _arr = [];
+        for (let i = 0; i < _count; i++) {
+            const p = _pick(_pluginPool);
+            _arr.push({name: p[0], filename: p[1], description: p[2], length: 0});
         }
+        _arr.item = function item(i) { return (i >= 0 && i < this.length) ? this[i] : null; };
+        _arr.namedItem = function namedItem(n) { for (let j = 0; j < this.length; j++) { if (this[j].name === n) return this[j]; } return null; };
+        _arr.refresh = function refresh() {};
+        Object.defineProperty(_arr, 'length', {value: _count, writable: false, enumerable: false, configurable: false});
+        Object.defineProperty(navigator, 'plugins', {get: () => _arr, configurable: true});
+        // mimeTypes 配套（避免 plugins 非空而 mimeTypes 为空被识破）
+        try {
+            const _mime = [{type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format'}];
+            _mime.item = function item(i) { return (i >= 0 && i < this.length) ? this[i] : null; };
+            _mime.namedItem = function namedItem(n) { for (let j = 0; j < this.length; j++) { if (this[j].type === n) return this[j]; } return null; };
+            Object.defineProperty(_mime, 'length', {value: _mime.length, enumerable: false, configurable: false});
+            Object.defineProperty(navigator, 'mimeTypes', {get: () => _mime, configurable: true});
+        } catch(e) {}
     } catch(e) {}
-    // mediaDevices 伪造枚举
+
+    // ===== mediaDevices：deviceId/groupId 按 seed 生成长随机串 =====
     try {
-        if (navigator.mediaDevices) {
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+            const _mk = () => _hex(16);
+            const _gid = () => _hex(16);
             const _enumDev = function enumerateDevices() {
-                return Promise.resolve([{deviceId:'default',kind:'audioinput',label:'',groupId:'g1'},{deviceId:'cam01',kind:'videoinput',label:'',groupId:'g2'}]);
+                return Promise.resolve([
+                    {deviceId: 'default', kind: 'audioinput', label: '', groupId: _gid()},
+                    {deviceId: _mk(), kind: 'audioinput', label: '', groupId: _gid()},
+                    {deviceId: 'default', kind: 'videoinput', label: '', groupId: _gid()},
+                    {deviceId: _mk(), kind: 'videoinput', label: '', groupId: _gid()},
+                    {deviceId: _mk(), kind: 'audiooutput', label: '', groupId: _gid()}
+                ]);
             };
+            _setLen(_enumDev, 0);
             _maskNative(_enumDev, 'enumerateDevices');
             navigator.mediaDevices.enumerateDevices = _enumDev;
         }
     } catch(e) {}
-    // Battery API 注入（自动化浏览器默认禁用，必须mock）
+
+    // ===== Battery API 注入（length=0，toString 原生伪装）=====
     try {
         if (!('getBattery' in navigator)) {
-            const _batLevel = 0.35 + Math.random() * 0.65; // 0.35~1.0
-            const _batCharging = Math.random() > 0.5;
+            const _batLevel = 0.35 + _rnd() * 0.65; // 0.35~1.0
+            const _batCharging = _rnd() > 0.5;
             const _batMock = {
                 charging: _batCharging,
                 chargingTime: _batCharging ? 0 : Infinity,
-                dischargingTime: _batCharging ? Infinity : 3600 + Math.random() * 7200,
+                dischargingTime: _batCharging ? Infinity : 3600 + _rnd() * 7200,
                 level: Math.round(_batLevel * 100) / 100,
                 onchargingchange: null,
                 onchargingtimechange: null,
@@ -1263,22 +1406,28 @@ _STEALTH_INIT_SCRIPT = r"""
                 removeEventListener: function(){},
                 dispatchEvent: function(){ return true; }
             };
-            const _getBattery = function() { return Promise.resolve(_batMock); };
+            const _getBattery = function getBattery() { return Promise.resolve(_batMock); };
+            _setLen(_getBattery, 0);
             _maskNative(_getBattery, 'getBattery');
             Object.defineProperty(navigator, 'getBattery', {get: () => _getBattery, configurable: true});
         }
     } catch(e) {}
-    // localStorage 随机化（无条件注入，确保至少3项）
+
+    // ===== localStorage / cookie：键名与值均按 seed 随机（避免 _app_ 前缀被交叉验证识破）=====
     try {
-        if (!localStorage.getItem('_app_cid')) { localStorage.setItem('_app_cid', String(Math.floor(Math.random()*1e10))+'.'+String(Math.floor(Math.random()*1e10))); }
-        if (!localStorage.getItem('_app_pref')) { localStorage.setItem('_app_pref', 'theme=light'); }
-        if (!localStorage.getItem('_app_sid')) { localStorage.setItem('_app_sid', Math.random().toString(36).slice(2)); }
-        // 额外cookie随机化标记（模拟真实用户cookie行为）
-        if (document.cookie.indexOf('_sess_') === -1) {
-            document.cookie = '_sess_=' + Math.random().toString(36).slice(2,10) + '; path=/; max-age=3600';
+        const _k1 = '_v' + _hex(6);
+        if (!localStorage.getItem(_k1)) { localStorage.setItem(_k1, String(Math.floor(_rnd()*1e10)) + '.' + String(Math.floor(_rnd()*1e10))); }
+        const _k2 = '_v' + _hex(6);
+        if (!localStorage.getItem(_k2)) { localStorage.setItem(_k2, 'theme=' + _pick(['light','dark','system'])); }
+        const _k3 = '_v' + _hex(6);
+        if (!localStorage.getItem(_k3)) { localStorage.setItem(_k3, _hex(12)); }
+        const _ck = '_v' + _hex(6);
+        if (document.cookie.indexOf(_ck) === -1) {
+            document.cookie = _ck + '=' + _hex(8) + '; path=/; max-age=3600';
         }
     } catch(e) {}
-    // permissions.query 保护（减少CDP检测面）
+
+    // ===== permissions.query 保护（length=1，toString 原生伪装）=====
     try {
         const origQuery = navigator.permissions.query;
         const _hookedQuery = function query(params) {
@@ -1287,11 +1436,17 @@ _STEALTH_INIT_SCRIPT = r"""
             }
             return origQuery.call(this, params);
         };
+        _setLen(_hookedQuery, 1);
         _maskNative(_hookedQuery, 'query');
         navigator.permissions.query = _hookedQuery;
     } catch(e) {}
 })();
-"""
+""".replace("__SEED__", str(seed))
+
+
+# 兼容旧引用（sandbox_test / production_test / *_integration 直接引用该常量）：
+# 每次导入取随机种子，实现"一次一密"，避免所有会话共享同一机器签名。
+_STEALTH_INIT_SCRIPT = build_stealth_script(random.randint(0, 0x7fffffff))
 
 
 def _noop_log(msg):
@@ -1358,7 +1513,8 @@ def run_drill(target_url, headless=True, log_fn=None, progress_fn=None, with_ste
             )
             if with_stealth:
                 progress_fn(40, "注入反检测脚本")
-                context.add_init_script(_STEALTH_INIT_SCRIPT)
+                # 每次演练取随机种子，生成一次一密的机器签名，避免所有会话指纹雷同
+                context.add_init_script(build_stealth_script(random.randint(0, 0x7fffffff)))
                 log_fn("✅ 反检测注入脚本已加载")
 
             page = context.new_page()

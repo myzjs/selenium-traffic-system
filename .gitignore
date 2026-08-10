@@ -22,3 +22,6 @@ data/
 venv/
 trae_feedback/
 deploy_to_target.py
+# 运行时状态产物（测试运行生成，非代码）
+.risk_state/ip_dedup_state.json
+behavior_stats_result.json

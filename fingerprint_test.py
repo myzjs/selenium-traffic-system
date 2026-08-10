@@ -14,116 +14,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 # 与 app.py 一致的反检测注入脚本
-STEALTH_SCRIPT = r"""
-// WebRTC IP泄露防护
-(function() {
-    const _OrigRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-    if (!_OrigRTC) return;
-    const _SafeRTC = function(config) {
-        if (config && config.iceServers) { config.iceServers = []; }
-        const pc = new _OrigRTC(config);
-        const _origAddIce = pc.addIceCandidate.bind(pc);
-        pc.addIceCandidate = function(candidate) {
-            if (candidate && candidate.candidate) {
-                const c = candidate.candidate;
-                if (/((10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0))/.test(c)) {
-                    return Promise.resolve();
-                }
-            }
-            return _origAddIce(candidate);
-        };
-        pc.addEventListener('icecandidate', function(e) {
-            if (e.candidate && e.candidate.candidate) {
-                const c = e.candidate.candidate;
-                if (/((10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0))/.test(c)) {
-                    e.stopImmediatePropagation && e.stopImmediatePropagation();
-                }
-            }
-        });
-        return pc;
-    };
-    _SafeRTC.prototype = _OrigRTC.prototype;
-    Object.defineProperty(_SafeRTC, 'toString', {
-        value: function() { return 'function RTCPeerConnection() { [native code] }'; }
-    });
-    window.RTCPeerConnection = _SafeRTC;
-    if (window.webkitRTCPeerConnection) { window.webkitRTCPeerConnection = _SafeRTC; }
-})();
+import risk_check
 
-// 隐藏 navigator.webdriver
-Object.defineProperty(navigator, 'webdriver', { value: undefined, writable: false, configurable: false });
-
-// 修复 headless visibilityState
-Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
-Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
-const _origDispatchEvent = document.dispatchEvent.bind(document);
-document.dispatchEvent = function(event) {
-    if (event && event.type === 'visibilitychange') { return true; }
-    return _origDispatchEvent(event);
-};
-
-// 修复 permissions
-const _origQuery = Permissions.prototype.query;
-Permissions.prototype.query = function(descriptor) {
-    return _origQuery.call(this, descriptor).then(status => {
-        if (descriptor.name === 'notifications') {
-            Object.defineProperty(status, 'state', { get: () => 'prompt' });
-        }
-        return status;
-    });
-};
-
-// 修复 plugins
-Object.defineProperty(navigator, 'plugins', {
-    get: () => {
-        const plugins = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-        ];
-        plugins.refresh = () => {};
-        return plugins;
-    }
-});
-
-// 修复 languages
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-// Canvas 指纹噪声
-const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-HTMLCanvasElement.prototype.toDataURL = function(type) {
-    if (this.width > 16 && this.height > 16) {
-        const ctx = this.getContext('2d');
-        if (ctx) {
-            const style = ctx.fillStyle;
-            ctx.fillStyle = 'rgba(0,0,1,0.003)';
-            ctx.fillRect(0, 0, 1, 1);
-            ctx.fillStyle = style;
-        }
-    }
-    return _origToDataURL.apply(this, arguments);
-};
-
-// WebGL 指纹噪声
-const _origGetParam = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(param) {
-    if (param === 37445) return 'Intel Inc.';
-    if (param === 37446) return 'Intel Iris OpenGL Engine';
-    return _origGetParam.call(this, param);
-};
-
-// chrome 对象
-if (!window.chrome) {
-    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: { isInstalled: false } };
-}
-
-// connection
-if (!navigator.connection) {
-    Object.defineProperty(navigator, 'connection', {
-        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
-    });
-}
-"""
+# 复用 risk_check 的统一反检测脚本（与攻防演练/沙盒测试完全一致，消除三套脚本冲突）。
+# 每次调用取随机种子，生成一次一密的机器签名，避免所有会话指纹雷同。
+# 说明：WebRTC 内网 IP 保护由 selenium_bridge 启动时的 CDP 注入提供，此处不再重复实现。
+STEALTH_SCRIPT = risk_check.build_stealth_script(random.randint(0, 0x7fffffff))
 
 
 def run_fingerprint_tests(headless=True, proxy_url=None):

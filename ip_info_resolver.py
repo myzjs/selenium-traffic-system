@@ -99,8 +99,11 @@ def _normalize_country_code(country_raw: str) -> Optional[str]:
     return name_map.get(s.lower())
 
 
-def _http_get_json(url: str, timeout: float = 15.0) -> Optional[Dict]:
-    """简单 HTTP GET JSON（用 stdlib，避免新增依赖）"""
+def _http_get_json(url: str, timeout: float = 15.0, proxy_url: str = None) -> Optional[Dict]:
+    """简单 HTTP GET JSON（用 stdlib，避免新增依赖）
+
+    若传入 proxy_url 则走代理（避免向Geo服务商暴露本机真IP），否则直连并记录 warning。
+    """
     try:
         req = urllib.request.Request(
             url, headers={
@@ -109,22 +112,34 @@ def _http_get_json(url: str, timeout: float = 15.0) -> Optional[Dict]:
                 "Accept-Language": "en-US,en;q=0.9",
             }
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                logger.debug(f"HTTP 状态码错误 {resp.status} for {url}")
-                return None
-            return json.loads(resp.read().decode("utf-8"))
+        if proxy_url:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+            with opener.open(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    logger.debug(f"HTTP 状态码错误 {resp.status} for {url}")
+                    return None
+                return json.loads(resp.read().decode("utf-8"))
+        else:
+            logger.warning(f"[Geo] 未走代理直连Geo API: {url[:60]}（可能向Geo服务商暴露本机真IP）")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    logger.debug(f"HTTP 状态码错误 {resp.status} for {url}")
+                    return None
+                return json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError) as e:
         logger.debug(f"HTTP 请求失败 {url}: {e}")
         return None
 
 
-def _query_ip_api(ip: str) -> Dict:
+def _query_ip_api(ip: str, proxy_url: str = None) -> Dict:
     """ip-api.com 免费版：45 次/分钟，无需 key"""
     # ★ H1 修复: 增加 isp/asn/hosting/proxy 字段，让 HilltopAds IP 质量过滤真正生效
     # 注: ip-api 无 type 字段，用 hosting/proxy 布尔标记换算 ip_type
     data = _http_get_json(
-        f"https://ip-api.com/json/{ip}?fields=status,countryCode,country,timezone,query,isp,as,org,hosting,proxy"
+        f"https://ip-api.com/json/{ip}?fields=status,countryCode,country,timezone,query,isp,as,org,hosting,proxy",
+        proxy_url=proxy_url,
     )
     if data and data.get("status") == "success":
         _ip_type = None
@@ -146,9 +161,9 @@ def _query_ip_api(ip: str) -> Dict:
     return {}
 
 
-def _query_ipapi_co(ip: str) -> Dict:
+def _query_ipapi_co(ip: str, proxy_url: str = None) -> Dict:
     """ipapi.co 免费版：1000 次/天，无需 key"""
-    data = _http_get_json(f"https://ipapi.co/{ip}/json/")
+    data = _http_get_json(f"https://ipapi.co/{ip}/json/", proxy_url=proxy_url)
     if data and not data.get("error"):
         return {
             "country_code": data.get("country") or data.get("country_code"),
@@ -162,9 +177,9 @@ def _query_ipapi_co(ip: str) -> Dict:
     return {}
 
 
-def _query_ipinfo_io(ip: str) -> Dict:
+def _query_ipinfo_io(ip: str, proxy_url: str = None) -> Dict:
     """ipinfo.io 免费版：50000 次/月，无需 key"""
-    data = _http_get_json(f"https://ipinfo.io/{ip}/json")
+    data = _http_get_json(f"https://ipinfo.io/{ip}/json", proxy_url=proxy_url)
     if data and "country" in data:
         # ★ Bug#6 修复: ipinfo.io 顶层 type 是 IPv4/IPv6，连接类型在 asn.type（hosting/business/education/isp/...）
         _asn_block = data.get("asn") or {}
@@ -181,12 +196,13 @@ def _query_ipinfo_io(ip: str) -> Dict:
     return {}
 
 
-def resolve_ip_info(ip: str, proxy_ip_info: Optional[Dict] = None) -> Dict:
+def resolve_ip_info(ip: str, proxy_ip_info: Optional[Dict] = None, proxy_url: str = None) -> Dict:
     """
     主入口：获取 country/timezone/language 三要素
     
     :param ip: 出口 IP
     :param proxy_ip_info: 代理返回的 ip_info 字典（可选），如果代理本身就返回了三要素则不调外部 API
+    :param proxy_url: 可选代理 URL，用于走代理查询Geo API（避免向Geo服务商暴露本机真IP）
     :return: {success: bool, ip, country_code, country_name, timezone, language, source}
     """
     result = {
@@ -234,7 +250,7 @@ def resolve_ip_info(ip: str, proxy_ip_info: Optional[Dict] = None) -> Dict:
             ("ipapi.co", _query_ipapi_co),
             ("ipinfo.io", _query_ipinfo_io),
         ]:
-            api_data = api_func(ip)
+            api_data = api_func(ip, proxy_url=proxy_url)
             if not api_data:
                 continue
             if not result["country_code"] and api_data.get("country_code"):
