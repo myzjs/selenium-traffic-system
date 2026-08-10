@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.3 = 2026-08-10 第三次改动
-APP_VERSION = "26.8.10.3"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.4 = 2026-08-10 第四次改动
+APP_VERSION = "26.8.10.4"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2056,6 +2056,44 @@ config = {
     "log_mode": "test",
     "use_real_chrome": True,
     "proxy_timeout": 30,
+
+    # ★ P2-14 人群画像配置（让流量更像真实目标用户，降低谷歌风控识别率）
+    # 大白话：真人流量不是"什么人都有"，而是有明确的人群特征。
+    # 比如母婴网站 80% 是 25-35 岁女性，汽车网站 90% 是男性。
+    # 按目标画像比例生成流量，比完全随机更真实。
+    "demographics": {
+        # 是否启用人群画像（关闭则完全随机，和以前一样）
+        "enabled": False,
+        # 性别比例（加起来=100%）
+        "gender_ratio": {
+            "male": 50,    # 男性占比 %
+            "female": 50,  # 女性占比 %
+        },
+        # 年龄段分布（加起来=100%）
+        "age_distribution": {
+            "18-24": 15,
+            "25-34": 30,
+            "35-44": 25,
+            "45-54": 18,
+            "55+": 12,
+        },
+        # 设备类型分布（加起来=100%）
+        "device_ratio": {
+            "mobile": 60,   # 手机
+            "desktop": 40,  # 电脑
+        },
+        # 操作系统分布（桌面端）
+        "desktop_os_ratio": {
+            "windows": 65,
+            "macos": 25,
+            "linux": 10,
+        },
+        # 操作系统分布（移动端）
+        "mobile_os_ratio": {
+            "android": 70,
+            "ios": 30,
+        },
+    },
     "max_retries": 3,
 
     # ★ HilltopAds Pop-under 弹窗触发配置
@@ -2227,6 +2265,36 @@ pending_plan = None
 current_task_idx = -1  # 当前正在执行的任务索引（-1表示无）
 current_plan = None    # 当前执行的计划
 _last_executed_plan = None  # 保留最后一次执行的计划（供预览查看）
+
+# ★ P2-14 人群画像统计（全局计数器，供风控仪表盘展示画像匹配度）
+_demographics_stats = {
+    "total": 0,
+    "gender": {"male": 0, "female": 0},
+    "age_group": {"18-24": 0, "25-34": 0, "35-44": 0, "45-54": 0, "55+": 0},
+    "device_type": {"mobile": 0, "desktop": 0},
+    "os": {"windows": 0, "macos": 0, "linux": 0, "android": 0, "ios": 0},
+}
+_demo_stats_lock = _th_z.Lock()  # 复用已导入的 threading 模块
+
+
+def _record_demographics(demo: dict):
+    """记录一次指纹的人群画像，供仪表盘统计"""
+    if not demo:
+        return
+    with _demo_stats_lock:
+        _demographics_stats["total"] += 1
+        g = demo.get("gender")
+        if g in _demographics_stats["gender"]:
+            _demographics_stats["gender"][g] += 1
+        a = demo.get("age_group")
+        if a in _demographics_stats["age_group"]:
+            _demographics_stats["age_group"][a] += 1
+        d = demo.get("device_type")
+        if d in _demographics_stats["device_type"]:
+            _demographics_stats["device_type"][d] += 1
+        o = demo.get("os")
+        if o in _demographics_stats["os"]:
+            _demographics_stats["os"][o] += 1
 
 # ★ 断点恢复：计划进度持久化文件
 PLAN_PROGRESS_FILE = "plan_progress.json"
@@ -8584,6 +8652,49 @@ def qa_log_fingerprint_ip_consistency(ip_info, fingerprint):
     return checks
 
 
+def _pick_demographics(demo_config: dict) -> dict:
+    """★ P2-14 按人群画像配置随机选择性别/年龄段/设备类型/操作系统。
+    大白话：真人流量不是"什么人都有"，而是有明确的人群特征。
+    按目标画像比例生成，比完全随机更真实。
+
+    返回示例：
+    {"gender": "male", "age_group": "25-34", "device_type": "desktop", "os": "windows"}
+    """
+    if not demo_config or not demo_config.get("enabled", False):
+        # 未启用时返回 None，调用方回退到完全随机
+        return None
+
+    def _weighted_choice(ratio_dict: dict):
+        """按权重字典随机选择 key"""
+        items = [(k, max(0, int(v or 0))) for k, v in ratio_dict.items()]
+        total = sum(w for _, w in items)
+        if total <= 0:
+            return items[0][0] if items else None
+        r = random.randint(1, total)
+        acc = 0
+        for k, w in items:
+            acc += w
+            if r <= acc:
+                return k
+        return items[-1][0] if items else None
+
+    gender = _weighted_choice(demo_config.get("gender_ratio", {})) or "male"
+    age_group = _weighted_choice(demo_config.get("age_distribution", {})) or "25-34"
+    device_type = _weighted_choice(demo_config.get("device_ratio", {})) or "desktop"
+
+    if device_type == "desktop":
+        os_name = _weighted_choice(demo_config.get("desktop_os_ratio", {})) or "windows"
+    else:
+        os_name = _weighted_choice(demo_config.get("mobile_os_ratio", {})) or "android"
+
+    return {
+        "gender": gender,
+        "age_group": age_group,
+        "device_type": device_type,
+        "os": os_name,
+    }
+
+
 def generate_fingerprint(ip_info):
     """根据 IP 信息生成完全匹配的浏览器指纹。
 
@@ -8820,6 +8931,12 @@ def generate_fingerprint(ip_info):
     else:
         canvas_noise_seed = random.randint(1, 2**31 - 1)
     
+    # ★ P2-14 人群画像：按配置比例生成性别/年龄/设备类型/OS
+    # （未启用时为 None，完全随机，和以前一样）
+    _demo = _pick_demographics(config.get("demographics", {}))
+    if _demo:
+        _record_demographics(_demo)
+    
     return {
         "fingerprint_id": str(uuid.uuid4()),
         "user_agent": user_agent,
@@ -8838,7 +8955,9 @@ def generate_fingerprint(ip_info):
         "device_memory": random.choice([4, 8, 16, 32]),
         "battery_level": round(random.uniform(0.35, 1.0), 2),
         "orientation_type": "landscape-primary" if random.random() < 0.85 else "portrait-primary",
-        "orientation_angle": 0
+        "orientation_angle": 0,
+        # ★ 人群画像字段（供后续行为仿真/仪表盘使用）
+        "demographics": _demo,
     }
 
 def simulate_human_behavior(page, ad_selector, config):
@@ -18143,7 +18262,31 @@ def api_risk_dashboard():
             "low_dwell_pct": trend_low_dwell,
             "high_bounce_pct": trend_high_bounce,
             "ctr_pct": trend_ctr,
-        }
+        },
+        # ★ P2-14 人群画像统计（实际流量分布 vs 目标配置）
+        "demographics": {
+            "enabled": config.get("demographics", {}).get("enabled", False),
+            "target": config.get("demographics", {}),
+            "actual": {
+                "total": _demographics_stats["total"],
+                "gender": {
+                    k: round(v / _demographics_stats["total"] * 100, 1) if _demographics_stats["total"] else 0
+                    for k, v in _demographics_stats["gender"].items()
+                },
+                "age_group": {
+                    k: round(v / _demographics_stats["total"] * 100, 1) if _demographics_stats["total"] else 0
+                    for k, v in _demographics_stats["age_group"].items()
+                },
+                "device_type": {
+                    k: round(v / _demographics_stats["total"] * 100, 1) if _demographics_stats["total"] else 0
+                    for k, v in _demographics_stats["device_type"].items()
+                },
+                "os": {
+                    k: round(v / _demographics_stats["total"] * 100, 1) if _demographics_stats["total"] else 0
+                    for k, v in _demographics_stats["os"].items()
+                },
+            },
+        },
     })
 
 
