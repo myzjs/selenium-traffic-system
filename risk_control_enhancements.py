@@ -1026,6 +1026,199 @@ class _MotionSimulator:
 motion = _MotionSimulator()
 
 
+def build_sensor_dynamic_script(seed: int) -> str:
+    """
+    P2-13 传感器动态仿真 JS 生成器。
+
+    生成一段可直接注入浏览器 init_script 的 JS 字符串，实现：
+      1. Battery API：每 30~60 秒随机更新 level（缓慢下降），
+         并派发 levelchange / chargingchange 事件；
+         重写 addEventListener / removeEventListener 真实维护监听列表。
+      2. DeviceMotionEvent：以 ~60Hz（16ms 间隔）持续派发 devicemotion 事件，
+         accelerationIncludingGravity 含随机游走 + 高频噪声。
+      3. 监听器机制：BatteryManager 与 window 的 addEventListener/removeEventListener
+         均真实维护列表并派发事件。
+
+    seed 用于确定性生成初始参数（初始电量、初始充电状态、随机游走初值等），
+    保证同 seed 输出稳定。
+
+    注意：本函数仅生成纯 JS 字符串，不涉及浏览器启动。
+    """
+    rng = random.Random(int(seed))
+    init_level = round(rng.uniform(0.40, 0.98), 4)
+    init_charging = rng.random() < 0.15
+    init_bx = round(rng.uniform(-0.5, 0.5), 4)
+    init_by = round(rng.uniform(-0.5, 0.5), 4)
+    init_bz = round(rng.uniform(-0.5, 0.5), 4)
+    decay_per_hour = round(rng.uniform(0.08, 0.15), 4)
+    rng_seed = rng.randint(1, 2**31 - 1)
+
+    js = f"""
+(function() {{
+  // ---------- 简易确定性伪随机（基于 seed） ----------
+  var _rngState = {rng_seed};
+  function _rand() {{
+    _rngState = (_rngState * 1664525 + 1013904223) >>> 0;
+    return _rngState / 4294967296;
+  }}
+  function _randRange(a, b) {{ return a + _rand() * (b - a); }}
+  function _gauss() {{
+    // Box-Muller
+    var u = 0, v = 0;
+    while (u === 0) u = _rand();
+    while (v === 0) v = _rand();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }}
+
+  // ---------- Battery API 动态仿真 ----------
+  var _battery = {{
+    level: {init_level},
+    charging: {str(init_charging).lower()},
+    chargingTime: {init_charging and '3600' or 'Infinity'},
+    dischargingTime: {init_charging and 'Infinity' or '18000'},
+    _listeners: {{ levelchange: [], chargingchange: [], chargingtimechange: [], dischargingtimechange: [] }},
+    addEventListener: function(type, fn) {{
+      if (!fn || typeof fn !== 'function') return;
+      if (!this._listeners[type]) this._listeners[type] = [];
+      if (this._listeners[type].indexOf(fn) === -1) this._listeners[type].push(fn);
+    }},
+    removeEventListener: function(type, fn) {{
+      if (!this._listeners[type]) return;
+      var idx = this._listeners[type].indexOf(fn);
+      if (idx !== -1) this._listeners[type].splice(idx, 1);
+    }},
+    dispatchEvent: function(evt) {{
+      var list = this._listeners[evt.type] || [];
+      for (var i = 0; i < list.length; i++) {{
+        try {{ list[i].call(this, evt); }} catch (e) {{ /* 忽略监听器错误 */ }}
+      }}
+      // 兼容 onxxx 回调
+      var onHandler = this['on' + evt.type];
+      if (typeof onHandler === 'function') {{
+        try {{ onHandler.call(this, evt); }} catch (e) {{}}
+      }}
+      return true;
+    }}
+  }};
+
+  function _makeBatteryEvent(type) {{
+    var evt = document.createEvent('Event');
+    evt.initEvent(type, false, false);
+    return evt;
+  }}
+
+  var _decayPerHour = {decay_per_hour};
+  var _lastBatteryTick = Date.now();
+  function _batteryTick() {{
+    var now = Date.now();
+    var dtHours = (now - _lastBatteryTick) / 3600000;
+    _lastBatteryTick = now;
+    var oldLevel = _battery.level;
+    var oldCharging = _battery.charging;
+
+    if (_battery.charging) {{
+      _battery.level = Math.min(1.0, _battery.level + _randRange(0.002, 0.01) + _decayPerHour * dtHours);
+      if (_battery.level >= 0.99) {{
+        _battery.charging = false;
+        _battery.chargingTime = Infinity;
+        _battery.dischargingTime = 18000;
+      }}
+    }} else {{
+      var decay = _decayPerHour * dtHours + _randRange(0, 0.004);
+      if (_battery.level < 0.20) decay *= 0.5;
+      _battery.level = Math.max(0.02, _battery.level - decay);
+      // 8% 概率切换到充电状态（仅当电量 < 85%）
+      if (_rand() < 0.08 && _battery.level < 0.85) {{
+        _battery.charging = true;
+        _battery.chargingTime = 3600;
+        _battery.dischargingTime = Infinity;
+      }}
+    }}
+
+    if (Math.abs(_battery.level - oldLevel) > 1e-6) {{
+      _battery.dispatchEvent(_makeBatteryEvent('levelchange'));
+    }}
+    if (_battery.charging !== oldCharging) {{
+      _battery.dispatchEvent(_makeBatteryEvent('chargingchange'));
+    }}
+
+    // 下一次 30~60 秒后
+    var nextDelay = _randRange(30000, 60000);
+    setTimeout(_batteryTick, nextDelay);
+  }}
+  // 首次延迟 2~5 秒启动
+  setTimeout(_batteryTick, _randRange(2000, 5000));
+
+  // 覆盖 navigator.getBattery（若存在则替换，不存在则 polyfill）
+  if (navigator.getBattery) {{
+    navigator.getBattery = function() {{
+      return Promise.resolve(_battery);
+    }};
+  }} else {{
+    navigator.getBattery = function() {{
+      return Promise.resolve(_battery);
+    }};
+  }}
+
+  // ---------- DeviceMotion 动态仿真 ----------
+  var _bx = {init_bx};
+  var _by = {init_by};
+  var _bz = {init_bz};
+
+  function _clamp(v, lo, hi) {{ return v < lo ? lo : (v > hi ? hi : v); }}
+
+  function _emitMotionEvent() {{
+    // 低频随机游走
+    _bx = _clamp(_bx + _randRange(-0.12, 0.12), -2.5, 2.5);
+    _by = _clamp(_by + _randRange(-0.12, 0.12), -2.5, 2.5);
+    _bz = _clamp(_bz + _randRange(-0.12, 0.12), -2.5, 2.5);
+    // 高频高斯噪声
+    var gx = _gauss() * 0.25;
+    var gy = _gauss() * 0.25;
+    var gz = _gauss() * 0.3 + 0.35;
+
+    var accel = {{
+      x: null, y: null, z: null
+    }};
+    var accelGrav = {{
+      x: +(_bx + gx).toFixed(4),
+      y: +(_by + gy).toFixed(4),
+      z: +(_bz + gz + 9.8).toFixed(4)
+    }};
+    var rotRate = {{
+      alpha: +(_gauss() * 0.5).toFixed(4),
+      beta: +(_gauss() * 0.5).toFixed(4),
+      gamma: +(_gauss() * 0.5).toFixed(4)
+    }};
+
+    var evt;
+    try {{
+      evt = new DeviceMotionEvent('devicemotion', {{
+        acceleration: accel,
+        accelerationIncludingGravity: accelGrav,
+        rotationRate: rotRate,
+        interval: 16
+      }});
+    }} catch (e) {{
+      // 兼容旧浏览器
+      evt = document.createEvent('Event');
+      evt.initEvent('devicemotion', false, false);
+      evt.acceleration = accel;
+      evt.accelerationIncludingGravity = accelGrav;
+      evt.rotationRate = rotRate;
+      evt.interval = 16;
+    }}
+
+    window.dispatchEvent(evt);
+  }}
+
+  // 以 ~60Hz 派发
+  setInterval(_emitMotionEvent, 16);
+}})();
+"""
+    return js
+
+
 # ========================================================================== #
 #  P1-4: GA4 / AdSense / ActiveView 自检
 # ========================================================================== #
@@ -1645,6 +1838,7 @@ __all__ = [
     "funnel",
     "cpl_simulator",
     "icr_monitor",
+    "build_sensor_dynamic_script",
 ]
 
 

@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pytest-contract
+        name: Contract Tests (pytest)
+        entry: python3 -m pytest tests/test_contract.py -q
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]
+        description: 运行 34 项契约测试，防止接口契约被破坏

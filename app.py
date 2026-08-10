@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.2 = 2026-08-10 第二次改动
-APP_VERSION = "26.8.10.2"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.3 = 2026-08-10 第三次改动
+APP_VERSION = "26.8.10.3"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -452,6 +452,40 @@ def generate_burst_hours(num_tasks):
     return sorted(hours[:num_tasks])  # 确保不超过 num_tasks
 
 
+def generate_power_law_hours(num_tasks):
+    """幂律（帕累托）分布模型：重尾长尾，少数高峰时段承载大部分流量，
+    多数时段流量稀疏，模拟真实网站"二八定律"的访问节奏。
+
+    实现方式：以帕累托分布生成"距高峰中心的小时偏移量"，
+    再随机旋转高峰中心到 0-24 小时内任意位置，
+    形成"一个主峰 + 长尾拖尾"的典型重尾形态。
+    """
+    hours = []
+    if num_tasks <= 0:
+        return []
+    # 帕累托形状参数 alpha：越小尾部越重（1.5 典型重尾）
+    alpha = random.uniform(1.3, 2.0)
+    # 高峰中心（随机落在 6-22 点之间，符合人类活动时段）
+    peak_center = random.uniform(6, 22)
+    # 尺度参数：决定主峰的集中程度（小时）
+    scale = random.uniform(0.3, 1.0)
+
+    for _ in range(num_tasks):
+        # 帕累托采样：x = scale * u^(-1/alpha), u ~ U(0,1)
+        u = random.random()
+        if u <= 0:
+            u = 1e-12
+        offset = scale * (u ** (-1.0 / alpha))
+        # 随机方向：一半在峰前，一半在峰后（形成对称长尾）
+        if random.random() < 0.5:
+            h = peak_center + offset
+        else:
+            h = peak_center - offset
+        hours.append(clamp_hour(h))
+
+    return sorted(hours)
+
+
 def get_weekend_holiday_multiplier(date_obj):
     """根据日期返回流量倍率（模拟真实网站的周末/节假日流量波动）
     
@@ -490,7 +524,8 @@ MODEL_FUNCTIONS = {
     "gamma": generate_gamma_hours,
     "poisson": generate_poisson_hours,
     "bimodal": generate_bimodal_hours,
-    "burst": generate_burst_hours
+    "burst": generate_burst_hours,
+    "power_law": generate_power_law_hours
 }
 
 def get_site_age_category(site_creation_date_str):
@@ -1316,6 +1351,15 @@ def generate_daily_tasks(cfg):
             continue
 
         full_day_tasks = random.randint(day_min, day_max)
+        # ★ P1-9: 随机大波动（打破固定区间平滑的机器特征）
+        # 15% 概率触发高峰日（任务量 ×1.5-2.5），10% 概率触发低谷日（×0.3-0.6）
+        _volatility_roll = random.random()
+        if _volatility_roll < 0.15:
+            _peak_mult = random.uniform(1.5, 2.5)
+            full_day_tasks = int(round(full_day_tasks * _peak_mult))
+        elif _volatility_roll < 0.25:
+            _valley_mult = random.uniform(0.3, 0.6)
+            full_day_tasks = max(1, int(round(full_day_tasks * _valley_mult)))
         # 周末/节假日流量调整（模拟真实网站流量波动）
         _day_date = day_local_start.date() if hasattr(day_local_start, 'date') else day_local_start
         _wk_multiplier = get_weekend_holiday_multiplier(_day_date)
@@ -3866,6 +3910,7 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
 
         # 1.6 ★ P1-5: 广告交互前停留≥8秒（模拟阅读行为，防止页面刚加载就点广告）
         _ad_min_page_stay = config.get("ad_min_page_stay", 8.0)  # 最少停留秒数
+        _page_stay_sec = 0.0
         try:
             _page_load_ts = page.evaluate("performance.timing.navigationStart || performance.timeOrigin") or 0
             if _page_load_ts > 0:
@@ -3876,9 +3921,34 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         except Exception:
             pass  # 获取navigationStart失败不阻断流程
 
-        # 2. 概率掷骰
+        # 2. ★ P0-6: 点击节奏对数正态化（替代固定均匀概率）
+        # 模拟真人"先阅读→看到广告→考虑→点击"的节奏：
+        # 页面刚加载时点击率低，随时间上升到峰值后再缓慢下降，
+        # 整体呈对数正态分布形态（前低后高再衰减）。
         ad_click_prob_cfg = config.get("ad_click_prob", {"min": 0.005, "max": 0.05})
-        prob = random.uniform(float(ad_click_prob_cfg.get("min", 0.005)), float(ad_click_prob_cfg.get("max", 0.05)))
+        _base_min = float(ad_click_prob_cfg.get("min", 0.005))
+        _base_max = float(ad_click_prob_cfg.get("max", 0.05))
+        _base_prob = random.uniform(_base_min, _base_max)
+
+        if _page_stay_sec > 0:
+            # 对数正态 PDF 形状参数：峰值约在 mu 秒处，sigma 控制宽度
+            # 典型阅读-决策节奏：峰值约 25-40 秒，sigma 约 0.6
+            import math as _math
+            _ln_mu = _math.log(random.uniform(25.0, 40.0))  # 峰值位置（秒）
+            _ln_sigma = random.uniform(0.5, 0.7)
+            _t = max(_page_stay_sec, 0.1)
+            # 对数正态 PDF（已归一化到峰值为 1，作为动态倍率）
+            _pdf = (1.0 / (_t * _ln_sigma * _math.sqrt(2 * _math.pi))) * \
+                   _math.exp(-((_math.log(_t) - _ln_mu) ** 2) / (2 * _ln_sigma ** 2))
+            _peak_pdf = (1.0 / (_math.exp(_ln_mu) * _ln_sigma * _math.sqrt(2 * _math.pi)))
+            _dynamic_ratio = _pdf / _peak_pdf if _peak_pdf > 0 else 1.0
+            # 动态倍率范围：0.15（低谷）~ 1.0（峰值）
+            _dynamic_ratio = max(0.15, min(1.0, _dynamic_ratio))
+            prob = _base_prob * _dynamic_ratio
+            log.debug(f"[广告点击][对数正态] 停留{_page_stay_sec:.1f}s 倍率={_dynamic_ratio:.3f} 概率={prob:.4f}")
+        else:
+            prob = _base_prob
+
         if random.random() >= prob:
             return False, current_x, current_y
 
@@ -17294,6 +17364,297 @@ def api_status():
         app.logger.error(f"api_status 异常: {e}\n{traceback.format_exc()}")
         return jsonify({"running": False, "total": 0, "success": 0, "fail": 0})
 
+
+@app.route('/api/debug/contract_probe')
+def api_debug_contract_probe():
+    """契约探针：返回各核心模块接口的「预期字段 / 实际字段 / 缺失字段」对比。
+
+    默认关闭（安全契约：不泄漏内部结构），需设置环境变量 ENABLE_CONTRACT_PROBE=true 才开放，
+    否则返回 404。参考 Coin Trading 的 /api/debug/panel 模式。
+    """
+    if os.getenv("ENABLE_CONTRACT_PROBE", "false").lower() != "true":
+        return jsonify({"success": False, "message": "契约探针已关闭（ENABLE_CONTRACT_PROBE）"}), 404
+
+    import inspect as _inspect
+
+    def _func_sig(mod, name):
+        """返回函数参数名列表（不含 self），不存在则返回 None。"""
+        fn = getattr(mod, name, None)
+        if fn is None or not callable(fn):
+            return None
+        try:
+            sig = _inspect.signature(fn)
+            return list(sig.parameters.keys())
+        except (ValueError, TypeError):
+            return []
+
+    def _return_type_hint(mod, name):
+        fn = getattr(mod, name, None)
+        if fn is None:
+            return None
+        try:
+            sig = _inspect.signature(fn)
+            return str(sig.return_annotation) if sig.return_annotation is not _inspect.Signature.empty else "untyped"
+        except (ValueError, TypeError):
+            return "untyped"
+
+    probe = {}
+
+    # ---- 1. ip_provider ----
+    try:
+        import ip_provider as _ip_mod
+        ip_funcs_expected = {
+            "is_high_risk_ip": {"params": ["ip_type"], "returns": "bool"},
+            "check_ip_used_recently": {"params": ["ip"], "returns": "bool"},
+            "record_ip_use": {"params": ["ip"], "returns": None},
+            "get_used_ips_count": {"params": [], "returns": "int"},
+            "_load_dedup_state": {"params": [], "returns": None},
+            "_save_dedup_state": {"params": ["force"], "returns": None},
+        }
+        ip_actual = {}
+        ip_missing = []
+        for fname, spec in ip_funcs_expected.items():
+            actual_params = _func_sig(_ip_mod, fname)
+            actual_ret = _return_type_hint(_ip_mod, fname)
+            if actual_params is None:
+                ip_missing.append(fname)
+            else:
+                ip_actual[fname] = {
+                    "params": actual_params,
+                    "return_hint": actual_ret,
+                    "params_match": set(actual_params) == set(spec["params"]),
+                }
+        probe["ip_provider"] = {
+            "预期函数": list(ip_funcs_expected.keys()),
+            "实际函数详情": ip_actual,
+            "缺失函数": ip_missing,
+            "high_risk_types_预期": ["datacenter", "proxy", "vpn", "hosting", "business"],
+            "high_risk_types_实际": sorted(getattr(_ip_mod, "HIGH_RISK_TYPES", set())),
+        }
+    except Exception as e:
+        probe["ip_provider"] = {"error": str(e)}
+
+    # ---- 2. risk_control_enhancements ----
+    try:
+        import risk_control_enhancements as _rce
+        rce_result = {}
+
+        # get_stable_canvas_seed
+        seed_params = _func_sig(_rce, "get_stable_canvas_seed")
+        seed_ret = _return_type_hint(_rce, "get_stable_canvas_seed")
+        seed_val = _rce.get_stable_canvas_seed("probe-test-fp") if seed_params is not None else None
+        rce_result["get_stable_canvas_seed"] = {
+            "存在": seed_params is not None,
+            "params": seed_params or [],
+            "return_hint": seed_ret,
+            "示例返回类型": type(seed_val).__name__ if seed_val is not None else None,
+            "示例返回值>0": (seed_val > 0) if isinstance(seed_val, int) else None,
+            "在__all__中": "get_stable_canvas_seed" in getattr(_rce, "__all__", []),
+        }
+
+        # dns_diversity.pick_resolver
+        dns_mod = getattr(_rce, "dns_diversity", None)
+        if dns_mod is not None:
+            dns_params = _func_sig(dns_mod, "pick_resolver")
+            dns_sample = dns_mod.pick_resolver("US") if dns_params is not None else None
+            rce_result["dns_diversity.pick_resolver"] = {
+                "存在": dns_params is not None,
+                "params": dns_params or [],
+                "返回类型": type(dns_sample).__name__ if dns_sample is not None else None,
+                "返回长度": len(dns_sample) if isinstance(dns_sample, list) else None,
+                "元素非空": all(isinstance(x, str) and x.strip() for x in dns_sample) if isinstance(dns_sample, list) else None,
+            }
+        else:
+            rce_result["dns_diversity.pick_resolver"] = {"存在": False, "缺失原因": "dns_diversity 子模块不存在"}
+
+        # isolate_pool.allow（用临时状态目录，不落盘）
+        pool_cls = getattr(_rce, "_IsolatePool", None)
+        if pool_cls is not None:
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                with _patch_rce_state_dir(_rce, td):
+                    pool = pool_cls()
+                    out = pool.allow(
+                        adv_id="probe-adv", ip="203.0.113.10",
+                        fingerprint="probe-fp", ua="probe-ua", asn="AS15169",
+                        persist=False,
+                    )
+                    rce_result["isolate_pool.allow"] = {
+                        "存在": True,
+                        "返回类型": type(out).__name__,
+                        "返回长度": len(out) if isinstance(out, tuple) else None,
+                        "元素类型": [type(x).__name__ for x in out] if isinstance(out, tuple) else None,
+                        "二元组(bool,str)": (
+                            isinstance(out, tuple) and len(out) == 2
+                            and isinstance(out[0], bool) and isinstance(out[1], str)
+                        ),
+                    }
+        else:
+            rce_result["isolate_pool.allow"] = {"存在": False}
+
+        # adv_isolation.can_acquire（用临时状态目录，不落盘）
+        adv_cls = getattr(_rce, "_AdvIsolation", None)
+        if adv_cls is not None:
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                with _patch_rce_state_dir(_rce, td):
+                    iso = adv_cls()
+                    out = iso.can_acquire(
+                        adv_id="probe-adv", device_id="probe-dev",
+                        ip="203.0.113.20", ua="probe-ua", persist=False,
+                    )
+                    rce_result["adv_isolation.can_acquire"] = {
+                        "存在": True,
+                        "返回类型": type(out).__name__,
+                        "返回长度": len(out) if isinstance(out, tuple) else None,
+                        "元素类型": [type(x).__name__ for x in out] if isinstance(out, tuple) else None,
+                        "二元组(bool,str)": (
+                            isinstance(out, tuple) and len(out) == 2
+                            and isinstance(out[0], bool) and isinstance(out[1], str)
+                        ),
+                    }
+        else:
+            rce_result["adv_isolation.can_acquire"] = {"存在": False}
+
+        probe["risk_control_enhancements"] = rce_result
+    except Exception as e:
+        probe["risk_control_enhancements"] = {"error": str(e)}
+
+    # ---- 3. seo_query_module ----
+    try:
+        from seo_query_module import get_seo_query, REGION_SEARCH_ENGINE_MAP
+        q = get_seo_query()
+        seo_result = {}
+
+        # get_local_search_engine_url
+        region_samples = {}
+        for cc in ("JP", "DE", "CN"):
+            url = q.get_local_search_engine_url(cc)
+            region_samples[cc] = {
+                "返回值": url,
+                "以http开头": url.startswith("http") if isinstance(url, str) else False,
+                "含地域特征": (
+                    ("co.jp" in url) if cc == "JP" else
+                    ("google.de" in url) if cc == "DE" else
+                    ("baidu" in url) if cc == "CN" else False
+                ),
+            }
+        seo_result["get_local_search_engine_url"] = {
+            "存在": True,
+            "params": _func_sig(q, "get_local_search_engine_url") or [],
+            "地域样例": region_samples,
+        }
+
+        # generate_referer_for_region
+        ref = q.generate_referer_for_region("JP", "ja", keyword="テスト")
+        seo_result["generate_referer_for_region"] = {
+            "存在": True,
+            "params": _func_sig(q, "generate_referer_for_region") or [],
+            "返回类型": type(ref).__name__ if ref is not None else "NoneType",
+            "合法URL": ref.startswith(("http://", "https://")) if isinstance(ref, str) else (ref is None),
+        }
+
+        # REGION_SEARCH_ENGINE_MAP 常量契约
+        expected_map = {"JP": "co.jp", "DE": "google.de", "CN": "baidu"}
+        map_ok = all(
+            frag in REGION_SEARCH_ENGINE_MAP.get(cc, "")
+            for cc, frag in expected_map.items()
+        )
+        seo_result["REGION_SEARCH_ENGINE_MAP"] = {
+            "预期关键映射": expected_map,
+            "实际映射": {cc: REGION_SEARCH_ENGINE_MAP.get(cc, "") for cc in expected_map},
+            "契约满足": map_ok,
+        }
+
+        probe["seo_query_module"] = seo_result
+    except Exception as e:
+        probe["seo_query_module"] = {"error": str(e)}
+
+    # ---- 4. ip_info_resolver ----
+    try:
+        from ip_info_resolver import resolve_ip_info
+        expected_keys = {"success", "ip", "country_code", "country_name", "timezone", "language"}
+        proxy_info = {"country": "JP", "timezone": "Asia/Tokyo", "language": "ja-JP"}
+        result = resolve_ip_info("203.0.113.88", proxy_ip_info=proxy_info)
+        actual_keys = set(result.keys()) if isinstance(result, dict) else set()
+        probe["ip_info_resolver"] = {
+            "resolve_ip_info": {
+                "存在": True,
+                "params": _func_sig(__import__("ip_info_resolver"), "resolve_ip_info") or [],
+                "预期字段": sorted(expected_keys),
+                "实际字段": sorted(actual_keys),
+                "缺失字段": sorted(expected_keys - actual_keys),
+                "多余字段": sorted(actual_keys - expected_keys),
+                "示例返回_success": result.get("success"),
+                "示例返回_country_code": result.get("country_code"),
+                "示例返回_timezone": result.get("timezone"),
+                "示例返回_language": result.get("language"),
+            }
+        }
+    except Exception as e:
+        probe["ip_info_resolver"] = {"error": str(e)}
+
+    # ---- 5. popunder_trigger ----
+    try:
+        import popunder_trigger as _pt
+        expected_funcs = [
+            "trigger_popunder",
+            "is_ip_safe_for_hilltopads",
+            "should_trigger_for_network",
+            "_pick_safe_coordinates",
+            "self_test",
+            "_inject_popunder_stealth",
+        ]
+        actual = {}
+        missing = []
+        for fname in expected_funcs:
+            fn = getattr(_pt, fname, None)
+            if fn is None or not callable(fn):
+                missing.append(fname)
+            else:
+                actual[fname] = {
+                    "存在": True,
+                    "params": _func_sig(_pt, fname) or [],
+                    "return_hint": _return_type_hint(_pt, fname),
+                }
+        probe["popunder_trigger"] = {
+            "预期导出函数": expected_funcs,
+            "实际函数详情": actual,
+            "缺失函数": missing,
+            "模块可导入": True,
+        }
+    except Exception as e:
+        probe["popunder_trigger"] = {"error": str(e)}
+
+    # 汇总统计
+    total_modules = len(probe)
+    modules_ok = sum(
+        1 for m, data in probe.items()
+        if isinstance(data, dict) and "error" not in data
+    )
+    summary = {
+        "模块总数": total_modules,
+        "正常模块数": modules_ok,
+        "异常模块数": total_modules - modules_ok,
+        "探针版本": "1.0",
+        "生成时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    return jsonify({
+        "success": True,
+        "summary": summary,
+        "probe": probe,
+    })
+
+
+def _patch_rce_state_dir(rce_module, tmp_dir):
+    """临时替换 risk_control_enhancements 的 STATE_DIR，用于探针不落盘测试。
+    返回一个上下文管理器。STATE_DIR 是 Path 对象，需用 Path 包装。"""
+    from pathlib import Path as _Path
+    from unittest.mock import patch as _mock_patch
+    return _mock_patch.object(rce_module, "STATE_DIR", _Path(tmp_dir))
+
+
 # ========== 🛡️ Dwell Monitor Guardian：Flask 控制接口（前端按钮：启动/停止/状态） ==========
 # 设计：用 subprocess.Popen 启动独立的 _dwell_monitor_guardian.py 守护进程，与 app.py 完全解耦，
 #       即便 app.py reload/重启，守护进程仍可单独存活或被明确 kill。
@@ -17630,6 +17991,288 @@ def kpi_dashboard_page():
                     },
                     options: {responsive:true, scales:{y:{beginAtZero:true}}}
                 });
+            });
+    </script>
+</body>
+</html>
+''')
+
+
+# ==================== 风控自检仪表盘（CTR / ICR） ====================
+@app.route("/api/risk_dashboard", methods=["GET"])
+def api_risk_dashboard():
+    """风控仪表盘数据 API：CTR 熔断 + ICR 监控 + 近 24 小时趋势"""
+    if not _HAS_RCE:
+        return jsonify({"error": "risk_control_enhancements 未加载"}), 500
+
+    # --- CTR 熔断数据（聚合所有广告主/渠道） ---
+    ctr_channels = {}
+    ctr_total_imp = 0
+    ctr_total_click = 0
+    try:
+        fuse = _rce.ctr_fuse
+        with fuse._lock:
+            for adv_id, channels in fuse._q.items():
+                for ch, q in channels.items():
+                    imp = sum(e[1] for e in q)
+                    click = sum(e[2] for e in q)
+                    ctr_channels.setdefault(ch, {"imp": 0, "click": 0})
+                    ctr_channels[ch]["imp"] += imp
+                    ctr_channels[ch]["click"] += click
+                    ctr_total_imp += imp
+                    ctr_total_click += click
+    except Exception as e:
+        log.warning(f"读取 CTR 熔断数据失败: {e}")
+
+    ctr_overall = ctr_total_click / ctr_total_imp if ctr_total_imp else 0.0
+    ctr_limit_default = _rce.ctr_fuse.CHANNEL_LIMIT.get("default", 0.12)
+    if ctr_total_imp < 80:
+        ctr_status = "样本不足"
+    elif ctr_overall > ctr_limit_default:
+        ctr_status = "熔断"
+    elif ctr_overall > ctr_limit_default * 0.8:
+        ctr_status = "警告"
+    else:
+        ctr_status = "正常"
+
+    # --- ICR 监控数据 ---
+    icr_snapshot = {"n": 0, "low_dwell_rate": 0, "high_bounce_rate": 0}
+    icr_warn = False
+    icr_reason = ""
+    try:
+        icr_warn, icr_snap, icr_reason = _rce.icr_monitor.should_warn()
+        icr_snapshot = icr_snap
+    except Exception as e:
+        log.warning(f"读取 ICR 监控数据失败: {e}")
+
+    icr_status = "正常"
+    if icr_snapshot.get("n", 0) < 30:
+        icr_status = "样本不足"
+    elif icr_warn:
+        icr_status = "告警"
+    elif (icr_snapshot.get("low_dwell_rate", 0) > _rce.icr_monitor.MAX_LOW_DWELL * 0.8
+          or icr_snapshot.get("high_bounce_rate", 0) > _rce.icr_monitor.MAX_HIGH_BOUNCE * 0.8):
+        icr_status = "警告"
+
+    # --- 近 24 小时趋势（按小时聚合 ICR 历史） ---
+    trend_hours = []
+    trend_low_dwell = []
+    trend_high_bounce = []
+    trend_ctr = []
+    try:
+        import time as _t
+        now = _t.time()
+        # 从 ICR 历史文件读取 24 小时数据
+        icr_file = _rce.STATE_DIR / "icr_history.jsonl"
+        hourly_buckets = {}
+        if icr_file.exists():
+            with icr_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        ts, d, b = _rce.json.loads(line)
+                        if now - float(ts) > 24 * 3600:
+                            continue
+                        hour_key = int(float(ts) // 3600)
+                        bucket = hourly_buckets.setdefault(hour_key, {"n": 0, "low": 0, "high_b": 0})
+                        bucket["n"] += 1
+                        if float(d) < 30.0:
+                            bucket["low"] += 1
+                        if float(b) > 0.8:
+                            bucket["high_b"] += 1
+                    except Exception:
+                        continue
+        # 生成最近 24 个小时的序列
+        current_hour = int(now // 3600)
+        for h in range(current_hour - 23, current_hour + 1):
+            import datetime as _dt
+            label = _dt.datetime.fromtimestamp(h * 3600).strftime("%H:00")
+            trend_hours.append(label)
+            b = hourly_buckets.get(h, {"n": 0, "low": 0, "high_b": 0})
+            if b["n"] > 0:
+                trend_low_dwell.append(round(b["low"] / b["n"] * 100, 2))
+                trend_high_bounce.append(round(b["high_b"] / b["n"] * 100, 2))
+            else:
+                trend_low_dwell.append(0)
+                trend_high_bounce.append(0)
+            # CTR 趋势：从 ctr_fuse 队列按小时聚合（近似）
+            ctr_imp = 0
+            ctr_click = 0
+            try:
+                fuse = _rce.ctr_fuse
+                with fuse._lock:
+                    for adv_id, channels in fuse._q.items():
+                        for ch, q in channels.items():
+                            for ts, imp, click in q:
+                                if int(ts // 3600) == h:
+                                    ctr_imp += imp
+                                    ctr_click += click
+            except Exception:
+                pass
+            trend_ctr.append(round(ctr_click / ctr_imp * 100, 3) if ctr_imp else 0)
+    except Exception as e:
+        log.warning(f"生成风控趋势数据失败: {e}")
+
+    return jsonify({
+        "ctr": {
+            "overall": round(ctr_overall * 100, 3),
+            "limit": round(ctr_limit_default * 100, 2),
+            "status": ctr_status,
+            "total_imp": ctr_total_imp,
+            "total_click": ctr_total_click,
+            "channels": {
+                ch: {
+                    "imp": v["imp"],
+                    "click": v["click"],
+                    "ctr": round(v["click"] / v["imp"] * 100, 3) if v["imp"] else 0,
+                    "limit": round(_rce.ctr_fuse.CHANNEL_LIMIT.get(ch, ctr_limit_default) * 100, 2),
+                }
+                for ch, v in ctr_channels.items()
+            }
+        },
+        "icr": {
+            "n": int(icr_snapshot.get("n", 0)),
+            "low_dwell_rate": round(icr_snapshot.get("low_dwell_rate", 0) * 100, 2),
+            "high_bounce_rate": round(icr_snapshot.get("high_bounce_rate", 0) * 100, 2),
+            "low_dwell_limit": round(_rce.icr_monitor.MAX_LOW_DWELL * 100, 0),
+            "high_bounce_limit": round(_rce.icr_monitor.MAX_HIGH_BOUNCE * 100, 0),
+            "status": icr_status,
+            "reason": icr_reason,
+        },
+        "trend": {
+            "hours": trend_hours,
+            "low_dwell_pct": trend_low_dwell,
+            "high_bounce_pct": trend_high_bounce,
+            "ctr_pct": trend_ctr,
+        }
+    })
+
+
+@app.route("/risk_dashboard", methods=["GET"])
+def risk_dashboard_page():
+    """风控自检仪表盘页面（CTR / ICR）"""
+    return render_template_string('''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>风控自检仪表盘</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background:#f5f7fa; color:#333; }
+        .header { background:#1a73e8; color:#fff; padding:20px 30px; }
+        .header h1 { font-size:22px; }
+        .container { max-width:1200px; margin:20px auto; padding:0 20px; }
+        .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin-bottom:24px; }
+        .card { background:#fff; border-radius:10px; padding:20px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
+        .card .value { font-size:32px; font-weight:700; color:#1a73e8; }
+        .card .label { font-size:13px; color:#666; margin-top:6px; }
+        .card .sub { font-size:12px; color:#999; margin-top:4px; }
+        .status-normal { color:#34a853 !important; }
+        .status-warn { color:#fbbc04 !important; }
+        .status-danger { color:#ea4335 !important; }
+        .chart-container { background:#fff; border-radius:10px; padding:20px; box-shadow:0 2px 8px rgba(0,0,0,0.08); margin-bottom:20px; }
+        .chart-container h3 { margin-bottom:12px; font-size:16px; }
+        .nav { display:flex; gap:12px; margin-bottom:20px; }
+        .nav a { color:#1a73e8; text-decoration:none; padding:8px 16px; border:1px solid #1a73e8; border-radius:6px; }
+        .nav a:hover { background:#1a73e8; color:#fff; }
+        table { width:100%; border-collapse:collapse; margin-top:10px; }
+        th, td { padding:8px 12px; text-align:left; border-bottom:1px solid #eee; font-size:13px; }
+        th { background:#f8f9fa; font-weight:600; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>风控自检仪表盘</h1>
+    </div>
+    <div class="container">
+        <div class="nav">
+            <a href="/">← 返回主页</a>
+            <a href="/kpi_dashboard">KPI 仪表盘</a>
+            <a href="/config_audit_log">配置审计日志</a>
+        </div>
+
+        <div class="cards" id="ctrCards"></div>
+        <div class="cards" id="icrCards"></div>
+
+        <div class="chart-container">
+            <h3>近 24 小时 CTR 趋势（%）</h3>
+            <canvas id="ctrChart"></canvas>
+        </div>
+        <div class="chart-container">
+            <h3>近 24 小时 ICR 趋势（低停留率 / 高跳出率 %）</h3>
+            <canvas id="icrChart"></canvas>
+        </div>
+        <div class="chart-container">
+            <h3>分渠道 CTR 明细</h3>
+            <table id="channelTable">
+                <thead><tr><th>渠道</th><th>曝光</th><th>点击</th><th>CTR</th><th>阈值</th><th>状态</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        function statusClass(s) {
+            if (s === '熔断' || s === '告警') return 'status-danger';
+            if (s === '警告') return 'status-warn';
+            return 'status-normal';
+        }
+        fetch('/api/risk_dashboard')
+            .then(r => r.json())
+            .then(data => {
+                const ctr = data.ctr || {};
+                const icr = data.icr || {};
+                const trend = data.trend || {hours:[], ctr_pct:[], low_dwell_pct:[], high_bounce_pct:[]};
+
+                // CTR 卡片
+                document.getElementById('ctrCards').innerHTML = [
+                    {v: ctr.overall + '%', l: '当前 CTR', sub: `阈值 ${ctr.limit}%`, cls: statusClass(ctr.status)},
+                    {v: ctr.status, l: 'CTR 状态', sub: `曝光 ${ctr.total_imp} / 点击 ${ctr.total_click}`, cls: statusClass(ctr.status)},
+                ].map(c => `<div class="card"><div class="value ${c.cls}">${c.v}</div><div class="label">${c.l}</div><div class="sub">${c.sub}</div></div>`).join('');
+
+                // ICR 卡片
+                document.getElementById('icrCards').innerHTML = [
+                    {v: icr.low_dwell_rate + '%', l: '低停留率', sub: `阈值 ${icr.low_dwell_limit}%`, cls: icr.low_dwell_rate > icr.low_dwell_limit ? 'status-danger' : (icr.low_dwell_rate > icr.low_dwell_limit * 0.8 ? 'status-warn' : 'status-normal')},
+                    {v: icr.high_bounce_rate + '%', l: '高跳出率', sub: `阈值 ${icr.high_bounce_limit}%`, cls: icr.high_bounce_rate > icr.high_bounce_limit ? 'status-danger' : (icr.high_bounce_rate > icr.high_bounce_limit * 0.8 ? 'status-warn' : 'status-normal')},
+                    {v: icr.status, l: 'ICR 状态', sub: `样本 ${icr.n}`, cls: statusClass(icr.status)},
+                ].map(c => `<div class="card"><div class="value ${c.cls}">${c.v}</div><div class="label">${c.l}</div><div class="sub">${c.sub}</div></div>`).join('');
+
+                // CTR 趋势图
+                const ctrCtx = document.getElementById('ctrChart').getContext('2d');
+                new Chart(ctrCtx, {
+                    type: 'line',
+                    data: {
+                        labels: trend.hours,
+                        datasets: [
+                            {label:'CTR (%)', data:trend.ctr_pct, borderColor:'#1a73e8', backgroundColor:'rgba(26,115,232,0.1)', fill:true, tension:0.3},
+                        ]
+                    },
+                    options: {responsive:true, scales:{y:{beginAtZero:true}}}
+                });
+
+                // ICR 趋势图
+                const icrCtx = document.getElementById('icrChart').getContext('2d');
+                new Chart(icrCtx, {
+                    type: 'line',
+                    data: {
+                        labels: trend.hours,
+                        datasets: [
+                            {label:'低停留率 (%)', data:trend.low_dwell_pct, borderColor:'#ea4335', tension:0.3},
+                            {label:'高跳出率 (%)', data:trend.high_bounce_pct, borderColor:'#fbbc04', tension:0.3},
+                        ]
+                    },
+                    options: {responsive:true, scales:{y:{beginAtZero:true, max:100}}}
+                });
+
+                // 分渠道明细表
+                const tbody = document.querySelector('#channelTable tbody');
+                const channels = ctr.channels || {};
+                tbody.innerHTML = Object.keys(channels).map(ch => {
+                    const c = channels[ch];
+                    const st = c.ctr > c.limit ? '熔断' : (c.ctr > c.limit * 0.8 ? '警告' : '正常');
+                    return `<tr><td>${ch}</td><td>${c.imp}</td><td>${c.click}</td><td>${c.ctr}%</td><td>${c.limit}%</td><td class="${statusClass(st)}">${st}</td></tr>`;
+                }).join('') || '<tr><td colspan="6" style="text-align:center;color:#999;">暂无数据</td></tr>';
             });
     </script>
 </body>
