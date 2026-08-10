@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.7 = 2026-08-10 第七次改动
-APP_VERSION = "26.8.10.7"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.1 = 2026-08-11 第一次改动
+APP_VERSION = "26.8.11.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -83,7 +83,10 @@ except Exception as _e:
 # 同一站点在短时间窗口内被高频反复访问是 AdSense/HilltopAds 最易识别的机器特征。
 # 用内存+落盘记录"站点→最近访问时间戳"，强制最小访问间隔 + 窗口内访问上限。
 _SITE_MIN_INTERVAL_SEC = 180.0          # 同一站点两次访问最小间隔（3分钟）
-_SITE_MAX_PER_WINDOW = 8               # 24小时窗口内单站点最大访问次数
+# ★ 26.8.11.1 修复：8次/24h 在单站点场景会导致任务空转，真人回访行为实际可达30次/天
+#   - 多站点场景下每个站点独立计数，单站点时放宽至 40 次/24h 兜底
+_SITE_MAX_PER_WINDOW = 30               # 24小时窗口内单站点最大访问次数（基础值）
+_SITE_SINGLE_URL_BONUS = 10             # 单站点场景额外叠加（30+10=40）
 _SITE_WINDOW_HOURS = 24
 _SITE_FREQ_LOCK = threading.RLock()
 # {host: [timestamp, ...]} 仅记录最近窗口内的访问
@@ -91,19 +94,28 @@ _SITE_VISITS = {}
 _SITE_FREQ_STATE = os.path.join(BASE_DIR if 'BASE_DIR' in dir() else os.path.dirname(os.path.abspath(__file__)), ".risk_state", "site_freq.json")
 
 
-def check_site_frequency(host: str) -> bool:
+def _get_site_window_limit(host_count: int = 1) -> int:
+    """★ 根据目标站点数量动态调整访问上限：单站点兜底放宽至 40 次/24h。"""
+    base = _SITE_MAX_PER_WINDOW
+    if host_count <= 1:
+        return base + _SITE_SINGLE_URL_BONUS
+    return base
+
+
+def check_site_frequency(host: str, host_count: int = 1) -> bool:
     """检查是否允许访问该站点。返回 True 表示允许。"""
     if not host:
         return True
     host = host.lower()
     now = time.time()
     cutoff = now - _SITE_WINDOW_HOURS * 3600
+    limit = _get_site_window_limit(host_count)
     with _SITE_FREQ_LOCK:
         ts_list = _SITE_VISITS.get(host, [])
         ts_list = [t for t in ts_list if t > cutoff]
         _SITE_VISITS[host] = ts_list
         # 窗口内访问数已达上限
-        if len(ts_list) >= _SITE_MAX_PER_WINDOW:
+        if len(ts_list) >= limit:
             return False
         # 距上次访问过近
         if ts_list and (now - ts_list[-1]) < _SITE_MIN_INTERVAL_SEC:
@@ -4842,7 +4854,9 @@ _stats_lock = threading.Lock()  # 保护 stats 字典的并发读写
 # 到期后强制关闭 page，中断所有冻结的 Playwright CDP 调用。
 _rope_watchdog_event = threading.Event()  # set() 取消看门狗
 _rope_watchdog_fired = False
-_ROPE_WATCHDOG_GRACE_S = 60  # deadline 到达后给检查点的宽限期（秒）
+_ROPE_WATCHDOG_GRACE_S = 90  # ★ 26.8.11.1 修复： deadline 到达后给检查点的宽限期（秒），从60s→90s
+#   - Pop-under 弹窗 load 状态等待 15s + CDP 事件派发 + 页面切换会放大主线程抖动
+#   - 低质量代理下 page.evaluate/goto 偶发阻塞 60-80s 是正常现象，60s 过严易误杀
 
 def _rope_watchdog(deadline, page_ref, label=""):
     """主动看门狗：deadline 到达时软提醒，宽限期后强制中断卡死的浏览器进程。
@@ -14653,14 +14667,16 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 # ★ P0-2 站点频率控制：单站点高频访问是机器流量最强信号。
                 # 对每个目标站点做最小访问间隔 + 窗口内访问上限校验，超限则跳过该站点。
                 _site_skipped = []
+                _host_count = len(_active_urls)
+                _dyn_limit = _get_site_window_limit(_host_count)
                 for _u in _active_urls:
                     _host_chk = urllib.parse.urlparse(_u).netloc.lower()
-                    if not check_site_frequency(_host_chk):
+                    if not check_site_frequency(_host_chk, host_count=_host_count):
                         _site_skipped.append(_host_chk)
                 if _site_skipped:
                     log.warning(
-                        f"⛔ P0-2 站点频控：以下站点超频，本次跳过 ({_SITE_MAX_PER_WINDOW}次/{_SITE_WINDOW_HOURS}h, "
-                        f"间隔≥{_SITE_MIN_INTERVAL_SEC:.0f}s): {_site_skipped}"
+                        f"⛔ P0-2 站点频控：以下站点超频，本次跳过 ({_dyn_limit}次/{_SITE_WINDOW_HOURS}h, "
+                        f"间隔≥{_SITE_MIN_INTERVAL_SEC:.0f}s, 目标站数={_host_count}): {_site_skipped}"
                     )
                 _site_skipped_set = set(_site_skipped)
                 for _url_idx, target_url in enumerate(_active_urls):
@@ -14811,7 +14827,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             # 大白话：真人从别的网站点链接过来，应该是五花八门的博客/论坛/新闻/问答，
                             # 而不是永远从 Medium/Quora/Reddit 首页来的（太整齐=机器特征）。
                             # 按 IP 国家/语言选对应语言区的外链池，更真实。
-                            _ref_lang = (ip_language or "en").split("-")[0].lower()
+                            # ★ 26.8.11.1 修复：ip_language 在此作用域未定义 → 改用已存在的 fingerprint["language"]
+                            _ip_lang_src = (
+                                fingerprint.get("language")
+                                if isinstance(fingerprint, dict)
+                                else (resolved_ip_info or {}).get("language") if isinstance(resolved_ip_info, dict) else None
+                            )
+                            _ref_lang = (_ip_lang_src or "en").split("-")[0].lower()
                             _referral_pool = _get_referral_pool(_ref_lang)
                             _ref_site = random.choice(_referral_pool)
                             log.info(f"🌐 [流量多样化] 外链跳转: {_ref_site} → {target_url}")

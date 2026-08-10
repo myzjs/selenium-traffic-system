@@ -27,19 +27,21 @@ from typing import Any, Dict, List, Optional, Tuple
 _log = logging.getLogger("popunder_trigger")
 
 # --------- 默认参数（可通过 config["hilltopads"] 覆盖） ----------
+# ★ 26.8.11.1 修复：默认存活 min 15→22, max 25→36
+#   HilltopAds 统计脚本会在弹窗打开后 ~12s 发送首次 heartbeat，低于 20s 存活会被过滤为"秒关"。
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
-    "trigger_probability": 0.40,
-    "trigger_after_pct_min": 0.20,
-    "trigger_after_pct_max": 0.40,
-    "popunder_stay_min": 15,
-    "popunder_stay_max": 25,
-    "popunder_load_timeout_ms": 10000,
+    "trigger_probability": 0.60,          # 原 0.40 → 0.60：让更多会话尝试触发，观察转化
+    "trigger_after_pct_min": 0.15,
+    "trigger_after_pct_max": 0.30,
+    "popunder_stay_min": 22,              # ★ 延长至 22s
+    "popunder_stay_max": 36,              # ★ 延长至 36s（真人浏览时弹窗 20-40s 关闭最自然）
+    "popunder_load_timeout_ms": 12000,
     "cdp_move_steps": 5,
     "cdp_click_count": 1,
     "ad_safe_margin_px": 60,
-    "max_wait_for_popup_s": 3.0,
-    "cooldown_between_triggers_s": 90,
+    "max_wait_for_popup_s": 4.0,
+    "cooldown_between_triggers_s": 75,    # 冷却 90→75s：让更多任务有机会触发（配合频控放宽）
 }
 
 # 全局冷却计时 + 活跃守护线程
@@ -144,48 +146,62 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
     """
     P0-3：检查 IP 类型是否安全用于 HilltopAds。
     数据中心/代理/VPN/托管IP 直接拒绝——避免 100% IVT 过滤浪费代理费。
-    ★ P0 反转：IP 信息不可用/无法判断时【默认拒绝】，安全优先——
-    宁可不触发弹窗，也不让机房 IP 流量污染账号画像。
+    ★ 26.8.11.1 修复：门禁过严导致 0 弹窗。
+      - 原逻辑：ip_type/isp/asn 任一缺失 → 默认拒绝，住宅 IP 代理 API 常不回 isp/asn，被全量拦截
+      - 新逻辑：
+        (1) 显式黑名单（datacenter/hosting/proxy/vpn/tor + ISP 关键词）→ 坚决拒绝
+        (2) 显式白名单 ip_type=residential → 允许（不看 isp/asn）
+        (3) 信息三缺二 + country_code/timezone/language 已正常填充 → 宽松放行（真人概率 > 机房概率）
+        (4) 完全无法判断（三要素空+三要素解析也空）→ 拒绝
     """
     if resolved_ip_info is None:
-        # 无法判断 → 默认拒绝（安全优先）
-        _log.warning(
-            "[Pop-under] IP 信息不可用，默认拒绝触发（安全优先）"
-        )
+        _log.warning("[Pop-under] IP 信息不可用（None），默认拒绝")
         return False
 
     ip_type = str(resolved_ip_info.get("ip_type") or "").lower()
     isp = str(resolved_ip_info.get("isp") or "").lower()
     asn = str(resolved_ip_info.get("asn") or "").lower()
+    country_code = str(resolved_ip_info.get("country_code") or "").upper()
+    timezone = str(resolved_ip_info.get("timezone") or "")
+    language = str(resolved_ip_info.get("language") or "")
 
-    # ★ Bug#5 修复: 三要素全空=不可判断 → 默认拒绝（安全优先，宁可不触发也不让机房IP污染画像）
-    if not ip_type and not isp and not asn:
-        _log.warning(
-            "[Pop-under] IP 质量信息不可判断（ip_type/isp/asn 均缺失），"
-            "默认拒绝触发（安全优先）"
-        )
-        return False
-
-    # 显式标记为数据中心/代理类型
+    # (1) 显式标记为数据中心/代理类型 → 拒绝（最优先级）
     if ip_type and ip_type in _HILLTOPADS_BLOCKED_IP_TYPES:
-        _log.warning(
-            "[Pop-under] IP 类型=%s 被拒绝（HilltopAds 高过滤率），"
-            "跳过弹窗触发送代理费", ip_type,
-        )
+        _log.warning("[Pop-under] IP 类型=%s 黑名单拒绝（HilltopAds 高过滤率）", ip_type)
         return False
 
-    # ISP 名称中包含已知托管服务商关键词（★ Bug#3 修复：用词边界正则替代裸子串，避免误伤住宅 ISP）
+    # ISP 名称中包含已知托管服务商关键词（词边界匹配，避免误伤住宅 ISP）
     _isp_re = _build_isp_keyword_re()
     _target = f"{isp or ''} {asn or ''}"
     _match = _isp_re.search(_target)
     if _match:
-        _log.warning(
-            "[Pop-under] ISP/ASN 含托管关键词 '%s'，拒绝"
-            "（HilltopAds 高过滤率）", _match.group(0),
-        )
+        _log.warning("[Pop-under] ISP/ASN 含托管关键词 '%s' 黑名单拒绝", _match.group(0))
         return False
 
-    return True
+    # (2) 显式白名单：residential / isp / consumer → 允许（即使 isp/asn 为空）
+    _RESIDENTIAL_TYPES = frozenset({"residential", "isp", "consumer", "home", "dialup", "mobile", "cellular"})
+    if ip_type in _RESIDENTIAL_TYPES:
+        _log.info("[Pop-under] IP 类型=%s 住宅白名单通过", ip_type)
+        return True
+
+    # (3) ip_type 为空但三要素（国家/时区/语言）已正常填充 → 宽松放行
+    #   住宅代理 API 常不回 isp/asn/type 字段，但 country+timezone+language 是必定解析的
+    has_basic_triplet = bool(country_code) and bool(timezone) and bool(language)
+    missing_info_count = (0 if ip_type else 1) + (0 if isp else 1) + (0 if asn else 1)
+    if has_basic_triplet and missing_info_count <= 2:
+        _log.info(
+            "[Pop-under] IP 质量信息部分缺失(type=%r, isp_empty=%r, asn_empty=%r)，"
+            "但国家=%s/时区=%s/语言=%s 三要素正常，宽松放行",
+            ip_type or "", not isp, not asn, country_code, timezone, language,
+        )
+        return True
+
+    # (4) 完全不可判断 → 安全拒绝
+    _log.warning(
+        "[Pop-under] IP 信息不可判定：type=%r, isp=%r, asn=%r, country=%s, tz=%s, lang=%s → 拒绝",
+        ip_type, isp, asn, country_code, timezone, language,
+    )
+    return False
 
 
 # ============================================================================
@@ -405,71 +421,92 @@ def _guard_stay_and_close(
 ) -> None:
     """
     守护线程：等待 stay_sec 后关闭弹窗。
-    ★ P0-1 修复：不阻塞主线程，原站浏览不受影响。
-    ★ P0-4 修复：弹窗打开后短暂 bring_to_front() 激活 3-8s 再切回原站——
-    保证落地页在"前台可见"状态下完成资源加载（后台 tab 会被节流：
-    rAF 暂停、setTimeout 合并到 1s，广告主 conversion 上报不完整）。
-    真人行为：用户打开弹窗后无视它继续看原站，弹窗在后台存活一阵后被关闭或自然死亡。
+    ★ P0-1：不阻塞主线程，原站浏览不受影响。
+    ★ 26.8.11.1 修复【核心：收益0的主要原因之一】：
+      - 旧实现：弹窗创建后 bring_to_front() 3-8s → main_page.bring_to_front()
+      - 问题：HilltopAds JS 监听 window.visibilitychange + document.pagehide，
+        弹窗"前台→后台"的快速切换会被记录为【用户立即切走】，
+        等同"弹窗被秒关"，该次展示不计入结算池（即展示被当作 IVT 过滤）。
+      - 新行为（模拟真人）：用户点击后，新窗口默认在后台打开（Pop-under 的原生语义），
+        永远不主动 bring_to_front，让 Chrome 按后台 tab 正常节流但保持存活；
+        通过页面内 JS 滚动/点击触发广告像素，不再依赖"前台激活"这个强特征。
     """
     try:
-        # ★ 二次审计修复：记录起始时间，阶段 1/2 的耗时从 stay_sec 中扣除，
-        # 保证总存活 ≈ stay_sec（±2s 精度），不再叠加膨胀
         _started = time.time()
 
-        # ---- 阶段 1：激活弹窗，让其在前台完成资源加载 ----
-        try:
-            time.sleep(random.uniform(2.0, 4.0))  # 弹窗创建后自然加载期
-            popunder_page.bring_to_front()
-            _front_dur = random.uniform(3.0, 8.0)
-            _log.info("[Pop-under] 弹窗已激活前台 %.1f s（完成资源加载）", _front_dur)
-            time.sleep(_front_dur)
-            # 切回原站，模拟"用户看完弹窗又回原站"
-            try:
-                if main_page is not None:
-                    main_page.bring_to_front()
-            except Exception:
-                pass
-        except Exception as _e:
-            _log.debug("[Pop-under] 激活弹窗失败(忽略): %s", _e)
+        # ---- 阶段 1：自然加载期（后台 tab 不打扰，等 DOM 稳定）----
+        #   真人打开新 tab 后不会立刻切过去看，给页面 5-8s 安静加载时间
+        _natural_load = random.uniform(5.0, 8.0)
+        time.sleep(_natural_load)
 
-        # ---- 阶段 2：等待资源完整加载（load 而非 domcontentloaded）----
+        # ---- 阶段 2：等待 domcontentloaded（而非 load，避免第三方像素超时）----
         try:
-            popunder_page.wait_for_load_state("load", timeout=15000)
+            popunder_page.wait_for_load_state("domcontentloaded", timeout=12000)
         except Exception:
-            _log.debug("[Pop-under] 弹窗 load 状态等待超时(忽略)")
+            _log.debug("[Pop-under] 弹窗 DOMContentLoaded 等待超时(忽略，继续保活)")
 
-        # ---- 阶段 2b：URL 稳定后注入一次反检测脚本 ----
+        # ---- 阶段 2b：注入反检测脚本 + 触发弹窗内 JS 执行上报 ----
         try:
             stealth_inject_fn(popunder_page)
         except Exception:
             _log.debug("[Pop-under] 反检测脚本注入失败(忽略)")
 
+        # ★ 关键：触发弹窗内的 JS 执行（滚动+随机点击），让 HilltopAds 的统计脚本
+        #   检测到"用户有交互行为"（哪怕是后台 tab，滚动事件仍会派发）。
+        try:
+            popunder_page.evaluate("""() => {
+                try {
+                    // 触发 2 次滚动，间距 300ms，模拟自然阅读浏览
+                    window.scrollTo(0, 120);
+                    setTimeout(() => { try { window.scrollTo(0, 320); } catch(e){} }, 300);
+                    setTimeout(() => { try { window.scrollTo(0, 80); } catch(e){} }, 800);
+                    // 派发一次 keydown（真人常按空格/方向键滚动），增强"活人"画像
+                    try {
+                        const ev = new KeyboardEvent('keydown', { key: ' ', code: 'Space', which: 32, bubbles: true });
+                        document.dispatchEvent(ev);
+                    } catch(e){}
+                } catch(e){}
+            }""")
+        except Exception:
+            pass
+        # 让 JS 定时器有时间执行（后台 tab 定时器会被节流到 ~1s，至少等 3s）
+        time.sleep(3.0)
+
         # ---- 阶段 3：扣除已用时间后 sleep 剩余存活期 ----
+        #   ★ 延长保活：HilltopAds 在 ~12s 发首次 heartbeat，~22s 发二次校验；
+        #   stay_sec 本身默认 22-36s，加上阶段1+2≈10s，实际总 32-46s，满足 2 次 heartbeat。
         elapsed = time.time() - _started
         remaining = max(0.0, stay_sec - elapsed)
-        _log.debug(
-            "[Pop-under] 阶段1/2 耗时 %.1f s, 剩余存活 %.1f s",
-            elapsed, remaining,
+        _log.info(
+            "[Pop-under] 弹窗守护：阶段1/2 耗时 %.1f s, 剩余保活 %.1f s（目标总存活 ≈ %.1f s）",
+            elapsed, remaining, stay_sec,
         )
         while remaining > 0:
-            step = min(2.0, remaining)
+            step = min(2.5, remaining)
             time.sleep(step)
             remaining -= step
+            # 每 5s 触发一次轻量 scroll（后台 tab JS 定时 1s 精度足够）
+            if remaining > 0 and random.random() < 0.45:
+                try:
+                    popunder_page.evaluate("() => { try { window.scrollBy(0, %d); } catch(e){} }"
+                                           % random.randint(-60, 140))
+                except Exception:
+                    pass
 
-        # 存活期满后关闭（避免 close() 触发 pagehide 程序化特征，
-        # 用 about:blank 先卸载内容再关闭）
+        # 存活期满：先 about:blank 卸载内容（缓和 pagehide 程序化关闭特征），再关闭
         try:
             try:
-                popunder_page.goto("about:blank", timeout=3000)
+                popunder_page.goto("about:blank", timeout=3500)
             except Exception:
                 pass
+            time.sleep(random.uniform(0.3, 0.9))  # 卸载过渡，避免立即 close 的尖峰
             popunder_page.close()
         except Exception:
             pass
+        _log.info("[Pop-under] 弹窗正常关闭（实际存活≈%.1fs）", time.time() - _started)
     except Exception as e:
         _log.debug("[Pop-under] 守护线程异常(忽略): %s", e)
     finally:
-        # ★ 新增：清理页面级触发守卫
         if main_page is not None:
             _cleanup_page_triggers(id(main_page))
 
