@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.4 = 2026-08-10 第四次改动
-APP_VERSION = "26.8.10.4"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.5 = 2026-08-10 第五次改动
+APP_VERSION = "26.8.10.5"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2295,6 +2295,115 @@ def _record_demographics(demo: dict):
         o = demo.get("os")
         if o in _demographics_stats["os"]:
             _demographics_stats["os"][o] += 1
+
+
+# ★ P2-16 外链来源池（真实化：40+ 各种类型网站的具体文章页，而非固定平台首页）
+# 大白话：真人从别的网站点链接过来，应该是五花八门的博客/论坛/新闻/问答/教程，
+# 而不是永远从那几个大平台首页来的（太整齐=机器特征）。
+# 按语言分类，不同国家的IP用对应语言的外链池，更真实。
+_REFERRAL_POOLS = {
+    # 英文外链池（25+，覆盖科技/商业/生活/新闻/问答/教程/博客等多种类型）
+    "en": [
+        # 科技博客/资讯
+        "https://techcrunch.com/2024/01/15/the-future-of-ai-in-small-business/",
+        "https://www.theverge.com/2024/2/10/24067892/ai-tools-productivity-review",
+        "https://arstechnica.com/gadgets/2024/03/best-laptops-2024/",
+        "https://www.wired.com/story/online-privacy-tips-2024/",
+        "https://www.cnet.com/tech/services-and-software/best-vpn-services/",
+        # 商业/财经
+        "https://www.forbes.com/sites/forbesbusinesscouncil/2024/01/20/digital-marketing-trends/",
+        "https://www.businessinsider.com/side-hustle-ideas-2024",
+        "https://www.entrepreneur.com/growing-a-business/website-traffic-tips/467821",
+        "https://www.investopedia.com/terms/d/digital-marketing-5218236",
+        # 问答/社区
+        "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-an-unsorted-array",
+        "https://www.quora.com/What-are-the-best-ways-to-increase-website-traffic",
+        "https://www.reddit.com/r/smallbusiness/comments/1abcde/how_do_you_drive_traffic_to_your_website/",
+        "https://news.ycombinator.com/item?id=38976542",
+        # 教程/指南
+        "https://www.smashingmagazine.com/2024/02/website-performance-optimization-guide/",
+        "https://css-tricks.com/improving-website-speed/",
+        "https://www.freecodecamp.org/news/seo-basics-for-developers/",
+        "https://www.digitalocean.com/community/tutorials/how-to-optimize-your-website",
+        # 生活/健康
+        "https://www.healthline.com/health/healthy-lifestyle-tips",
+        "https://www.mindbodygreen.com/articles/daily-habits-for-better-focus",
+        "https://greatist.com/fitness/best-home-workouts",
+        # 新闻/媒体
+        "https://www.bbc.com/news/technology-67890123",
+        "https://www.nytimes.com/2024/01/25/technology/ai-small-business.html",
+        "https://www.theguardian.com/technology/2024/feb/05/online-privacy-tips",
+        # 博客/个人站
+        "https://waitbutwhy.com/2024/01/ai-revolution.html",
+        "https://www.farnamstreetblog.com/2024/02/mental-models/",
+        "https://seths.blog/2024/01/the-least-you-can-do/",
+        # 设计/创意
+        "https://dribbble.com/stories/2024/02/15/ux-design-trends",
+        "https://www.behance.net/gallery/123456789/Website-Redesign",
+    ],
+    # 中文外链池（15+，覆盖科技/生活/财经/问答/教程）
+    "zh": [
+        # 科技/资讯
+        "https://www.36kr.com/p/2587643215678982",
+        "https://www.huxiu.com/article/2345678.html",
+        "https://www.ifanr.com/1234567",
+        "https://www.leiphone.com/category/ai/abc123.html",
+        # 问答/社区
+        "https://www.zhihu.com/question/123456789",
+        "https://www.v2ex.com/t/1234567",
+        "https://juejin.cn/post/7234567890123456789",
+        "https://segmentfault.com/q/12345678",
+        # 教程/指南
+        "https://www.runoob.com/w3cnote/seo-basic-tutorial.html",
+        "https://www.w3cschool.cn/article/abc123.html",
+        # 财经/商业
+        "https://www.yicai.com/news/12345678.html",
+        "https://www.ftchinese.com/story/001098765",
+        # 生活/健康
+        "https://www.douban.com/note/123456789/",
+        "https://www.xiaohongshu.com/discovery/item/123456789abcdef",
+        "https://www.guokr.com/article/123456/",
+    ],
+    # 日文外链池（10+）
+    "ja": [
+        "https://www.itmedia.co.jp/news/articles/2401/15/news012.html",
+        "https://www.gizmodo.jp/2024/02/ai-tools-review.html",
+        "https://japan.zdnet.com/article/35234567/",
+        "https://www.asahi.com/articles/ASDF12345.html",
+        "https://www.yomiuri.co.jp/tech/20240120-OYT1T50000/",
+        "https://qiita.com/example/items/abc123def456",
+        "https://teratail.com/questions/1234567",
+        "https://note.com/example/n/n12345abcde",
+        "https://www.lifehacker.jp/2024/02/productivity-tips.html",
+        "https://www.huffingtonpost.jp/2024/01/10/digital-marketing_a_23456789/",
+    ],
+    # 德文外链池（10+）
+    "de": [
+        "https://www.heise.de/news/KI-Tools-im-Test-1234567.html",
+        "https://www.spiegel.de/netzwelt/web/tipps-fuer-mehr-website-besucher-a-1234567.html",
+        "https://www.zeit.de/digital/internet/2024-01/seo-tipps-website",
+        "https://www.golem.de/news/kuenstliche-intelligenz-2402-123456.html",
+        "https://www.computerbase.de/2024-01/best-laptops-test/",
+        "https://www.handelsblatt.com/technik/it/24/12345678.html",
+        "https://www.wiwo.de/technologie/digitale-welt/12345678-all.html",
+        "https://www.stern.de/gesundheit/gesunder-lebensstil-12345678.html",
+        "https://www.focus.de/gesundheit/tipps/12345678.html",
+        "https://www.t-online.de/digital/ratgeber/id_12345678/seo-tipps.html",
+    ],
+}
+
+
+def _get_referral_pool(lang: str) -> list:
+    """根据语言返回对应的外链来源池。找不到时回退到英文池。"""
+    lang = (lang or "en").lower()
+    if lang in _REFERRAL_POOLS:
+        return _REFERRAL_POOLS[lang]
+    # 尝试匹配前缀（如 en-US → en）
+    prefix = lang.split("-")[0] if "-" in lang else lang
+    if prefix in _REFERRAL_POOLS:
+        return _REFERRAL_POOLS[prefix]
+    return _REFERRAL_POOLS["en"]
+
 
 # ★ 断点恢复：计划进度持久化文件
 PLAN_PROGRESS_FILE = "plan_progress.json"
@@ -14692,14 +14801,13 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 log.warning(f"⚠️ 社媒跳转失败: {str(_social_err)[:80]}，回退到搜索模式")
                                 _traffic_source = "search"
                         elif _traffic_source == "referral":
-                            # ★ 外链跳转：从相关网站点击链接进入（模拟博客/论坛推荐）
-                            _referral_sites = [
-                                "https://news.ycombinator.com/",
-                                "https://www.quora.com/",
-                                "https://medium.com/",
-                                "https://stackoverflow.com/",
-                            ]
-                            _ref_site = random.choice(_referral_sites)
+                            # ★ P2-16 外链来源真实化：从固定4个平台首页 → 40+ 各种类型网站的具体文章页
+                            # 大白话：真人从别的网站点链接过来，应该是五花八门的博客/论坛/新闻/问答，
+                            # 而不是永远从 Medium/Quora/Reddit 首页来的（太整齐=机器特征）。
+                            # 按 IP 国家/语言选对应语言区的外链池，更真实。
+                            _ref_lang = (ip_language or "en").split("-")[0].lower()
+                            _referral_pool = _get_referral_pool(_ref_lang)
+                            _ref_site = random.choice(_referral_pool)
                             log.info(f"🌐 [流量多样化] 外链跳转: {_ref_site} → {target_url}")
                             simulate_rtt_jitter(base_ms=90, jitter_ms=40)
                             try:
@@ -14707,7 +14815,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 _ref_stay = random.uniform(2.0, 6.0)
                                 current_x, current_y = simulate_human_in_window(
                                     page, _ref_stay, page_behavior_stats, current_x, current_y,
-                                    config, page_name=f"外链站({_ref_site.split('//')[1][:20]})"
+                                    config, page_name=f"外链站({_ref_site.split('//')[1][:25]})"
                                 )
                                 page.evaluate(f"window.location.href = '{target_url}'")
                                 time.sleep(random.uniform(2.0, 4.0))
