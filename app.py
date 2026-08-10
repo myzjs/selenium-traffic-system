@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.1 = 2026-08-10 第一次改动
-APP_VERSION = "26.8.10.1"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.2 = 2026-08-10 第二次改动
+APP_VERSION = "26.8.10.2"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -3823,8 +3823,23 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
 
 # ★ 广告点击风控：任务级冷却时间 + 广告去重
 _ad_click_last_ts = 0  # 上次广告点击时间戳（全局，跨任务冷却）
-_ad_click_cooldown = 180  # 冷却时间（秒），同一IP/会话两次点击间隔至少3分钟
+# ★ P0 谷歌广告合规修复：180s 固定冷却会形成"3分钟为最小间隔"的规整分布，
+# 时序分类器易识别为机器节奏。改为对数正态随机冷却（中位数 180s，σ=0.4），
+# 保留均值但引入自然离散，模拟真人"间隔随机、偶有连击"的真实节奏。
+_ad_click_cooldown_median = 180  # 冷却中位数（秒）
+_ad_click_cooldown_sigma = 0.4   # 对数正态标准差
+_ad_click_cooldown_min = 60      # 最小冷却（秒，防止过于密集）
+_ad_click_cooldown_max = 600     # 最大冷却（秒，防止过长）
 _ad_clicked_positions = set()  # 当前任务已点击的广告坐标key（任务结束后清空）
+
+def _ad_click_cooldown_now() -> float:
+    """按对数正态分布生成下一次广告点击的冷却时长（中位数≈180s，右偏长尾）。"""
+    import math as _m
+    try:
+        v = _m.exp(random.gauss(_m.log(_ad_click_cooldown_median), _ad_click_cooldown_sigma))
+    except Exception:
+        v = float(_ad_click_cooldown_median)
+    return max(float(_ad_click_cooldown_min), min(float(_ad_click_cooldown_max), v))
 
 def reset_ad_click_tracking():
     """每个新任务开始时调用，清空任务级去重记录"""
@@ -3842,9 +3857,11 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         if daily_ad_click_limit_reached():
             return False, current_x, current_y
 
-        # 1.5 ★ 风控冷却：两次广告点击间隔至少3分钟（模拟真人不会连续点击广告）
+        # 1.5 ★ 风控冷却：两次广告点击间隔按对数正态随机（中位数180s，右偏长尾），
+        # 替代原固定180s硬下限（规整分布易被时序分类器识别为机器节奏）。
         _now = time.time()
-        if _now - _ad_click_last_ts < _ad_click_cooldown:
+        _cooldown = _ad_click_cooldown_now()
+        if _now - _ad_click_last_ts < _cooldown:
             return False, current_x, current_y
 
         # 1.6 ★ P1-5: 广告交互前停留≥8秒（模拟阅读行为，防止页面刚加载就点广告）
@@ -3908,19 +3925,54 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
                     });
                 });
             }
-            // 跨域iframe兆底检测
+            // 跨域iframe兆底检测（★ P0 谷歌广告合规修复：收窄白名单，
+                // 旧实现仅排除 youtube/vimeo 等 8 个域名，评论/社交/嵌入/预览等非广告 iframe
+                // 都可能被误点，封号级风险。现大幅扩充白名单，仅保留明确广告相关域名。）
             if (results.length === 0) {
-                const _nonAd = ['youtube','vimeo','dailymotion','twitter','facebook','instagram','recaptcha','hcaptcha','disqus','paypal'];
+                const _nonAd = [
+                    // 视频/社交平台
+                    'youtube','vimeo','dailymotion','twitch','bilibili','youku','iqiyi',
+                    'twitter','facebook','instagram','linkedin','tiktok','pinterest','reddit',
+                    'tumblr','snapchat','whatsapp','telegram','discord','weibo','qq',
+                    // 安全/支付/验证
+                    'recaptcha','hcaptcha','turnstile','arkoselabs','geetest','paypal',
+                    'stripe','alipay','wechatpay','apple.com/apple-pay','google.com/recaptcha',
+                    // 评论/嵌入/预览
+                    'disqus','comment','giscus','utterances','codepen','jsfiddle',
+                    'codesandbox','stackblitz','repl.it','glitch','soundcloud','spotify',
+                    'bandcamp','mixcloud','deezer','apple-music','google-maps','maps.google',
+                    'openstreetmap','mapbox','baidu-map','amap','player','embed','iframe',
+                    // 统计/分析/客服
+                    'googletagmanager','google-analytics','analytics','hotjar','fullstory',
+                    'mouseflow','luckyorange','intercom','zendesk','freshchat','tawk',
+                    'crisp','drift','olark','livechat','chatra','jivo','tidio',
+                    // CDN/静态资源
+                    'cdn','static','assets','img','image','pic','avatar','gravatar',
+                    // 登录/SSO
+                    'accounts.google','login','signin','auth','sso','oauth','passport',
+                    // 广告检测/隐私/合规
+                    'cookiebot','cookieyes','onetrust','termly','privacy','consent',
+                    'trustarc','cookiepro',
+                ];
                 document.querySelectorAll('iframe').forEach(el => {
                     if (seen.has(el)) return;
                     const src = (el.getAttribute('src') || '').toLowerCase();
                     if (!src || src === 'about:blank') return;
                     if (_nonAd.some(d => src.includes(d))) return;
                     try { if (new URL(src, location.href).hostname === location.hostname) return; } catch(e){}
+                    // ★ P0 合规：必须满足"广告尺寸"才视为广告候选（大幅收窄误点）
                     const r = el.getBoundingClientRect();
                     const w = Math.round(r.width || 0);
                     const h = Math.round(r.height || 0);
-                    if (w < 160 || h < 90) return;
+                    // 标准广告尺寸：728x90/300x250/160x600/336x280/300x600/970x90/250x250/200x200/468x60/234x60/120x600/125x125
+                    const adSizes = [
+                        [728,90],[970,90],[468,60],[234,60],
+                        [300,250],[336,280],[250,250],[200,200],[180,150],[125,125],
+                        [160,600],[300,600],[120,600],[240,400],[300,1050],
+                        [320,50],[320,100],[300,50],[250,360],[200,446],
+                    ];
+                    const isAdSize = adSizes.some(([aw,ah]) => Math.abs(w-aw) <= 10 && Math.abs(h-ah) <= 10);
+                    if (!isAdSize) return;
                     if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return;
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden') return;
@@ -3988,8 +4040,19 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
                     pass
                 _landing_text = (_page_title + ' ' + _h1_text).strip()
                 if _landing_text:
+                    # ★ P0-3 谷歌广告合规修复：广告-落地页语义匹配必须用真实广告文案，
+                    # 而非占位符 "ad_{stage}"（旧实现形同虚设，是封号级风险）。
+                    # 优先使用当前任务的搜索关键词作为广告宣称（SEO 流量场景下，
+                    # 用户搜索该词→看到广告→点进落地页，广告文案与搜索词高度相关），
+                    # 其次用页面 title 前 20 字兜底，确保语义比较有真实意义。
+                    _creative = (
+                        current_task.get("keyword")
+                        or current_task.get("search_keyword")
+                        or _page_title[:20]
+                        or "ad"
+                    )
                     _ok_s, _s, _why = _rce.semantic_sim.allow(
-                        creative_text=(f"ad_{stage}" if stage else "ad"),
+                        creative_text=_creative,
                         landing_text=_landing_text,
                     )
                     if not _ok_s:
@@ -4015,7 +4078,7 @@ def try_click_visible_ad(page, config, current_x, current_y, stage="页面"):
         if _click_ok:
             _today_clicks = record_ad_click(1)
             _ad_click_last_ts = time.time()  # ★ 更新冷却时间戳
-            log.info(f"🖱️ [广告点击] 已执行点击（今日累计 {_today_clicks} 次，冷却{_ad_click_cooldown}s）")
+            log.info(f"🖱️ [广告点击] 已执行点击（今日累计 {_today_clicks} 次，下次冷却中位数{_ad_click_cooldown_median}s）")
         else:
             # ★ F6: 点击失败直接返回，不执行"点击后等待/落地页处理"，避免误报点击成功
             return False, current_x, current_y
@@ -14819,16 +14882,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                                         except Exception:
                                                             pass
                                                         _safe_page_wait(page, min_wait=1.5, max_wait=3.0, ad_wait=True)
-                                                        # ★ 注入document.referrer覆写（让页面JS/广告脚本也能读到正确的referrer）
-                                                        if _referer_for_goto:
-                                                            try:
-                                                                page.evaluate("""(ref) => {
-                                                                    try {
-                                                                        Object.defineProperty(document, 'referrer', {get: () => ref, configurable: true});
-                                                                    } catch(e) {}
-                                                                }""", _referer_for_goto)
-                                                            except Exception:
-                                                                pass
+                                                        # ★ P0 谷歌广告合规修复：移除 document.referrer 覆写。
+                                                        # 旧实现通过 Object.defineProperty 伪造 referrer 属灰色导流，
+                                                        # 是封号级风险。现依赖真实来源页自然跳转（window.location.href）
+                                                        # 让浏览器原生设置 document.referrer，不再主动伪造。
                                                 except Exception:
                                                     pass
                                                 return True
