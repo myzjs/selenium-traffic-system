@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.6 = 2026-08-10 第六次改动
-APP_VERSION = "26.8.10.6"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.10.7 = 2026-08-10 第七次改动
+APP_VERSION = "26.8.10.7"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2377,6 +2377,38 @@ def _get_referral_pool(lang: str) -> list:
     if prefix in _REFERRAL_POOLS:
         return _REFERRAL_POOLS[prefix]
     return _REFERRAL_POOLS["en"]
+
+
+def _executor_shutdown_cancel(executor):
+    """★ Python 3.8 兼容：安全关闭线程池并取消未完成任务。
+    大白话：Python 3.9 才有 cancel_futures 参数，3.8 没有。
+    美国服务器是 Python 3.8，直接调用会报错导致任务跑不起来。
+    兼容方案：先手动取消所有未完成的 future，再 shutdown。
+    """
+    try:
+        # 尝试取消所有未完成的任务
+        for _f in list(getattr(executor, "_threads", []) or []):
+            pass  # _threads 是线程列表，不是 future
+        # 从内部队列里取未完成的 future 并取消
+        try:
+            import queue as _q
+            if hasattr(executor, "_work_queue"):
+                while True:
+                    try:
+                        _work_item = executor._work_queue.get_nowait()
+                        if _work_item is not None:
+                            _work_item.future.cancel()
+                    except _q.Empty:
+                        break
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 最后调用 shutdown（不传 cancel_futures，兼容 3.8）
+    try:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 # ★ 断点恢复：计划进度持久化文件
@@ -12771,7 +12803,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                 log.error(f" IPDeep代理获取失败: {type(e).__name__}: {e}")
                                 proxy_info = {"success": False, "error": f"{type(e).__name__}: {e}"}
                         finally:
-                            _executor.shutdown(wait=False, cancel_futures=True)  # 超时即放弃，后台线程由daemon兜底
+                            _executor_shutdown_cancel(_executor)  # 超时即放弃，兼容 Python 3.8（无 cancel_futures 参数）
                         
                         # 记录获取结果
                         if proxy_info and proxy_info.get("success"):
@@ -13418,7 +13450,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             log.error(f"❌ {exec_err}")
                             return None, exec_err
                     finally:
-                        _launch_executor.shutdown(wait=False, cancel_futures=True)  # 超时即放弃，后台线程由daemon兜底
+                        _executor_shutdown_cancel(_launch_executor)  # 超时即放弃，兼容 Python 3.8（无 cancel_futures 参数）
 
                 def _minimal_launch_kwargs():
                     args = [
@@ -16805,7 +16837,7 @@ def _run_drill_thread(target_url, headless):
                 _drill_state["progress"] = 100
                 return
         finally:
-            _drill_executor.shutdown(wait=False, cancel_futures=True)
+            _executor_shutdown_cancel(_drill_executor)
         # 保存完整报告用于前端展示
         _drill_state["report"] = (report or {}).get("risk_calc", {})
         _drill_state["full_report"] = report or {}
