@@ -21,7 +21,7 @@ import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
-APP_VERSION = "26.8.11.7"
+APP_VERSION = "26.8.11.10"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -397,13 +397,40 @@ def clamp_hour(h):
     """限制在 0-24 小时，循环边界"""
     return ((h % 24) + 24) % 24
 
+def enforce_working_hours(hours, min_hour=8.0, max_hour=23.0, max_retry=3):
+    """26.8.11.9 根因修复：把 hour_list 严格限制在工作时段 [min_hour, max_hour)。
+    
+    不允许 0-7 点（凌晨/深夜）或 23 点以后排任务，真实网站这些时段流量为 0。
+    策略：
+      ① 先筛选出已经落在合法区间内的 hour（保留随机节奏）；
+      ② 对缺口部分，在 [min_hour, max_hour) 区间内均匀补随机小时，
+         max_retry 轮次后仍不满足再全部随机，保证最终数量=len(hours)。
+    """
+    target_n = len(hours)
+    if target_n <= 0:
+        return []
+    legal = [h for h in hours if min_hour <= h < max_hour]
+    need = target_n - len(legal)
+    retry = 0
+    while need > 0 and retry < max_retry:
+        retry += 1
+        # 在合法区间内均匀补小时，同时加少量抖动避免整点重复
+        fills = [random.uniform(min_hour, max_hour) for _ in range(need * 3)]
+        valid_fill = [h for h in fills if min_hour <= h < max_hour][:need]
+        legal.extend(valid_fill)
+        need = target_n - len(legal)
+    # 兜底：仍不够则直接 uniform 填充
+    while len(legal) < target_n:
+        legal.append(random.uniform(min_hour, max_hour - 1e-6))
+    return sorted(legal[:target_n])
+
 def generate_normal_hours(num_tasks):
     """普通正态分布模型：平稳，均值12点，标准差6小时"""
     hours = []
     for _ in range(num_tasks):
         h = clamp_hour(random.normalvariate(12, 6))
         hours.append(h)
-    return sorted(hours)
+    return enforce_working_hours(hours)
 
 def generate_gamma_hours(num_tasks):
     """伽马分布模型：活动突增，形状2.5，速率0.2"""
@@ -411,7 +438,7 @@ def generate_gamma_hours(num_tasks):
     for _ in range(num_tasks):
         h = clamp_hour(random.gammavariate(2.5, 5))
         hours.append(h)
-    return sorted(hours)
+    return enforce_working_hours(hours)
 
 def generate_poisson_hours(num_tasks):
     """泊松分布模型：秒级脉冲，均匀分布在 0-24 小时内"""
@@ -423,7 +450,7 @@ def generate_poisson_hours(num_tasks):
         # 平均间隔 1/12 小时 = 5 分钟
         interval_h = random.expovariate(12)
         cumulative += interval_h
-    return sorted([h % 24 for h in hours])
+    return enforce_working_hours([h % 24 for h in hours])
 
 def generate_bimodal_hours(num_tasks):
     """双峰混合正态分布模型：早晚高峰（早9晚9）"""
@@ -434,7 +461,7 @@ def generate_bimodal_hours(num_tasks):
         else:
             h = clamp_hour(random.normalvariate(21, 2))
         hours.append(h)
-    return sorted(hours)
+    return enforce_working_hours(hours)
 
 def generate_burst_hours(num_tasks):
     """突发流量模型：模拟真实用户的突发访问行为（如热点事件、社交分享）"""
@@ -443,7 +470,8 @@ def generate_burst_hours(num_tasks):
         return []
     # 随机选择 1-3 个突发时段
     num_bursts = random.randint(1, min(3, max(1, num_tasks // 5)))
-    burst_centers = [random.uniform(6, 23) for _ in range(num_bursts)]
+    # 26.8.11.9 加固：burst_center 也落在 [8, 22] 区间（不允许 6-7 或 22-23 边缘）
+    burst_centers = [random.uniform(8, 22) for _ in range(num_bursts)]
     tasks_per_burst = num_tasks // num_bursts
     remainder = num_tasks % num_bursts
     
@@ -458,10 +486,10 @@ def generate_burst_hours(num_tasks):
     # 添加少量背景流量（10-20%）
     background_count = max(1, int(num_tasks * random.uniform(0.1, 0.2)))
     for _ in range(background_count):
-        h = clamp_hour(random.uniform(7, 23))
+        h = clamp_hour(random.uniform(8, 23))
         hours.append(h)
     
-    return sorted(hours[:num_tasks])  # 确保不超过 num_tasks
+    return enforce_working_hours(hours[:num_tasks])  # 确保不超过 num_tasks
 
 
 def generate_power_law_hours(num_tasks):
@@ -477,8 +505,8 @@ def generate_power_law_hours(num_tasks):
         return []
     # 帕累托形状参数 alpha：越小尾部越重（1.5 典型重尾）
     alpha = random.uniform(1.3, 2.0)
-    # 高峰中心（随机落在 6-22 点之间，符合人类活动时段）
-    peak_center = random.uniform(6, 22)
+    # 26.8.11.9 加固：高峰中心随机落在 [9, 21]（更集中，避免边缘穿透到凌晨）
+    peak_center = random.uniform(9, 21)
     # 尺度参数：决定主峰的集中程度（小时）
     scale = random.uniform(0.3, 1.0)
 
@@ -495,7 +523,7 @@ def generate_power_law_hours(num_tasks):
             h = peak_center - offset
         hours.append(clamp_hour(h))
 
-    return sorted(hours)
+    return enforce_working_hours(hours)
 
 
 def get_weekend_holiday_multiplier(date_obj):
@@ -682,12 +710,13 @@ def get_countries_at_utc_sec(utc_sec, country_segments):
 
 def soft_boundary_probability(utc_sec, country_code):
     """
-    软边界概率衰减
-    返回 0.0 ~ 1.0，表示该时刻该国家有"真实流量"的概率
+    软边界概率衰减（26.8.11.9 根因加固：0-7 点 & 23 点以后 0%，不再给 10% 漏网概率）
     
-    - 当地 9-22 点（核心时段）：100%
-    - 当地 7-9, 22-24 点（边缘时段）：50%
-    - 当地 0-7 点（凌晨时段）：10%
+    返回 0.0 ~ 1.0，表示该时刻该国家有"真实流量"的概率
+    - 当地 8-23 点：
+        · 9-22 点（核心时段）：100%
+        · 8-9, 22-23 点（边缘时段）：25%
+    - 当地 0-8 点 & 23-24 点：0%（真实网站这些时段无人访问，与 enforce_working_hours 一致）
     """
     import datetime as _dt
     tz_str = get_timezone_for_country(country_code)
@@ -704,10 +733,11 @@ def soft_boundary_probability(utc_sec, country_code):
     
     if 9 <= h < 22:
         return 1.0
-    elif 7 <= h < 9 or 22 <= h < 24:
-        return 0.5
+    elif 8 <= h < 9 or 22 <= h < 23:
+        return 0.25
     else:
-        return 0.1
+        # 26.8.11.9 由 0.1 改为 0.0：彻底禁止凌晨/深夜，不再"碰运气"
+        return 0.0
 
 
 def select_country_by_quota(candidates, country_quota_used, country_quota_target):
@@ -821,12 +851,20 @@ def generate_daily_tasks_legacy(cfg):
         "mid": {"min": 200, "max": 300},
         "old": {"min": 500, "max": 600}
     })
-
+    # 26.8.11.9 根因修复：legacy 函数不能再把"计划天数"当"总任务数"！
+    #   必须跟 generate_daily_tasks 一样按 daily_traffic_range × plan_days 来算总任务量，
+    #   否则 fallback 到 legacy 时总任务=3（plan_days=3）直接等于完全没跑。
+    range_cfg = traffic_range.get(site_age, traffic_range["old"])
+    _day_min = int(range_cfg.get("min", 50))
+    _day_max = int(range_cfg.get("max", max(_day_min, 50)))
+    if _day_max < _day_min:
+        _day_min, _day_max = _day_max, _day_min
+    _one_day_tasks = random.randint(_day_min, _day_max)
     if auto_mode:
-        range_cfg = traffic_range.get(site_age, traffic_range["old"])
-        total_tasks_planned = random.randint(range_cfg["min"], range_cfg["max"])
+        total_tasks_planned = max(_day_min, cfg.get("plan_days", 1)) * random.randint(_day_min, _day_max)
     else:
-        total_tasks_planned = cfg.get("plan_days", 1)
+        _pd = max(1, int(cfg.get("plan_days", 1)))
+        total_tasks_planned = max(1, _one_day_tasks * _pd)
     
     # ★ 3.4 周末衰减因子：周六日流量乘以0.6-0.8（真实网站周末流量下降）
     import datetime as _dt_wk
@@ -875,12 +913,13 @@ def generate_daily_tasks_legacy(cfg):
         if cc not in country_segments:
             country_segments[cc] = []
         
-        # 检查从昨天到后天的本地工作时段，覆盖我们的24小时窗口
+        # 26.8.11.10 根因修复：同新函数，必须严格为 [8:00, 23:00)
+        #   之前 7:00-次日0:00 会让补偿和采样漏进 7-8 / 23-24 边缘时段。
         for day_offset in [-1, 0, 1, 2]:
             local_date = today_utc_start.date() + _dt.timedelta(days=day_offset)
-            # 本地时间 7:00 到次日 0:00
-            local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(7, 0)))
-            local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(0, 0))) + _dt.timedelta(days=1)
+            # 本地时间 8:00 到 23:00（与 enforce_working_hours、soft_boundary 完全一致）
+            local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(8, 0)))
+            local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(23, 0)))
             
             # 转换为 UTC 时间
             utc_start = local_start.astimezone(pytz.UTC)
@@ -981,11 +1020,13 @@ def generate_daily_tasks_legacy(cfg):
     else:
         # 非自动模式：★ 3.1 时段权重曲线（按目标国时区的双峰分布）
         chosen_model = "hourly_weighted"
-        _hourly_weights = cfg.get("hourly_weights", [0.2,0.1,0.1,0.1,0.2,0.3,0.5,0.8,1.0,1.0,0.9,0.8,0.7,0.7,0.8,0.9,1.0,1.0,0.9,0.8,0.7,0.5,0.4,0.3])
-        # 按权重采样小时，然后在小时内随机分钟
-        _hours_pool = list(range(24))
+        _hourly_weights_full = cfg.get("hourly_weights", [0.2,0.1,0.1,0.1,0.2,0.3,0.5,0.8,1.0,1.0,0.9,0.8,0.7,0.7,0.8,0.9,1.0,1.0,0.9,0.8,0.7,0.5,0.4,0.3])
+        # 26.8.11.10 根因修复：小时池严格截断为 [8, 22]（对应 8:00-23:00 的整数小时），
+        #   禁止 0-7 & 23 小时参与采样，与 enforce_working_hours / country_segments 对齐。
+        _hours_pool = list(range(8, 23))
+        _hourly_weights = [_hourly_weights_full[h] for h in _hours_pool]
         _weights_sum = sum(_hourly_weights)
-        _weights_norm = [w / _weights_sum for w in _hourly_weights]
+        _weights_norm = [w / _weights_sum for w in _hourly_weights] if _weights_sum > 0 else [1.0 / len(_hours_pool)] * len(_hours_pool)
         for i in range(total_tasks_planned):
             # 按权重随机选择小时
             _h = random.choices(_hours_pool, weights=_weights_norm, k=1)[0]
@@ -1014,6 +1055,7 @@ def generate_daily_tasks_legacy(cfg):
         "out_of_window": 0,   # 超过24小时窗口
         "out_of_coverage": 0,
         "soft_boundary": 0,
+        "outside_cc_work_hour": 0,  # 26.8.11.10 新增：legacy 也加最终 cc 硬校验计数
     }
     
     for tp in raw_time_points:
@@ -1164,6 +1206,16 @@ def generate_daily_tasks_legacy(cfg):
         if chosen_country is None:
             chosen_country = random.choice(countries_at)
         
+        # 26.8.11.10 ★ 最终硬校验（防波堤）：与新函数 generate_daily_tasks L1510-L1518 完全一致。
+        #   把 actual_start_utc 换算为 chosen_country 的当地时间，若不在 [8:00, 23:00) 一律丢弃。
+        _tz_cc = pytz.timezone(get_timezone_for_country(chosen_country))
+        _actual_start_utc_for_check = (today_local_start_utc + _dt.timedelta(seconds=actual_start) - today_utc_start).total_seconds()
+        _local_cc = (today_utc_start + _dt.timedelta(seconds=_actual_start_utc_for_check)).astimezone(_tz_cc)
+        _h_cc = _local_cc.hour + _local_cc.minute / 60.0
+        if not (8.0 <= _h_cc < 23.0):
+            discard_reasons["outside_cc_work_hour"] = discard_reasons.get("outside_cc_work_hour", 0) + 1
+            continue
+        
         proxy = random.choice(proxy_by_country.get(chosen_country, proxy_pool_enabled))
         
         # 随机执行时长（网页浏览模式：任务时长=浏览网页时长，与配置一致）
@@ -1296,10 +1348,13 @@ def generate_daily_tasks(cfg):
         except Exception:
             tz = pytz.timezone("America/New_York")
         country_segments.setdefault(cc, [])
+        # 26.8.11.10 根因修复：country_segments 必须严格 = 工作时段 [8:00, 23:00)
+        #   之前是 7:00-24:00，导致补偿机制生成的时间点落到 7-8 / 23-24 边缘，
+        #   新函数被 outside_cc_work_hour 硬拦截后无二次补偿→任务量不足；旧函数直接通过→凌晨任务。
         for day_offset in range(-1, plan_days + 3):
             local_date = today_utc_start.date() + _dt.timedelta(days=day_offset)
-            local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(7, 0)))
-            local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(0, 0))) + _dt.timedelta(days=1)
+            local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(8, 0)))
+            local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(23, 0)))
             start_sec = (local_start.astimezone(pytz.UTC) - today_utc_start).total_seconds()
             end_sec = (local_end.astimezone(pytz.UTC) - today_utc_start).total_seconds()
             if start_sec < end_sec:
@@ -1339,7 +1394,8 @@ def generate_daily_tasks(cfg):
     tasks = []
     daily_summaries = []
     warnings = []
-    discard_reasons = {"past_time": 0, "out_of_window": 0, "out_of_coverage": 0, "soft_boundary": 0}
+    discard_reasons = {"past_time": 0, "out_of_window": 0, "out_of_coverage": 0, "soft_boundary": 0,
+                       "outside_cc_work_hour": 0}  # 26.8.11.9 新增：最终 cc 硬校验未通过的计数
     country_distribution = {}
     country_quota_target = {cc: 0 for cc in enabled_countries}
     country_quota_used = {cc: 0 for cc in enabled_countries}
@@ -1371,16 +1427,21 @@ def generate_daily_tasks(cfg):
             full_day_tasks = int(round(full_day_tasks * _peak_mult))
         elif _volatility_roll < 0.25:
             _valley_mult = random.uniform(0.3, 0.6)
-            full_day_tasks = max(1, int(round(full_day_tasks * _valley_mult)))
+            # 26.8.11.9 根因修复：低谷波动必须 >= 日流量下限（day_min），
+            #   禁止击穿用户配置的 daily_traffic_range.*.min（例：新站 min=30，低谷不能再压到 9）。
+            full_day_tasks = max(day_min, int(round(full_day_tasks * _valley_mult)))
         # 周末/节假日流量调整（模拟真实网站流量波动）
         _day_date = day_local_start.date() if hasattr(day_local_start, 'date') else day_local_start
         _wk_multiplier = get_weekend_holiday_multiplier(_day_date)
-        full_day_tasks = max(1, int(round(full_day_tasks * _wk_multiplier)))
+        # 26.8.11.9 同样加固：周末乘数后仍然不得低于 day_min（周六日只是减少但不能击穿下限）
+        full_day_tasks = max(day_min, int(round(full_day_tasks * _wk_multiplier)))
         if day_idx == 0:
             remain_ratio = max(0.0, (day_end_sec - available_start) / 86400.0)
             planned_for_day = int(round(full_day_tasks * remain_ratio))
-            # ★ 第一天最低保底：即使晚间生成计划，也保证至少20%日任务量或12个任务
-            _min_first_day = max(12, int(round(full_day_tasks * 0.20)))
+            # 26.8.11.9 根因修复：第一天按剩余时间比例换算后，
+            #   保底值必须同时满足：① ≥ 日硬性下限的 25%（且≥ day_min），② ≥ 12（机器保护老兜底）
+            #   禁止出现"day_min=30，但第一天只生成 12 条"这种明显低于日流量区间的计划。
+            _min_first_day = max(day_min, 12, int(round(full_day_tasks * 0.25)))
             if planned_for_day < _min_first_day and remain_ratio > 0:
                 planned_for_day = _min_first_day
             if full_day_tasks > 0 and remain_ratio > 0 and planned_for_day < 1:
@@ -1463,6 +1524,15 @@ def generate_daily_tasks(cfg):
             if not countries_at:
                 continue
             chosen_country = select_country_by_quota(countries_at, country_quota_used, country_quota_target) or random.choice(countries_at)
+            # 26.8.11.9 ★ 最终硬校验（防波堤）：把 tp 换算为 chosen_country 的当地时间，
+            #   若不在 [8:00, 23:00) 之间，一律丢弃，哪怕前面所有概率/补偿都通过了。
+            #   彻底杜绝 US 00:31 / GB 02:05 / CA 04:50 这种凌晨任务。
+            _tz_cc = pytz.timezone(get_timezone_for_country(chosen_country))
+            _local_cc = (today_utc_start + _dt.timedelta(seconds=actual_start_utc)).astimezone(_tz_cc)
+            _h_cc = _local_cc.hour + _local_cc.minute / 60.0
+            if not (8.0 <= _h_cc < 23.0):
+                discard_reasons["outside_cc_work_hour"] = discard_reasons.get("outside_cc_work_hour", 0) + 1
+                continue
             proxy = random.choice(proxy_by_country.get(chosen_country, proxy_pool_enabled))
             # ★ P1-5 对数正态替换均匀分布（右偏长尾，符合真人特征）
             browse_duration = _rt_logsample(
