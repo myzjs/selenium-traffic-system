@@ -21,7 +21,7 @@ import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
-APP_VERSION = "26.8.11.6"
+APP_VERSION = "26.8.11.7"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -8284,15 +8284,33 @@ log = StructuredLogger()
 ua_pool_manager = UAPoolManager()
 
 def get_proxy_from_vps():
-    """从 IPDeep 获取代理和IP信息（兼容旧调用）"""
-    return get_proxy_from_api_url(config["ip_proxy_api"], config.get("ip_proxy_user", ""), config.get("ip_proxy_pwd", ""), "US")
+    """从 IPDeep 获取代理和IP信息（兼容旧调用）
+
+    26.8.11.7 加固：api_url 为空时立即给出可理解错误 + 修复指引，不再抛 MissingSchema: Invalid URL '' 这类用户看不懂的异常。
+    """
+    _api = config.get("ip_proxy_api") or ""
+    if not _api.strip():
+        _hint = ("IPDeep 代理 API URL 为空！请检查以下二选一任一：\n"
+                 "  ① .env 文件：确认有 IP_PROXY_API / IP_PROXY_USER / IP_PROXY_PWD 三行且非空（推荐，避免明文落 config.json）\n"
+                 "  ② Web 前端「保存配置」页面：IP代理配置段三项都填，保存后会写入 config.json\n"
+                 f"  【当前】config[\"ip_proxy_api\"] len={len(_api)}，.env 加载状态：IP_PROXY_API={'已存在' if os.environ.get('IP_PROXY_API') else 'MISSING/空'}")
+        log.error(f"[IPDeep][26.8.11.7 加固报错] {_hint}")
+        raise RuntimeError(_hint)
+    return get_proxy_from_api_url(_api, config.get("ip_proxy_user", ""), config.get("ip_proxy_pwd", ""), "US")
 
 def get_proxy_from_api_url(api_url, api_user, api_pwd, country_code="US"):
     """直连 IPDeep API 获取代理（代理池方式）
     
     统一使用 ip_provider 模块，消除重复代码。
     内部复用 IPProvider._fetch_proxy_from_ipdeep 的实现。
+
+    26.8.11.7 加固：入口立即校验 URL，不把空值留给 requests（MissingSchema 信息无意义）。
     """
+    if not isinstance(api_url, str) or not api_url.strip() or not (api_url.startswith("http://") or api_url.startswith("https://")):
+        _hint = (f"代理 API URL 非法（len={len(api_url) if isinstance(api_url,str) else 'N/A'}）：{repr(api_url)[:120]}\n"
+                 f"  修复：在 .env 设置 IP_PROXY_API=https://api.ipdeep.com/...（完整 URL 带 id 参数）")
+        log.error(f"[IPDeep][26.8.11.7 加固报错] {_hint}")
+        raise ValueError(_hint)
     # 确保 ip_provider 使用最新配置
     try:
         _ip_provider.configure_ip_provider(config)
