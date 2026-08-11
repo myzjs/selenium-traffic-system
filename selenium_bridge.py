@@ -1459,8 +1459,47 @@ class _CDPSession:
         self.page = page
 
     def send(self, method: str, params: Dict = None) -> Any:
-        """发送 CDP 命令（如 Input.dispatchMouseEvent / Input.dispatchKeyEvent）"""
-        return self.driver.execute_cdp_cmd(method, params or {})
+        """发送 CDP 命令（Selenium 3/4/5 通吃的兼容实现）
+        - 优先使用 Selenium 4+ 官方 API: driver.execute_cdp_cmd(method, params)
+        - 若 driver 没有该属性（Selenium 3.x 场景），走 command_executor 兜底
+        """
+        _params = params or {}
+        driver = self.driver
+        # 方法 1：Selenium 4.0+ 原生 execute_cdp_cmd
+        if hasattr(driver, "execute_cdp_cmd") and callable(getattr(driver, "execute_cdp_cmd", None)):
+            try:
+                return driver.execute_cdp_cmd(method, _params)
+            except TypeError:
+                # 个别版本签名不匹配，跳过走兜底
+                pass
+        # 方法 2：Selenium 3.x → 通过 command_executor 注入 executeCdpCommand 端点
+        _cmd_exec = getattr(driver, "command_executor", None)
+        if _cmd_exec is not None and hasattr(_cmd_exec, "_commands"):
+            if "executeCdpCommand" not in _cmd_exec._commands:
+                try:
+                    _cmd_exec._commands["executeCdpCommand"] = (
+                        "POST",
+                        "/session/$sessionId/goog/cdp/execute",
+                    )
+                except Exception:
+                    pass
+            try:
+                result = _cmd_exec.execute(
+                    "executeCdpCommand",
+                    {"cmd": method, "params": _params},
+                )
+            except TypeError:
+                try:
+                    result = _cmd_exec.execute("executeCdpCommand", method, _params)
+                except Exception:
+                    result = None
+            if isinstance(result, dict) and "value" in result:
+                return result["value"]
+            return result
+        raise RuntimeError(
+            f"当前 Selenium 驱动不支持发送 CDP 命令（driver={type(driver).__name__}，"
+            f"has_execute_cdp_cmd={hasattr(driver, 'execute_cdp_cmd')}）"
+        )
 
     def close(self):
         pass

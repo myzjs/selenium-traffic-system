@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import threading
+import unittest  # 26.8.11.3 新增：class-based TestCase 基类
 from typing import Any, Dict, Optional
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,8 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+APP_PATH = os.path.join(PROJECT_ROOT, "app.py")  # 26.8.11.3 新增：统一 app.py 绝对路径
 
 
 # ===========================================================================
@@ -688,4 +691,134 @@ class TestHeartbeatMonitoring:
         )
         assert has_dict_key(src, "heartbeat_monitored", r"(?:True|False|\S+)"), (
             "diagnostics 缺少 heartbeat_monitored 标志位"
+        )
+
+
+# ======================================================================
+# 26.8.11.3 新增：Selenium 3/4/5 CDP 调用兼容层 + 服务自恢复调度器
+# ======================================================================
+class Test_CDP_Session_Compat_26_8_11_3(unittest.TestCase):
+    """修复：Selenium 3 场景 driver 没有 execute_cdp_cmd 时，_CDPSession.send 自动走
+    command_executor 兜底，不再抛 AttributeError（导致 Pop-under 线程崩 → worker 死 → 任务自动停）。"""
+
+    def test_cdp_session_send_without_native_execute_cdp_cmd(self):
+        """driver 无 execute_cdp_cmd 属性（Selenium 3）→ 自动走 command_executor 兜底，
+        不抛 AttributeError；能正确把 cmd/params 投递到 executeCdpCommand 端点。"""
+        try:
+            import selenium  # noqa: F401
+        except Exception:
+            pytest.skip("selenium not installed in test env (server-only module)")
+        import sys
+        sys.path.insert(0, PROJECT_ROOT)
+        try:
+            from selenium_bridge import _CDPSession  # noqa: E402
+        except Exception as _e:
+            pytest.skip(f"selenium_bridge import failed in test env ({type(_e).__name__})")
+
+        call_log = []
+
+        class _FakeCmdExec:
+            def __init__(self):
+                self._commands = {}
+
+            def execute(self, *args):
+                call_log.append(args)
+                return {"value": {"ok": True, "cmd": args[1]["cmd"] if len(args) > 1 else None}}
+
+        class _FakeDriver3:
+            def __init__(self):
+                self.command_executor = _FakeCmdExec()
+            # 故意不定义 execute_cdp_cmd（模拟 Selenium 3.x）
+
+        cdp = _CDPSession(_FakeDriver3())
+        # act
+        res = cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": 100, "y": 200})
+        # assert
+        self.assertTrue(call_log, "兜底路径未被调用（call_log 空）")
+        first_call = call_log[0]
+        self.assertEqual(first_call[0], "executeCdpCommand", f"未走 executeCdpCommand 端点：{first_call[0]}")
+        body = first_call[1]
+        self.assertEqual(body["cmd"], "Input.dispatchMouseEvent")
+        self.assertEqual(body["params"]["type"], "mousePressed")
+        self.assertEqual(body["params"]["x"], 100)
+        self.assertEqual(res.get("cmd"), "Input.dispatchMouseEvent")
+
+    def test_cdp_session_send_prefers_native_execute_cdp_cmd_when_available(self):
+        """driver 有 execute_cdp_cmd（Selenium 4）→ 优先走原生，不用 command_executor。"""
+        try:
+            import selenium  # noqa: F401
+        except Exception:
+            pytest.skip("selenium not installed in test env (server-only module)")
+        import sys
+        sys.path.insert(0, PROJECT_ROOT)
+        try:
+            from selenium_bridge import _CDPSession  # noqa: E402
+        except Exception as _e:
+            pytest.skip(f"selenium_bridge import failed in test env ({type(_e).__name__})")
+
+        native_log = []
+        fallback_log = []
+
+        class _FakeCmdExec:
+            def __init__(self):
+                self._commands = {}
+
+            def execute(self, *a, **kw):
+                fallback_log.append((a, kw))
+                return {"value": "fallback"}
+
+        class _FakeDriver4:
+            def __init__(self):
+                self.command_executor = _FakeCmdExec()
+
+            def execute_cdp_cmd(self, method, params):
+                native_log.append((method, params))
+                return {"source": "native", "method": method, "params": params}
+
+        cdp = _CDPSession(_FakeDriver4())
+        res = cdp.send("Network.enable", {})
+        # assert 走了 native，没走 fallback
+        self.assertEqual(len(native_log), 1, "未命中原生 execute_cdp_cmd 分支")
+        self.assertEqual(native_log[0][0], "Network.enable")
+        self.assertEqual(len(fallback_log), 0, "有原生路径时不应该走 fallback")
+        self.assertEqual(res["source"], "native")
+
+
+class Test_App_AutoResume_26_8_11_3(unittest.TestCase):
+    """修复：Flask 启动时若 config.enabled=True，自动启动 worker_task 线程，
+    避免 systemctl restart / OOM kill 后任务计数器归零、必须手动调 POST /start_task。"""
+
+    def test_app_main_auto_resume_code_present(self):
+        """AST/文本匹配：app.py 的 __main__ 块必须同时存在 3 个特征片段。"""
+        with open(APP_PATH, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn(
+            'config.get("enabled", False) and not task_running',
+            src,
+            "缺少 enabled+not running 的自恢复触发条件",
+        )
+        self.assertIn(
+            "name=\"auto-resume-worker\"",
+            src,
+            "缺少 auto-resume-worker 线程命名（后续日志识别依赖此名字）",
+        )
+        self.assertIn(
+            "target=worker_task,",
+            src,
+            "自恢复线程 target 必须指向 worker_task",
+        )
+        self.assertIn(
+            "✅ [自恢复] config.enabled=True",
+            src,
+            "缺少自恢复启动成功的 INFO 日志（之后 grep 验证需要）",
+        )
+
+    def test_app_main_auto_resume_exception_is_caught(self):
+        """自恢复启动失败时，必须走 except 分支记录 warning，不得把异常抛到 app.run 之前。"""
+        with open(APP_PATH, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn(
+            "⚠️ [自恢复] 自动启动任务调度器失败",
+            src,
+            "缺少自恢复失败的 WARNING 兜底日志（启动失败会让 Flask 起不来）",
         )

@@ -21,7 +21,7 @@ import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
-APP_VERSION = "26.8.11.2"
+APP_VERSION = "26.8.11.3"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -18764,4 +18764,22 @@ if __name__ == "__main__":
     # 优先读取环境变量，无参数默认5001
     port = int(os.getenv("RUN_PORT",5001))
     host = os.getenv("RUN_HOST","0.0.0.0")
+
+    # ★ 26.8.11.3 新增：若 config.enabled=True，服务启动后自动启动任务调度器（含断点恢复）
+    #   —— 避免每次 systemctl restart / OOM kill / 服务器重启后，必须手动调 POST /start_task
+    if config.get("enabled", False) and not task_running:
+        try:
+            import threading as _auto_thr
+            _auto_thr.Thread(
+                target=worker_task,
+                kwargs={"single_task": False, "adsl_ip_task": False},
+                daemon=True,
+                name="auto-resume-worker",
+            ).start()
+            log.info("✅ [自恢复] config.enabled=True，服务启动时自动启动任务调度器（断点自动恢复）")
+        except Exception as _auto_e:
+            log.warning(
+                f"⚠️ [自恢复] 自动启动任务调度器失败：{type(_auto_e).__name__}: {str(_auto_e)[:200]}"
+            )
+
     app.run(host=host,port=port)
