@@ -21,7 +21,7 @@ import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
-APP_VERSION = "26.8.11.5"
+APP_VERSION = "26.8.11.6"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -15991,8 +15991,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         
                         # ==================== 任务结果 ====================
                         task_time = time.time() - task_start_time
-                        # ★ 有效流量判定：广告监控检测到曝光 OR 页面确实含有广告代码（联盟会自行计数）
-                        traffic_valid = bool(ad_loaded and ad_impressions > 0) or _has_ad_code
+                        # ★ 有效流量判定（合规铁律 26.8.11.6 根因修复）：仅当广告监控真实检测到广告加载 AND 曝光数>0 才算有效。
+                        #    严禁仅凭 _has_ad_code（页面含广告 JS 字符串）就判有效——那是假成功，会导致 HilltopAds 后台 0 收益但本地以为"跑成功了"。
+                        traffic_valid = bool(ad_loaded and ad_impressions > 0)
                         valid_traffic = traffic_valid
                         success = bool(load_success and consistency)
                         if success and not traffic_valid:

@@ -654,6 +654,7 @@ def main() -> int:
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--max-iter", type=int, default=5, help="最大迭代轮数，默认 5（防止死循环）")
     ap.add_argument("--watch", action="store_true", help="检测到代码改动后自动进入下一轮")
+    ap.add_argument("--idle-sleep", type=int, default=30, help="每轮之间默认 sleep 秒数（无 --watch 时），默认 30；调试时可设 5 加速")
     ap.add_argument("--auto-commit", action="store_true", help="本轮 0 错误 AND Stage7 通过后，版本号自增 → commit → push → 部署 US")
     ap.add_argument("--grace", type=int, default=2, help="同一连续错误容忍次数（默认 2），避免越改越坏/收益永远不到立刻停")
     ap.add_argument("--report-dir", default=str(REPORT_DIR_DEFAULT), help=f"报告输出目录（默认 {REPORT_DIR_DEFAULT}）")
@@ -751,8 +752,8 @@ def main() -> int:
                 print("[Watch] 超时无改动，结束")
                 return 4
         else:
-            wait_s = 30
-            print(f"\n⏳ 无 --watch，默认 {wait_s}s 后进入下一轮（Ctrl+C 可提前停）")
+            wait_s = args.idle_sleep  # 26.8.11.5：改为 CLI 可配置（默认 30，调试时 5）
+            print(f"\n⏳ 无 --watch，默认 {wait_s}s 后进入下一轮（Ctrl+C 可提前停；用 --idle-sleep 调整时长）")
             time.sleep(wait_s)
     return 0
 
