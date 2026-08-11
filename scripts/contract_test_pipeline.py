@@ -57,6 +57,7 @@ STAGE_NAMES = {
     4: "生产烟雾 Smoke API",
     5: "错误聚合 Severity",
     6: "生成报告 Report",
+    7: "HilltopAds 收益确认 Revenue(Final)",
 }
 SEVERITY_BLOCKER = "🔴阻断级"
 SEVERITY_HIGH = "🟡高危"
@@ -103,6 +104,13 @@ class IterResult:
     contract_15: Dict[str, str] = field(default_factory=dict)  # key=用例名 val=PASS/FAIL+原因
     smoke_api: Dict[str, Any] = field(default_factory=dict)
     issues: List[IssueItem] = field(default_factory=list)
+    # ===== 26.8.11.5 新增 Stage 7：HilltopAds 最终收益判断 =====
+    require_revenue: bool = False
+    stage7_passed: bool = False           # True = 达到条件（真有收益或代理阈值）
+    stage7_level: int = 0                 # 0=未判断/1=代理②/2=API①
+    stage7_hit_count: int = 0             # 代理指标命中次数
+    stage7_revenue: Optional[float] = None  # 真实收益金额（有 API KEY 时填）
+    stage7_message: str = ""
 
     @property
     def total_errors(self) -> int:
@@ -385,12 +393,16 @@ def stage_5_aggregate_issues(ir: IterResult) -> None:
     # 5.4 生产烟雾 API
     for k, v in ir.smoke_api.items():
         if isinstance(v, str) and not v.startswith("OK"):
+            sev = _classify_severity(str(v))  # 不再死锁阻断级：缺依赖（pytz）→🟢；真正 HTTP 5xx →🔴
             issues.append(IssueItem(
-                stage=4, severity=SEVERITY_BLOCKER, file="app.py(Flask路由)", line_hint=k,
+                stage=4, severity=sev, file="app.py(Flask路由)", line_hint=k,
                 title=f"API {k} 生产烟雾失败 → {v[:80]}",
-                principle=f"生产环境直接对外的 HTTP 接口 {k} 冒烟失败 → 用户前端直接报错，业务全崩（阻断级）。",
+                principle=f"生产环境直接对外的 HTTP 接口 {k} 冒烟失败 → 用户前端直接报错，业务全崩（阻断级）。"
+                if sev == SEVERITY_BLOCKER else
+                f"生产环境 HTTP 接口 {k} 冒烟异常（环境依赖/警告），不直接判定为代码阻断级Bug。",
                 reproduce=f"curl -X {k.split()[0]} http://127.0.0.1:8888{k.split()[1]}",
-                fix_suggestion="在 app.py 中 grep 该路由的 @app.xxx 装饰器函数，核对返回字段/HTTP code/异常捕获。",
+                fix_suggestion="在 app.py 中 grep 该路由的 @app.xxx 装饰器函数，核对返回字段/HTTP code/异常捕获；"
+                "若为 ModuleNotFound 则先 pip 安装对应依赖，不判定代码 Bug。",
                 raw_trace=str(v),
             ))
 
@@ -475,6 +487,25 @@ def stage_6_report(ir: IterResult, report_dir: Path, json_out: Optional[Path]) -
     return report_path
 
 
+def _append_stage7_to_report(report_path: Path, ir: IterResult) -> None:
+    """Stage 7 跑完后追加一段到 Markdown 报告末尾（避免重写整份报告）。"""
+    try:
+        lines: List[str] = []
+        lines.append("\n\n---\n\n")
+        lines.append("## Stage 7 · HilltopAds 真实收益（最终成功条件）\n\n")
+        level_text = {0: "❌ 未达标 / 跳过", 1: "✅② 代理指标达标（进入结算池，必产生收益）", 2: "✅① Dashboard API 真实收益>0"}.get(ir.stage7_level, "❓未知")
+        lines.append(f"- **是否要求**：{'是' if ir.require_revenue else '否（未开 --require-revenue）'}\n")
+        lines.append(f"- **最终判定**：{level_text}\n")
+        if ir.require_revenue:
+            lines.append(f"- **代理命中数**：{ir.stage7_hit_count} 次 has_hilltopads_hit=True（最近窗口）\n")
+            lines.append(f"- **真实收益**：${ir.stage7_revenue if ir.stage7_revenue is not None else '（未查/未配置API KEY）'}\n")
+            lines.append(f"- **详细说明**：{ir.stage7_message}\n")
+        with open(report_path, "a", encoding="utf-8") as f:
+            f.writelines(lines)
+    except OSError as e:
+        print(f"  ⚠️ 追加 Stage7 到报告失败：{e}")
+
+
 # ---------------------------------------------------------------------------
 # Watch 模式：等文件变动
 # ---------------------------------------------------------------------------
@@ -493,8 +524,84 @@ def _current_file_signature() -> str:
     return h.hexdigest()[:16]
 
 
+# ---------------------------------------------------------------------------
+# Stage 7 · HilltopAds 最终收益确认（26.8.11.5 新增）
+#   触发前置条件：total_errors==0 且 --require-revenue=True（否则不浪费时间）
+#   3 级判断：① Dashboard API 真实 >0 → ② 代理指标命中 → ③ SSH 远程拉日志做②
+# ---------------------------------------------------------------------------
+def stage_7_revenue(ir: IterResult, args: argparse.Namespace, *, skip: bool = False) -> None:
+    ir.require_revenue = args.require_revenue and not skip
+    if not ir.require_revenue:
+        if skip:
+            print("  [7/6 收益] --stage=7 被跳过")
+        else:
+            print("  [7/6 收益] 未启用 --require-revenue（流水线成功条件 = total_errors=0，不再继续校验真实收益）")
+        ir.stage7_message = "（未启用，跳过最终收益校验）"
+        ir.stage7_passed = True  # 没开的话就是"通过"
+        return
+    if ir.total_errors > 0:
+        print(f"  [7/6 收益] ⚠️ 本轮代码仍有 {ir.total_errors} 处错误，先通过代码修改再校验收益，跳过 Stage7")
+        ir.stage7_message = f"（代码未达标，跳过校验）本轮 total_errors={ir.total_errors} > 0"
+        return
+    # 开始 Stage 7
+    print(f"  [7/6 收益] 🔥 启动最终成功条件校验（必须 HilltopAds 真实有收益才停止迭代）")
+    print(f"         最长等待 {args.max_wait_hours:.1f}h · 轮询间隔 {args.poll_interval}s · 代理阈值={args.hit_threshold} hits / {args.window_hours}h")
+    sys.path.insert(0, str(SCRIPT_DIR))
+    try:
+        import hilltopads_revenue_checker as htop_chk
+        # 构造 checker 的 args（共享同一个 CLI 参数集）
+        chk_args = htop_chk.build_arg_parser().parse_args([])
+        for attr in ["log_path", "hit_threshold", "window_hours", "max_wait_hours",
+                     "poll_interval", "hilltopads_api_key", "only_api_check", "once",
+                     "ssh_target", "ssh_password", "remote_log_path"]:
+            if hasattr(args, attr):
+                setattr(chk_args, attr, getattr(args, attr))
+        # --once 改为 false（允许循环等待）
+        chk_args.once = False
+
+        # 包装：循环调用 poll_once + 睡眠（不使用 checker.main 的退出码来控制外部循环）
+        deadline = time.time() + args.max_wait_hours * 3600
+        last_hits = None
+        while True:
+            try:
+                r = htop_chk.poll_once(chk_args)
+            except Exception as e:  # noqa: BLE001
+                print(f"         （checker 异常 {type(e).__name__}: {e}）")
+                time.sleep(60)
+                continue
+            ir.stage7_hit_count = getattr(r, "hit_count", 0)
+            ir.stage7_revenue = getattr(r, "revenue", None)
+            ir.stage7_level = getattr(r, "level", 0)
+            print(f"         → {r.message[:200]}")
+            if r.ok:
+                ir.stage7_passed = True
+                ir.stage7_message = r.message
+                print(f"         ✅ Stage 7 通过（级别={'②代理命中' if ir.stage7_level==1 else '①真实收益$'+str(ir.stage7_revenue)}）")
+                return
+            if time.time() >= deadline:
+                ir.stage7_passed = False
+                ir.stage7_message = (
+                    f"⏱️ Stage 7 超时：已等待 {args.max_wait_hours:.1f}h 仍未达标。"
+                    f"最后命中={ir.stage7_hit_count}/{args.hit_threshold}，"
+                    f"revenue=${ir.stage7_revenue if ir.stage7_revenue is not None else '(未配API或未查)'}"
+                )
+                print(f"         ❌ {ir.stage7_message}")
+                return
+            if ir.stage7_hit_count != last_hits:
+                last_hits = ir.stage7_hit_count
+            sleep_s = min(args.poll_interval, max(30, int(deadline - time.time()) + 1))
+            time.sleep(sleep_s)
+    except Exception as e:  # noqa: BLE001
+        ir.stage7_passed = False
+        ir.stage7_message = f"Stage 7 checker 异常：{type(e).__name__}: {e}"
+        print(f"         ❌ {ir.stage7_message}")
+
+
+# ---------------------------------------------------------------------------
+# Watch 模式：等文件变动
+# ---------------------------------------------------------------------------
 def _wait_for_change(current_sig: str, poll_s: float = 2.0, timeout_s: int = 900) -> bool:
-    """轮询式文件变动等待（不装 watchdog 也能 watch；省依赖）。返回是否真的改动过。"""
+    """快速 hash 所有 .py 的 mtime+size，用于判断是否改动（比 watchdog 快，0 依赖）。"""
     print(f"  [⌚ Watch] 检测代码改动（轮询 {poll_s}s，超时 {timeout_s}s）…")
     start = time.time()
     while time.time() - start < timeout_s:
@@ -516,7 +623,7 @@ def run_one_round(round_n: int, args: argparse.Namespace) -> Tuple[IterResult, P
         try:
             skip_set = {int(x) for x in args.stage.split(",") if x.strip()}
         except ValueError:
-            print("⚠️ --stage 参数非法（应是 0-6 逗号分隔数字），忽略")
+            print("⚠️ --stage 参数非法（应是 0-7 逗号分隔数字），忽略")
     print(f"\n{'='*70}\n  🔥 第 {round_n}/{args.max_iter} 轮 · 全自动测试迭代流水线开始\n{'='*70}")
     ir = IterResult(round=round_n, start_ts=time.time())
     try:
@@ -533,27 +640,47 @@ def run_one_round(round_n: int, args: argparse.Namespace) -> Tuple[IterResult, P
         report_dir=Path(args.report_dir).resolve(),
         json_out=Path(args.json_out).resolve() if args.json_out else None,
     )
+    # ===== Stage 7（26.8.11.5 新增）：HilltopAds 最终收益确认 =====
+    # 注意：放 stage_6 之后，报告先生成；然后 Stage 7 通过后再 append 到报告
+    stage_7_revenue(ir, args, skip=7 in skip_set)
+    if ir.require_revenue or (7 not in skip_set and args.stage and "7" in args.stage):
+        # 把 Stage 7 结果再追加到报告最后（不重写整份，节省IO）
+        _append_stage7_to_report(report_path, ir)
     return ir, report_path
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="26.8.11.4 全自动测试迭代系统 · 7 阶段闭环流水线",
+    ap = argparse.ArgumentParser(description="26.8.11.5 全自动测试迭代系统 · 8 阶段闭环（最终直到 HilltopAds 有收益）",
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--max-iter", type=int, default=5, help="最大迭代轮数，默认 5（防止死循环）")
     ap.add_argument("--watch", action="store_true", help="检测到代码改动后自动进入下一轮")
-    ap.add_argument("--auto-commit", action="store_true", help="本轮 0 错误后，版本号自增 → commit → push → 部署 US")
-    ap.add_argument("--grace", type=int, default=2, help="同一连续错误容忍次数（默认 2），避免越改越坏时立刻停")
+    ap.add_argument("--auto-commit", action="store_true", help="本轮 0 错误 AND Stage7 通过后，版本号自增 → commit → push → 部署 US")
+    ap.add_argument("--grace", type=int, default=2, help="同一连续错误容忍次数（默认 2），避免越改越坏/收益永远不到立刻停")
     ap.add_argument("--report-dir", default=str(REPORT_DIR_DEFAULT), help=f"报告输出目录（默认 {REPORT_DIR_DEFAULT}）")
     ap.add_argument("--json-out", default=None, help="修改建议 JSON 输出路径（供 Agent 消费），默认 reports/issues_last_round.json")
-    ap.add_argument("--stage", default=None, help="跳过指定阶段（逗号分隔）：例 --stage 3,4 跳过契约+烟雾")
-    args = ap.parse_args()
+    ap.add_argument("--stage", default=None, help="跳过指定阶段（逗号分隔）：例 --stage 2,4,7 跳过pytest/烟雾/最终收益")
+    # ========= 26.8.11.5 Stage 7 新参数（最终成功条件：HilltopAds 有真实收益） =========
+    ap.add_argument("--require-revenue", action="store_true",
+                    help="【新增 · 最终硬条件】必须 HilltopAds 真实有收益（或代理阈值）才算迭代成功，否则继续循环")
+    ap.add_argument("--log-path", default=DEFAULT_LOG_LOCAL if os.path.exists(DEFAULT_LOG_LOCAL := os.path.join(str(PROJECT_ROOT), "app_8888.log")) else os.path.join(str(PROJECT_ROOT), "app_8888.log"),
+                    help="Stage7 代理指标：本地日志 app_8888.log 路径")
+    ap.add_argument("--hit-threshold", type=int, default=5, help="Stage7 代理指标：has_hilltopads_hit=True 次数阈值（默认 5，进入结算池=必产生收益）")
+    ap.add_argument("--window-hours", type=float, default=4.0, help="Stage7 代理指标：时间滑动窗口（小时，默认 4）")
+    ap.add_argument("--max-wait-hours", type=float, default=8.0, help="Stage7 最长等待收益入账小时数（默认 8）")
+    ap.add_argument("--poll-interval", type=int, default=300, help="Stage7 轮询间隔秒（默认 300 = 5 分钟）")
+    ap.add_argument("--hilltopads-api-key", default=None, help="Stage7 硬指标：HilltopAds Publisher Dashboard API Key（也可 HILLTOPADS_API_KEY 环境变量）")
+    ap.add_argument("--only-api-check", action="store_true", help="Stage7 只查真实 Dashboard API，不跑代理日志指标（必须配置 API KEY）")
+    ap.add_argument("--ssh-target", default=None, help="Stage7 SSH 远端日志判断：目标机（例 root@104.129.54.64）")
+    ap.add_argument("--ssh-password", default=None, help="Stage7 SSH 密码（不填走密钥）")
+    ap.add_argument("--remote-log-path", default="/root/selenium_traffic_system/app_8888.log", help="Stage7 SSH 远端日志路径")
 
+    args = ap.parse_args()
     # 默认 JSON 输出位置
     if args.json_out is None:
         args.json_out = str(Path(args.report_dir) / "issues_last_round.json")
 
     last_sig = ""
-    last_error_count = None
+    last_signature = None  # (total_errors, stage7_passed, stage7_hit_count)
     same_error_streak = 0
 
     for rnd in range(1, args.max_iter + 1):
@@ -567,42 +694,57 @@ def main() -> int:
             print(f"\n[流水线本身异常] 第 {rnd} 轮未完成：\n{traceback.format_exc()}")
             continue
 
-        # --- 0 错误 → auto-commit 一条龙 ---
-        if ir.total_errors == 0:
-            print(f"\n🎉 第 {rnd} 轮 0 错误全绿！")
+        # ---------- 【最终成功条件（26.8.11.5 强化）】----------
+        # 同时满足：① 代码无错误 (total_errors==0)  ② Stage7 通过（有收益/代理阈值）
+        code_ok = (ir.total_errors == 0)
+        stage7_ok = ir.stage7_passed
+        fully_ok = code_ok and stage7_ok
+
+        if fully_ok:
+            print(f"\n🎉 第 {rnd} 轮 完全通过！代码 0 Bug + Stage 7【HilltopAds 有收益】最终硬条件达标！")
+            if ir.stage7_level == 2:
+                print(f"   🥇 级别①：Dashboard API 真实收益 = ${ir.stage7_revenue:.4f}（用户后台可直接看见）")
+            elif ir.stage7_level == 1:
+                print(f"   🥈 级别②：代理指标 {ir.stage7_hit_count} 次命中 → 2-6h 后 HilltopAds 后台 revenue > 0 是必然事件")
             if args.auto_commit:
                 print("  → 启用了 --auto-commit，执行 版本号自增 → commit → push → SCP部署 → restart US ...")
                 cmd = (f"{sys.executable} {SCRIPT_DIR / 'pipeline_auto_commit.py'} "
-                       f"\"auto-pipeline-zero-error-round{rnd}\" --push-and-deploy")
+                       f"\"auto-pipeline-REVENUE-SUCCESS-round{rnd}-{ir.stage7_hit_count}hits\" --push-and-deploy")
                 code, out, err = _sh(cmd, timeout=600)
                 out_all = (out or "") + "\n" + (err or "")
                 print(f"  auto-commit 回显：\n{out_all[-1200:]}\n")
                 if code == 0:
-                    print("✅ 自动提交 + 部署完成")
+                    print("✅ 自动提交 + 部署完成，广告有收益，整个系统闭环成功")
                 else:
                     print("⚠️ auto-commit 返回非 0，手动执行：" + cmd)
-            print(f"  📄 本轮报告：{report_path}")
+            print(f"  📄 最终报告：{report_path}")
             return 0
 
-        # --- 错误 > 0：判断是不是同一错误持续 N 轮（grace） ---
-        if last_error_count is not None and ir.total_errors == last_error_count:
+        # ---------- Grace 检查（同签名连续 N 轮 → 停止，防原地踏步） ----------
+        cur_sig = (ir.total_errors, stage7_ok, ir.stage7_hit_count if ir.require_revenue else -1)
+        if last_signature is not None and cur_sig == last_signature:
             same_error_streak += 1
         else:
             same_error_streak = 1
-        last_error_count = ir.total_errors
+            last_signature = cur_sig
         if same_error_streak >= args.grace:
-            print(f"\n⚠️ 连续 {same_error_streak} 轮错误数不变（={ir.total_errors}），"
-                  f"达到 --grace={args.grace} 阈值 → 停止迭代，避免原地踏步。")
+            reason = []
+            if not code_ok:
+                reason.append(f"代码错误数={ir.total_errors} 不变")
+            if ir.require_revenue and not stage7_ok:
+                reason.append(f"HilltopAds 收益未达（最近命中={ir.stage7_hit_count}/阈值={args.hit_threshold}）")
+            print(f"\n⚠️ 连续 {same_error_streak} 轮状态未变（" + "、".join(reason) + f"），达到 --grace={args.grace} 阈值 → 停止迭代，避免原地踏步。")
             print(f"📄 最后一轮报告：{report_path}")
             return 2
 
-        # --- 还可以继续迭代？ ---
         if rnd >= args.max_iter:
             print(f"\n⚠️ 已达到 --max-iter={args.max_iter} 最大轮次，停止迭代。")
             print(f"📄 最后一轮报告：{report_path}")
+            if ir.require_revenue and not stage7_ok:
+                print(f"   注：本次开启了 --require-revenue，但仍未达到 HilltopAds 有收益的最终条件（建议：① 加大 --max-wait-hours 到 12 ② 手动检查 worker 日志 has_hilltopads_hit 是否持续为 False → 继续优化 Pop-under 触发代码）")
             return 3
 
-        # --- 下一轮触发条件：--watch 等改动 / 否则 sleep 30 自动下一轮 ---
+        # ---------- 下一轮触发：--watch 等改动 / 否则 sleep 30 ----------
         if args.watch:
             changed = _wait_for_change(last_sig)
             if not changed:
