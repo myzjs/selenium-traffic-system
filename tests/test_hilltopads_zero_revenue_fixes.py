@@ -541,3 +541,151 @@ def _extract_func_return_simple(src: str, func_name: str):
             break
     func_src = "\n".join(lines[start:end])
     return func_src
+
+
+# ===========================================================================
+# #5 26.8.11.2 新增：Pop-under Heartbeat 监听日志
+# ===========================================================================
+class TestHeartbeatMonitoring:
+    """验证 heartbeat URL 分类、分析函数、守护线程签名等新增能力。"""
+
+    # ------------------------------------------------------------------
+    # 5a. URL 分类：_is_heartbeat_url 正例/反例/排除项全覆盖
+    # ------------------------------------------------------------------
+    def test_heartbeat_url_hilltopads_domains_always_hit(self):
+        """HilltopAds/Traffichunt/HtopCDN 域名命中任何路径都算 heartbeat。"""
+        from popunder_trigger import _is_heartbeat_url
+
+        assert _is_heartbeat_url("https://cdn1.hilltopads.com/api/hb?slot=123") is True
+        assert _is_heartbeat_url("https://track.traffichunt.net/pixel.gif") is True
+        assert _is_heartbeat_url("https://htopcdn.com/stat?e=imp") is True
+        # 即使没有路径关键词，光靠域名也必须命中
+        assert _is_heartbeat_url("https://hilltopads.com/") is True
+
+    def test_heartbeat_url_static_resources_excluded(self):
+        """普通静态资源（CSS/JS/字体/普通图片）：因为没命中 heartbeat 关键词 → 返回 False。
+        ★ 注意：pixel.gif / heartbeat.png 是典型广告像素，它们"命中关键词 → True"是【正确行为】，
+        不算误报。这里只验证"不命中关键词的普通资源"不会被当成 heartbeat。
+        """
+        from popunder_trigger import _is_heartbeat_url
+
+        # --- 正常静态资源（文件名/路径里完全没关键词）→ False ---
+        assert _is_heartbeat_url("https://cdn.example.com/static/logo.png") is False
+        assert _is_heartbeat_url("https://cdn.example.com/assets/main.css") is False
+        assert _is_heartbeat_url("https://cdn.example.com/assets/app.bundle.js") is False
+        assert _is_heartbeat_url("https://cdn.example.com/fonts/Inter-Regular.woff2") is False
+        assert _is_heartbeat_url("https://cdn.example.com/img/hero-banner.jpg") is False
+        # 带 query 的普通静态资源 → 也 False
+        assert _is_heartbeat_url("https://cdn.example.com/img/hero-banner.jpg?v=20240811") is False
+
+        # --- 含关键词的 GIF/PNG（典型广告跟踪像素）→ 是 heartbeat，不应被排除 ---
+        #    这才是 HilltopAds 真的在发的统计请求格式
+        assert _is_heartbeat_url("https://track.example.org/pixel.gif?rid=abc123") is True
+        assert _is_heartbeat_url("https://pixel.example.com/impression.png?slot=7") is True
+
+    def test_heartbeat_url_negative_ordinary_pages(self):
+        """普通 HTML 页面 / JS / 无关键词 API 必须返回 False。"""
+        from popunder_trigger import _is_heartbeat_url
+
+        assert _is_heartbeat_url("https://example.com/") is False
+        assert _is_heartbeat_url("https://example.com/article/123.html") is False
+        assert _is_heartbeat_url("https://example.com/assets/app.bundle.js") is False
+        assert _is_heartbeat_url("https://api.example.com/v2/user/info") is False
+        # 非 http/https（about:blank / blob）→ False
+        assert _is_heartbeat_url("about:blank") is False
+        assert _is_heartbeat_url("") is False
+
+    # ------------------------------------------------------------------
+    # 5b. 分析函数：_analyze_heartbeat_records 的三类典型场景
+    # ------------------------------------------------------------------
+    def test_analyze_two_plus_heartbeats_summary_ok(self):
+        """2+ heartbeat 返回 first/second_at 时间差合理 + HilltopAds 域名命中识别。"""
+        from popunder_trigger import _analyze_heartbeat_records
+
+        started = 1700000000.0
+        records = [
+            {"t": started + 1.2,  "url": "https://landing.example.com/main.js", "method": "GET"},
+            {"t": started + 12.3, "url": "https://cdn1.hilltopads.com/api/hb?slot=A", "method": "GET"},
+            {"t": started + 15.0, "url": "https://cdn.example.com/banner.jpg", "method": "GET"},
+            {"t": started + 22.8, "url": "https://track.traffichunt.net/hb?rid=xyz", "method": "POST"},
+            {"t": started + 30.1, "url": "https://thirdparty.test/pixel?v=1", "method": "GET"},
+        ]
+        summary = _analyze_heartbeat_records(records, started)
+        assert summary["heartbeat_count"] >= 3, f"应命中 3+，实={summary['heartbeat_count']}"
+        assert summary["first_at"] == pytest.approx(12.3, 0.01)
+        assert summary["second_at"] == pytest.approx(22.8, 0.01)
+        assert summary["has_hilltopads_hit"] is True
+        assert summary["total_req"] == 5
+        # 样本前 5 条应该包含 HilltopAds / Traffichunt URL
+        joined = " | ".join(summary["sample_urls"])
+        assert "hilltopads" in joined or "traffichunt" in joined
+
+    def test_analyze_zero_heartbeats_scenario(self):
+        """0 heartbeat 场景：count=0，first/second 均为 None。"""
+        from popunder_trigger import _analyze_heartbeat_records
+
+        started = 1700000000.0
+        records = [
+            {"t": started + 0.5, "url": "https://landing.example.com/", "method": "GET"},
+            {"t": started + 1.1, "url": "https://cdn.example.com/app.css", "method": "GET"},
+            {"t": started + 2.3, "url": "https://cdn.example.com/app.bundle.js", "method": "GET"},
+            {"t": started + 5.0, "url": "https://pic.example.com/avatar.png", "method": "GET"},
+        ]
+        summary = _analyze_heartbeat_records(records, started)
+        assert summary["heartbeat_count"] == 0
+        assert summary["first_at"] is None
+        assert summary["second_at"] is None
+        assert summary["has_hilltopads_hit"] is False
+        assert summary["total_req"] == 4
+
+    def test_analyze_empty_records_no_crash(self):
+        """空列表输入也不崩溃（监听器注册失败场景的兜底）。"""
+        from popunder_trigger import _analyze_heartbeat_records
+
+        summary = _analyze_heartbeat_records([], 0.0)
+        assert summary["heartbeat_count"] == 0
+        assert summary["first_at"] is None
+        assert summary["total_req"] == 0
+
+    # ------------------------------------------------------------------
+    # 5c. 守护线程签名 + 返回 diagnostics 里 heartbeat 钩子
+    # ------------------------------------------------------------------
+    def test_guard_stay_and_close_signature_accepts_heartbeat_arg(self):
+        """_guard_stay_and_close 第 5 个参数必须是 heartbeat_records（默认 None）。
+        保证 trigger_popunder 线程传进去的列表能被分析函数消费。"""
+        import inspect
+        from popunder_trigger import _guard_stay_and_close
+
+        sig = inspect.signature(_guard_stay_and_close)
+        params = list(sig.parameters.keys())
+        assert len(params) >= 5, (
+            f"守护线程签名需要 ≥5 个参数（含 heartbeat_records），实际={params}"
+        )
+        # 第 5 个参数名
+        assert params[4] == "heartbeat_records", f"第 5 个参数应为 heartbeat_records，实={params[4]}"
+        # 默认值是 None（保证老调用点不传也兼容）
+        assert sig.parameters["heartbeat_records"].default is None
+
+    def test_trigger_popunder_returns_heartbeat_hooks(self):
+        """trigger_popunder 返回的 diagnostics 必须带 heartbeat_records_ref + heartbeat_monitored。
+        源码文本扫描（宽松正则），避免导入 whole module（有 playwright 依赖）。"""
+        import re
+
+        pu_file = os.path.join(PROJECT_ROOT, "popunder_trigger.py")
+        with open(pu_file, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # 匹配字典 key-value 模式（支持单/双引号，忽略逗号、空格、行尾注释）
+        def has_dict_key(src_text: str, key: str, value_pattern: str) -> bool:
+            pat = re.compile(
+                rf"""['"]{re.escape(key)}['"]\s*:\s*{value_pattern}\s*,?""",
+                re.MULTILINE,
+            )
+            return pat.search(src_text) is not None
+
+        assert has_dict_key(src, "heartbeat_records_ref", "heartbeat_records"), (
+            "diagnostics 缺少 heartbeat_records_ref 钩子（未将列表引用传给上层）"
+        )
+        assert has_dict_key(src, "heartbeat_monitored", r"(?:True|False|\S+)"), (
+            "diagnostics 缺少 heartbeat_monitored 标志位"
+        )

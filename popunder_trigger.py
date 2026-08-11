@@ -44,6 +44,85 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "cooldown_between_triggers_s": 75,    # 冷却 90→75s：让更多任务有机会触发（配合频控放宽）
 }
 
+# ============================================================================
+# ★ 26.8.11.2 新增：HilltopAds Heartbeat 监听 — 排查"收益=0"的最终链路
+# ============================================================================
+# Heartbeat / 广告像素典型 URL 关键词（命中任一即判定为广告统计请求）
+_HEARTBEAT_URL_KEYWORDS: Tuple[str, ...] = (
+    # HilltopAds / Traffichunt 自有域名（最强匹配）
+    "hilltopads", "htopcdn", "traffichunt",
+    # 通用统计 / 像素 / 上报路径
+    "heartbeat", "/hb?", "hb=", "/ping", "/pixels", "/pixel",
+    "tracker", "/track?", "/tracking/", "tracking?", "stats.php",
+    # ★ 注：原本有 "/stat"，但会命中 /static/ 误伤所有普通静态资源，
+    #   改为更长的精确形式：/stats/ /statistics/ stat? stat/ 这些模式
+    "/stats", "stats/", "/statistics", "stat.php", "/stat/", "/stat?",
+    "beacon", "event=", "impression=", "view=", "evt=",
+    "log_event", "log.php", "/collect", "/sync",
+    # 通用广告联盟像素前缀（兜底）
+    "adserv", "adsystem", "adserver", "adsrv", "adtrack",
+    "click?", "imp=", "visit=", "revenue=", "bid=",
+)
+# 排除项：纯静态资源（即使路径命中也不算统计请求）
+_HEARTBEAT_URL_EXCLUDE_EXT: Tuple[str, ...] = (
+    ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".map", ".mp4", ".webm",
+)
+
+
+def _is_heartbeat_url(url: str) -> bool:
+    """判断 URL 是否疑似广告统计/heartbeat 请求
+
+    ★ 26.8.11.2 设计：不做扩展名排除。
+      广告统计像素常见格式就是 pixel.gif / impression.png / track.jpg，
+      命中关键词就必须算 heartbeat；不命中关键词的 logo.png / app.css
+      自然会被关键词过滤掉，无需额外扩展名黑名单兜底。
+    """
+    if not url:
+        return False
+    u = url.lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    return any(kw in u for kw in _HEARTBEAT_URL_KEYWORDS)
+
+
+def _analyze_heartbeat_records(
+    records: List[Dict[str, Any]],
+    started_at: float,
+) -> Dict[str, Any]:
+    """
+    汇总 heartbeat 监听结果（守护线程结束时调用）
+
+    返回：
+      total_req           : 弹窗生命周期内总请求数（所有资源+接口）
+      heartbeat_count     : 疑似 heartbeat/统计 请求数
+      first_at            : 首次 heartbeat 距弹窗创建的秒数（None 表示未收到）
+      second_at           : 第二次 heartbeat 秒数（HilltopAds 结算关键指标）
+      sample_urls         : 前 5 条匹配 URL（便于日志确认模式）
+      has_hilltopads_hit  : 是否命中 hilltopads/traffichunt 域名（最强正例）
+    """
+    total_req = len(records)
+    matched: List[Dict[str, Any]] = []
+    has_ht = False
+    for rec in records:
+        url = str(rec.get("url") or "")
+        if _is_heartbeat_url(url):
+            matched.append(rec)
+            if ("hilltopads" in url.lower()) or ("traffichunt" in url.lower()) or ("htopcdn" in url.lower()):
+                has_ht = True
+    matched.sort(key=lambda r: float(r.get("t") or 0.0))
+    first_at = (float(matched[0]["t"]) - started_at) if matched else None
+    second_at = (float(matched[1]["t"]) - started_at) if len(matched) >= 2 else None
+    sample = [str(m.get("url", ""))[:160] for m in matched[:5]]
+    return {
+        "total_req": total_req,
+        "heartbeat_count": len(matched),
+        "first_at": round(first_at, 1) if first_at is not None else None,
+        "second_at": round(second_at, 1) if second_at is not None else None,
+        "sample_urls": sample,
+        "has_hilltopads_hit": has_ht,
+    }
+
 # 全局冷却计时 + 活跃守护线程
 # ★ M1 修复: _LAST_POPUNDER_TS 读写加锁，防并发 check-then-act 竞态导致双弹窗
 _LAST_POPUNDER_TS: float = 0.0
@@ -418,6 +497,7 @@ def _guard_stay_and_close(
     main_page: Any,
     stay_sec: float,
     stealth_inject_fn,
+    heartbeat_records: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     守护线程：等待 stay_sec 后关闭弹窗。
@@ -430,6 +510,9 @@ def _guard_stay_and_close(
       - 新行为（模拟真人）：用户点击后，新窗口默认在后台打开（Pop-under 的原生语义），
         永远不主动 bring_to_front，让 Chrome 按后台 tab 正常节流但保持存活；
         通过页面内 JS 滚动/点击触发广告像素，不再依赖"前台激活"这个强特征。
+    ★ 26.8.11.2 新增：heartbeat_records 不为空时，在守护线程结束时
+      分析 Pop-under 弹窗生命周期内的网络请求，输出 HilltopAds heartbeat 成功/失败日志
+      （解决"后台有展示但收益=0"无法定位是"没发 heartbeat"还是"发了被过滤"）
     """
     try:
         _started = time.time()
@@ -493,6 +576,48 @@ def _guard_stay_and_close(
                 except Exception:
                     pass
 
+        # ---- ★ 26.8.11.2 新增：Heartbeat 分析日志（关闭前快照一次最新网络请求）----
+        _hb_summary: Optional[Dict[str, Any]] = None
+        if heartbeat_records is not None:
+            try:
+                _hb_summary = _analyze_heartbeat_records(heartbeat_records, _started)
+                cnt = _hb_summary["heartbeat_count"]
+                tot = _hb_summary["total_req"]
+                first = _hb_summary["first_at"]
+                second = _hb_summary["second_at"]
+                ht_hit = _hb_summary["has_hilltopads_hit"]
+                # 分类输出，一眼区分【正常/疑似有问题/完全没发】
+                if cnt >= 2 and (first is not None) and (second is not None):
+                    # ✅ HilltopAds 结算要求：至少 2 次 heartbeat（首次 ~12s，二次 ~22s）
+                    _flag = "✅" if ht_hit else "🟢"
+                    _log.info(
+                        "[Pop-under] %s Heartbeat OK: 命中 %d / 总请求 %d "
+                        "（1st=%.1fs, 2nd=%.1fs，HilltopAds域名=%s）",
+                        _flag, cnt, tot, first, second, ht_hit,
+                    )
+                elif cnt >= 1:
+                    # ⚠️ 只有 1 次 heartbeat：可能存活期不够，或二次还没发就被关了
+                    _log.warning(
+                        "[Pop-under] ⚠️ Heartbeat 不足: 仅 %d / 总请求 %d "
+                        "（1st=%s，2nd=未收到）— 可能弹窗存活期过短或后台 tab 节流过度",
+                        cnt, tot, (f"{first:.1f}s" if first is not None else "-"),
+                    )
+                else:
+                    # ❌ 一次 heartbeat 都没发：广告脚本可能没加载 / 被广告拦截 / 后台 tab 强节流
+                    _log.warning(
+                        "[Pop-under] ❌ Heartbeat ZERO: 0 / 总请求 %d — "
+                        "广告脚本可能未加载（常见原因：代理拦截/JS 报错/Chrome 后台强节流）",
+                        tot,
+                    )
+                # 样本 URL 写 DEBUG 级别（避免 INFO 噪音太大，需排查时开 debug log）
+                if _hb_summary["sample_urls"]:
+                    _log.debug(
+                        "[Pop-under] Heartbeat 样本 URL（前 5 条）: %s",
+                        " | ".join(_hb_summary["sample_urls"]),
+                    )
+            except Exception as _hb_err:
+                _log.debug("[Pop-under] Heartbeat 分析异常(忽略): %s", _hb_err)
+
         # 存活期满：先 about:blank 卸载内容（缓和 pagehide 程序化关闭特征），再关闭
         try:
             try:
@@ -503,7 +628,13 @@ def _guard_stay_and_close(
             popunder_page.close()
         except Exception:
             pass
-        _log.info("[Pop-under] 弹窗正常关闭（实际存活≈%.1fs）", time.time() - _started)
+        _survived = time.time() - _started
+        _hb_tag = ""
+        if _hb_summary is not None:
+            _c = _hb_summary["heartbeat_count"]
+            _ht = "HT" if _hb_summary["has_hilltopads_hit"] else "no-HT"
+            _hb_tag = f"，heartbeat={_c}/{_ht}"
+        _log.info("[Pop-under] 弹窗正常关闭（实际存活≈%.1fs%s）", _survived, _hb_tag)
     except Exception as e:
         _log.debug("[Pop-under] 守护线程异常(忽略): %s", e)
     finally:
@@ -698,6 +829,36 @@ def trigger_popunder(
                     popunder_page = new_pages[-1]
                     break
 
+        # ★ 26.8.11.2 新增：注册 Pop-under 弹窗网络请求监听器（监听 heartbeat）
+        #   —— 挂在【拿到 popunder_page 之后、加载状态等待之前】注册，
+        #      确保从弹窗 about:blank → 重定向 → 最终落地页的所有请求都被采集。
+        heartbeat_records: List[Dict[str, Any]] = []
+        if popunder_page is not None:
+            _req_lock = threading.Lock()
+
+            def _on_pop_request(request) -> None:
+                try:
+                    # Playwright sync 回调在主调线程（HumanModel 工作线程）触发，
+                    # 追加到列表是原子操作，加锁仅作保险（Python list.append GIL 保护）
+                    rec = {
+                        "t": time.time(),
+                        "url": getattr(request, "url", "") or "",
+                        "method": str(getattr(request, "method", "") or "").upper(),
+                        "type": str(getattr(request, "resource_type", "") or ""),
+                    }
+                    with _req_lock:
+                        heartbeat_records.append(rec)
+                except Exception:
+                    pass  # 回调内任何错误不得影响页面主流程
+
+            try:
+                # 注册 request 监听器（网络请求发出时触发，覆盖 fetch/XHR/IMG/script/beacon 所有类型）
+                popunder_page.on("request", _on_pop_request)
+            except Exception:
+                # Playwright 版本差异或页面已关闭时可能失败——降级为不监听，不阻断核心流程
+                _log.debug("[Pop-under] Heartbeat 监听器注册失败(忽略，继续触发)")
+                heartbeat_records = []  # 空列表 → 守护线程里检测不到，跳过分析
+
         if popunder_page is None:
             _log.warning("Pop-under 弹窗未创建（%d s 内无新标签）", max_wait)
             _cleanup_page_triggers(page_id)  # ★ H2/M3: 失败路径清理页面守卫，允许后续重试
@@ -744,7 +905,7 @@ def trigger_popunder(
             )
         guardian = threading.Thread(
             target=_guard_stay_and_close,
-            args=(popunder_page, page, stay, _inject_popunder_stealth),
+            args=(popunder_page, page, stay, _inject_popunder_stealth, heartbeat_records),
             daemon=True,
         )
         guardian.start()
@@ -754,6 +915,7 @@ def trigger_popunder(
 
         # 立即返回，不阻塞——原站浏览继续！
         # ★ H2: triggered 区分 confirmed / unconfirmed，供统计层区分有效曝光
+        # ★ 26.8.11.2: 增加 heartbeat_records 引用（守护线程异步写入，供 app.py qa_log 后续汇总）
         return _effective_triggered, popunder_page, {
             "triggered": _effective_triggered,
             "unconfirmed": _unconfirmed,
@@ -763,6 +925,8 @@ def trigger_popunder(
             "load_state": load_state,
             "click_coords": (safe_x, safe_y),
             "async_guardian": True,
+            "heartbeat_records_ref": heartbeat_records,  # list 引用，守护线程异步写入
+            "heartbeat_monitored": len(heartbeat_records) >= 0,  # True 表示本次启动了监听
         }
 
     except Exception as e:

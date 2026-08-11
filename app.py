@@ -20,8 +20,8 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.1 = 2026-08-11 第一次改动
-APP_VERSION = "26.8.11.1"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
+APP_VERSION = "26.8.11.2"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
