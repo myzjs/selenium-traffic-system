@@ -590,7 +590,7 @@ def get_site_age_category(site_creation_date_str):
 def get_country_working_seconds_today(country_code, base_date=None):
     """
     获取指定国家"今天"的工作时段（转换为UTC秒数，从今天UTC 00:00 起）
-    工作时段：当地时间 7:00-24:00（17小时）
+    工作时段：当地时间 8:00-23:00（15小时，与 enforce_working_hours / generate_daily_tasks 对齐）
     
     Returns:
         list of tuples: [(start_utc_sec, end_utc_sec), ...]
@@ -610,13 +610,13 @@ def get_country_working_seconds_today(country_code, base_date=None):
     # 今日UTC 00:00 锚点
     utc_today_start = _dt.datetime.combine(base_date, _dt.time(0, 0), tzinfo=pytz.UTC)
     
-    # 构造该国家今天的 7:00 和明天的 0:00（即24:00）
+    # 26.8.11.10 与新/旧计划函数 & enforce_working_hours 三方对齐：严格 8:00-23:00
     segments = []
     # 检查前一天、当天、后一天的本地工作时段，看哪些与今天UTC重叠
     for day_offset in [-1, 0, 1]:
         local_date = base_date + _dt.timedelta(days=day_offset)
-        local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(7, 0)))
-        local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(0, 0))) + _dt.timedelta(days=1)
+        local_start = tz.localize(_dt.datetime.combine(local_date, _dt.time(8, 0)))
+        local_end = tz.localize(_dt.datetime.combine(local_date, _dt.time(23, 0)))
         
         utc_start = local_start.astimezone(pytz.UTC)
         utc_end = local_end.astimezone(pytz.UTC)
