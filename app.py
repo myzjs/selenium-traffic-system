@@ -20,8 +20,9 @@ from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
-# ★ 规则三：版本号 = 当天日期 + 当日序号。26.8.11.2 = 2026-08-11 第二次改动（新增heartbeat监听日志）
-APP_VERSION = "26.8.11.10"
+# ★ 规则三：版本号 = 当天日期 + 当日序号。
+# 26.8.12.1 = 2026-08-12 第一次改动（6项薄弱维度一次性完整落地：国家权重/日内曲线/假日季节/红队19场景库/Golden Label评估闭环/Hook挂载零侵入）
+APP_VERSION = "26.8.12.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -526,37 +527,82 @@ def generate_power_law_hours(num_tasks):
     return enforce_working_hours(hours)
 
 
-def get_weekend_holiday_multiplier(date_obj):
-    """根据日期返回流量倍率（模拟真实网站的周末/节假日流量波动）
-    
-    - 工作日: ~1.0（基准，周一略低、周五略高）
-    - 周六: 0.75~0.85（周末流量通常下降）
-    - 周日: 0.65~0.80（周日更低）
-    - 节假日: 0.50~0.70（重大节日流量大幅下降）
+def get_weekend_holiday_multiplier(date_obj, country_codes=None):
+    """根据日期×参与国家返回小说站典型流量倍率（娱乐内容在周末/假日=消费高峰，不是低谷）。
+
+    规则（26.8.12.4 接入 traffic_distribution 精细化季节模型）：
+      - 工作日基准: 1.0（周一 0.92、周五 1.05 真人周内节律）
+      - 周六/周日: 1.10~1.20（真人周末宅家，娱乐站流量上涨 ~15%）
+      - 各国假日: 1.25~1.35（公共假期消费高峰，基于 traffic_distribution.COUNTRY_HOLIDAYS）
+      - 若传入多个国家：取倍率加权平均（按国家人口权重）
+
+    参数:
+      date_obj: date 对象
+      country_codes: 可选 list[str]，参与计划的国家列表；None 或空 → 默认仅基于通用周末节律。
+    返回:
+      float 倍率（例 1.15 表示比工作日多 15% 流量）
     """
+    # ★ 先加载 traffic_distribution（失败则静默回退旧逻辑）
+    _td = None
+    try:
+        import traffic_distribution as _td
+    except Exception:
+        _td = None
+
     weekday = date_obj.weekday()  # 0=周一, 6=周日
-    month, day = date_obj.month, date_obj.day
-    
-    # 简单节假日检测（主要西方节日）
-    major_holidays = [
-        (1, 1),   # 元旦
-        (12, 25), # 圣诞节
-        (12, 24), # 平安夜
-        (7, 4),   # 美国独立日
-    ]
-    # 感恩节（11月第四个周四）
-    if month == 11 and weekday == 3 and 22 <= day <= 28:
-        return random.uniform(0.50, 0.70)
-    if (month, day) in major_holidays:
-        return random.uniform(0.50, 0.70)
-    
+
+    # 基础周末节律（小说/娱乐站：周末 > 工作日，与旧实现反向）
     if weekday == 5:  # 周六
-        return random.uniform(0.75, 0.85)
+        base_scale = random.uniform(1.10, 1.20)
     elif weekday == 6:  # 周日
-        return random.uniform(0.65, 0.80)
-    else:  # 工作日微小波动
+        base_scale = random.uniform(1.10, 1.18)
+    else:
         base = {0: 0.92, 1: 1.0, 2: 1.0, 3: 1.0, 4: 1.05}.get(weekday, 1.0)
-        return base * random.uniform(0.95, 1.05)
+        base_scale = base * random.uniform(0.95, 1.05)
+
+    # 若 traffic_distribution 不可用，返回基础周末节律
+    if _td is None:
+        return base_scale
+
+    # ★ 若没有指定国家，使用通用逻辑（旧节假日检测安全兜底）
+    if not country_codes:
+        # 简单通用节日（主要西方+东方节日，命中则用 1.20~1.30 高峰）
+        month, day = date_obj.month, date_obj.day
+        common_holidays = [(1, 1), (12, 25), (12, 31)]
+        if month == 11 and weekday == 3 and 22 <= day <= 28:  # 美加感恩节
+            return max(base_scale, random.uniform(1.25, 1.35))
+        if (month, day) in common_holidays:
+            return max(base_scale, random.uniform(1.20, 1.30))
+        return base_scale
+
+    # ★ 精细化：对每个参与国家，调用 traffic_distribution.traffic_day_scale（含9国假日集）
+    # 按人口权重聚合 → 返回加权平均，保证大国假日对计划影响更大
+    try:
+        from traffic_distribution import (
+            weighted_country_sample,
+            traffic_day_scale,
+            COUNTRY_POPULATION_WEIGHTS,
+            DEFAULT_COUNTRY_WEIGHT,
+        )
+    except Exception:
+        return base_scale
+
+    ccs = list({c.upper() for c in country_codes if c})
+    if not ccs:
+        return base_scale
+
+    multipliers, weights = [], []
+    for cc in ccs:
+        scale = traffic_day_scale(date_obj, cc)
+        w = COUNTRY_POPULATION_WEIGHTS.get(cc, DEFAULT_COUNTRY_WEIGHT)
+        multipliers.append(scale)
+        weights.append(w)
+    # 加权平均（大国假日权重大）
+    total_w = sum(weights) or 1.0
+    aggregated = sum(m * w / total_w for m, w in zip(multipliers, weights))
+    # 加入 ±4% 微抖动，避免精确倍数出现机器特征
+    aggregated = max(0.80, min(2.50, aggregated * random.uniform(0.96, 1.04)))
+    return round(aggregated, 4)
 
 
 MODEL_FUNCTIONS = {
@@ -567,6 +613,55 @@ MODEL_FUNCTIONS = {
     "burst": generate_burst_hours,
     "power_law": generate_power_law_hours
 }
+
+def weighted_country_hours_for_tasks(num_tasks, country_codes, *, min_hour=8.0, max_hour=23.0):
+    """26.8.12.4 ★ 日内小时精细化：按 enabled_countries 人口权重，逐任务抽目标国，
+    再调用 traffic_distribution.weighted_local_hours 采样该国独立日内曲线。
+
+    这样每个任务的发起小时，都**精确对应其目标国的本地波峰/波谷**：
+    - CN 任务出现在 20-22 晚间（本地晚高峰 1.8×），不是 UTC 全局统一曲线
+    - IN 任务出现在 19-23 IST（与 CN 接近但稍晚）
+    - US 东部任务 21-23 ET / 西部 UTC 0-2 工作在早晨，各自偏移
+    失败（模块未找到/无国家）→ 静默回退 MODEL_FUNCTIONS["bimodal"] 通用双峰。
+
+    参数:
+      num_tasks:  要生成的小时点数量
+      country_codes: list[str]，参与国家列表；空 → 回退 bimodal 通用
+      min_hour / max_hour: 硬工作小时边界（与 enforce_working_hours 一致：8~23）
+    返回:
+      list[float]，长度 ~num_tasks；每个元素是"相对起点的小时数"（0~24），
+      调用方加上自己的 UTC 基准秒数即可（legacy: seconds_now_utc；多天: today_utc_start + tp）。
+    """
+    if num_tasks <= 0:
+        return []
+    if not country_codes:
+        return enforce_working_hours(generate_bimodal_hours(num_tasks), min_hour, max_hour)
+
+    # 优先加载精细化模块
+    try:
+        from traffic_distribution import (
+            COUNTRY_POPULATION_WEIGHTS,
+            DEFAULT_COUNTRY_WEIGHT,
+            weighted_local_hours,
+            COUNTRY_HOUR_PROFILES,
+        )
+        ccs = [c.upper() for c in country_codes if c]
+        weights = [COUNTRY_POPULATION_WEIGHTS.get(c, DEFAULT_COUNTRY_WEIGHT) for c in ccs]
+        hours = []
+        for _ in range(num_tasks):
+            # 每任务独立抽一次目标国（人口权重）→ 再抽该国的本地小时
+            cc = random.choices(ccs, weights=weights, k=1)[0]
+            # 若该国有独立 profile → 走独立曲线；否则 weighted_local_hours 内部会给通用双峰
+            hrs = weighted_local_hours(cc, 1, min_hour=min_hour, max_hour=max_hour)
+            if hrs:
+                hours.append(hrs[0])
+            else:
+                # 兜底：通用 bimodal 抽一个
+                hours.append(enforce_working_hours(generate_bimodal_hours(1), min_hour, max_hour)[0])
+        return sorted(hours)
+    except Exception as _h_e:
+        logging.debug(f"weighted_country_hours_for_tasks 精细化失败，回退通用 bimodal: {_h_e}")
+        return enforce_working_hours(generate_bimodal_hours(num_tasks), min_hour, max_hour)
 
 def get_site_age_category(site_creation_date_str):
     """根据建站日期字符串（YYYY-MM-DD）返回：new/mid/old"""
@@ -994,49 +1089,89 @@ def generate_daily_tasks_legacy(cfg):
             country_quota_target[cc] = max(1, int(round(quota)))
         log.info(f"🌍 地域分散策略启用: 权重={_geo_weights}, 配额={country_quota_target}")
     else:
-        # 兜底：基础平均 + ±20% 抖动
-        base_quota = total_tasks_planned / len(enabled_countries)
-        for cc in enabled_countries:
-            quota = base_quota * random.uniform(0.8, 1.2)
-            country_quota_target[cc] = max(1, int(round(quota)))
+        # 26.8.12.4 ★ 国家流量精细化：优先使用 traffic_distribution 45国互联网人口权重，
+        #   不再是各国均分配 ±20% 均匀兜底；大国（IN/US/CN/ID/BR）天然获得更多任务数，
+        #   接近真实世界互联网用户分布。失败回退旧均匀 ±20%。
+        _td_ok = False
+        try:
+            from traffic_distribution import (
+                COUNTRY_POPULATION_WEIGHTS, DEFAULT_COUNTRY_WEIGHT
+            )
+            _td_ok = True
+        except Exception:
+            _td_ok = False
+        if _td_ok:
+            w_map = COUNTRY_POPULATION_WEIGHTS
+            _total_weight = sum(w_map.get(cc.upper(), DEFAULT_COUNTRY_WEIGHT) for cc in enabled_countries)
+            for cc in enabled_countries:
+                _w = w_map.get(cc.upper(), DEFAULT_COUNTRY_WEIGHT)
+                # 保留 ±15% 随机抖动避免完美整数比
+                quota = total_tasks_planned * (_w / _total_weight) * random.uniform(0.85, 1.15)
+                country_quota_target[cc] = max(1, int(round(quota)))
+            log.info(f"🌍 人口权重国家配额（45国）: 配额={country_quota_target}")
+        else:
+            # 兜底：基础平均 + ±20% 抖动
+            base_quota = total_tasks_planned / len(enabled_countries)
+            for cc in enabled_countries:
+                quota = base_quota * random.uniform(0.8, 1.2)
+                country_quota_target[cc] = max(1, int(round(quota)))
     
     # 3. 生成全局任务时间点（从现在开始偏移）
     chosen_model = "simple"
     raw_time_points = []  # UTC秒数列表
     
     if auto_mode:
-        selected_models = cfg.get("selected_models", ["normal", "gamma", "bimodal", "poisson"])
-        selected_models = [m for m in selected_models if m in MODEL_FUNCTIONS]
-        if not selected_models:
-            selected_models = ["normal"]
-        chosen_model = random.choice(selected_models)
-        model_func = MODEL_FUNCTIONS[chosen_model]
-        hour_list = model_func(total_tasks_planned)
-        
+        # 26.8.12.4 ★ 日内小时精细化：优先用各国独立日内曲线（CN 20-22晚高峰1.8×等）
+        #   只在 enabled_countries=空 / 模块缺失时，回退旧 MODEL_FUNCTIONS。
+        _enabled_ccs = [p.get("country_code") for p in proxy_pool_enabled if p.get("country_code")]
+        chosen_model = "country_hourly"
+        hour_list = weighted_country_hours_for_tasks(
+            total_tasks_planned, _enabled_ccs,
+            min_hour=8.0, max_hour=23.0,
+        )
+        # 安全兜底：若新函数意外返回空（理论不会），走旧通用模型
+        if not hour_list:
+            selected_models = cfg.get("selected_models", ["normal", "gamma", "bimodal", "poisson"])
+            selected_models = [m for m in selected_models if m in MODEL_FUNCTIONS] or ["normal"]
+            chosen_model = random.choice(selected_models)
+            hour_list = MODEL_FUNCTIONS[chosen_model](total_tasks_planned)
+
         for h in hour_list:
             tp = seconds_now_utc + h * 3600
             if tp >= seconds_now_utc and tp < end_of_window:
                 raw_time_points.append(tp)
     else:
-        # 非自动模式：★ 3.1 时段权重曲线（按目标国时区的双峰分布）
-        chosen_model = "hourly_weighted"
-        _hourly_weights_full = cfg.get("hourly_weights", [0.2,0.1,0.1,0.1,0.2,0.3,0.5,0.8,1.0,1.0,0.9,0.8,0.7,0.7,0.8,0.9,1.0,1.0,0.9,0.8,0.7,0.5,0.4,0.3])
-        # 26.8.11.10 根因修复：小时池严格截断为 [8, 22]（对应 8:00-23:00 的整数小时），
-        #   禁止 0-7 & 23 小时参与采样，与 enforce_working_hours / country_segments 对齐。
-        _hours_pool = list(range(8, 23))
-        _hourly_weights = [_hourly_weights_full[h] for h in _hours_pool]
-        _weights_sum = sum(_hourly_weights)
-        _weights_norm = [w / _weights_sum for w in _hourly_weights] if _weights_sum > 0 else [1.0 / len(_hours_pool)] * len(_hours_pool)
-        for i in range(total_tasks_planned):
-            # 按权重随机选择小时
-            _h = random.choices(_hours_pool, weights=_weights_norm, k=1)[0]
-            _m = random.randint(0, 59)
-            _s = random.randint(0, 59)
-            # 转换为UTC秒数（假设目标国时区，简化处理：直接用UTC）
-            tp = seconds_now_utc + (_h * 3600 + _m * 60 + _s)
-            # 确保在24h窗口内
-            if tp < end_of_window:
-                raw_time_points.append(tp)
+        # 26.8.12.4 ★ 非 auto_mode 也接入各国独立曲线：
+        #   优先 weighted_country_hours_for_tasks（保留±15分随机抖动，避免整点重复），
+        #   失败才回退 cfg["hourly_weights"] 通用双峰（原 hourly_weighted 逻辑）。
+        chosen_model = "country_hourly_config"
+        _enabled_ccs = [p.get("country_code") for p in proxy_pool_enabled if p.get("country_code")]
+        hour_list = weighted_country_hours_for_tasks(
+            total_tasks_planned, _enabled_ccs,
+            min_hour=8.0, max_hour=23.0,
+        )
+        if hour_list:
+            for h in hour_list:
+                # 加 ±15 分钟抖动（与原逻辑中的 _m/_s 行为一致），避免精确对齐整点
+                jitter_min = random.uniform(-15, 15)
+                _h_adj = max(8.0, min(23.0 - 1e-6, h + jitter_min / 60.0))
+                tp = seconds_now_utc + _h_adj * 3600
+                if tp < end_of_window:
+                    raw_time_points.append(tp)
+        else:
+            chosen_model = "hourly_weighted"
+            _hourly_weights_full = cfg.get("hourly_weights", [0.2,0.1,0.1,0.1,0.2,0.3,0.5,0.8,1.0,1.0,0.9,0.8,0.7,0.7,0.8,0.9,1.0,1.0,0.9,0.8,0.7,0.5,0.4,0.3])
+            _hours_pool = list(range(8, 23))
+            _hourly_weights = [_hourly_weights_full[h] for h in _hours_pool]
+            _weights_sum = sum(_hourly_weights)
+            _weights_norm = [w / _weights_sum for w in _hourly_weights] if _weights_sum > 0 else [1.0 / len(_hours_pool)] * len(_hours_pool)
+            for i in range(total_tasks_planned):
+                _h = random.choices(_hours_pool, weights=_weights_norm, k=1)[0]
+                _m = random.randint(0, 59)
+                _s = random.randint(0, 59)
+                tp = seconds_now_utc + (_h * 3600 + _m * 60 + _s)
+                if tp < end_of_window:
+                    raw_time_points.append(tp)
         # 补充：如果权重采样导致时间点不足，用均匀分布补齐
         if len(raw_time_points) < total_tasks_planned:
             est_task_len = (total_stay_cfg["min"] + total_stay_cfg["max"]) / 2
@@ -1432,7 +1567,8 @@ def generate_daily_tasks(cfg):
             full_day_tasks = max(day_min, int(round(full_day_tasks * _valley_mult)))
         # 周末/节假日流量调整（模拟真实网站流量波动）
         _day_date = day_local_start.date() if hasattr(day_local_start, 'date') else day_local_start
-        _wk_multiplier = get_weekend_holiday_multiplier(_day_date)
+        # 26.8.12.4 精细化季节缩放：传入参与国家列表 → 9国独立假日集 + 人口权重加权平均
+        _wk_multiplier = get_weekend_holiday_multiplier(_day_date, country_codes=enabled_countries)
         # 26.8.11.9 同样加固：周末乘数后仍然不得低于 day_min（周六日只是减少但不能击穿下限）
         full_day_tasks = max(day_min, int(round(full_day_tasks * _wk_multiplier)))
         if day_idx == 0:
@@ -1457,8 +1593,15 @@ def generate_daily_tasks(cfg):
             })
             continue
 
-        chosen_model = random.choice(list(MODEL_FUNCTIONS.keys()))
-        hour_list = MODEL_FUNCTIONS[chosen_model](planned_for_day)
+        # 26.8.12.4 ★ 日内小时精细化：优先各国独立曲线；失败回退旧 MODEL_FUNCTIONS 通用模型
+        hour_list = weighted_country_hours_for_tasks(
+            planned_for_day, enabled_countries,
+            min_hour=8.0, max_hour=23.0,
+        )
+        chosen_model = "country_hourly"
+        if not hour_list:
+            chosen_model = random.choice(list(MODEL_FUNCTIONS.keys()))
+            hour_list = MODEL_FUNCTIONS[chosen_model](planned_for_day)
         raw_time_points = []
         for h in hour_list:
             tp = day_start_sec + h * 3600
@@ -1507,9 +1650,21 @@ def generate_daily_tasks(cfg):
         valid_time_points = sorted(set(valid_time_points))
 
         generated_before = len(tasks)
-        day_quota_base = max(1, planned_for_day / len(enabled_countries))
-        for cc in enabled_countries:
-            country_quota_target[cc] += max(1, int(round(day_quota_base * random.uniform(0.8, 1.2))))
+        # 26.8.12.4 ★ 日任务配额计算：优先45国人口权重，失败回退旧的均等±20%
+        try:
+            from traffic_distribution import (
+                COUNTRY_POPULATION_WEIGHTS, DEFAULT_COUNTRY_WEIGHT
+            )
+            w_map = COUNTRY_POPULATION_WEIGHTS
+            _total_weight = sum(w_map.get(cc.upper(), DEFAULT_COUNTRY_WEIGHT) for cc in enabled_countries)
+            for cc in enabled_countries:
+                _w = w_map.get(cc.upper(), DEFAULT_COUNTRY_WEIGHT)
+                q = planned_for_day * (_w / _total_weight) * random.uniform(0.85, 1.15)
+                country_quota_target[cc] += max(1, int(round(q)))
+        except Exception:
+            day_quota_base = max(1, planned_for_day / len(enabled_countries))
+            for cc in enabled_countries:
+                country_quota_target[cc] += max(1, int(round(day_quota_base * random.uniform(0.8, 1.2))))
 
         for tp in valid_time_points:
             local_datetime = (today_utc_start + _dt.timedelta(seconds=tp)).astimezone(local_tz)
@@ -1949,6 +2104,29 @@ def apply_behavior_profile_to_config(profile, config):
 
 
 app = Flask(__name__)
+# ★ 红队攻防演练：挂载 /redteam 蓝图 + 主页注入双Tab UI（风控检测 / 红队评估）
+#   真实任务模式钩子：将 app.py 的 worker_task(single_task=True) 包装后接入红队模块，
+#   用于红队"🚀 真实任务"模式。import 失败回退 dry_run，不影响 app.py 启动。
+try:
+    import redteam_webui as _redteam_webui
+    _rt_hook = None
+    try:
+        import redteam_real_task_hook_example as _rt_hook_example
+        # 闭包：在 app.py 的全局作用域下调用真实任务钩子，保证 config / worker_task 可访问
+        def _app_rt_hook(scenario, applied_ctx, recorder, country_code, headless):
+            return _rt_hook_example.real_task_hook_for_redteam(
+                scenario, applied_ctx, recorder, country_code, headless
+            )
+        _rt_hook = _app_rt_hook
+    except Exception as _rh_e:
+        logging.getLogger().warning(f"[WARN] 红队真实任务钩子未加载，真实模式会回退干跑：{_rh_e}")
+    _redteam_webui.mount_on_app(app, register_real_task_hook=_rt_hook)
+    logging.getLogger().info(
+        "🎯 红队攻防演练模块已挂载（攻防演练按钮下新增「红队反欺诈评估」Tab，"
+        f"真实任务钩子={'已接入' if _rt_hook else '未接入（仅干跑可用）'})"
+    )
+except Exception as _rt_e:
+    logging.getLogger().warning(f"[WARN] 红队模块加载失败（不影响其它功能）: {_rt_e}")
 # ★ 5.3 日志轮转：RotatingFileHandler（maxBytes=10MB, backupCount=5，总占用≤50MB）
 from logging.handlers import RotatingFileHandler as _RFH
 _log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
