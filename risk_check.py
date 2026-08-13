@@ -1,7 +1,11 @@
+import logging
 import random
 import re
 import os
 import time
+
+# 模块级日志器（审计修复：新增，供各处降级/拒绝路径记录日志）
+logger = logging.getLogger(__name__)
 
 # 本脚本所在目录（app.py 同路径）；演练报告统一存放到本目录下的 report/
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,14 +151,47 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     }
 
     # ====================== 1. 基础环境信息 ======================
-    ua = page.evaluate("navigator.userAgent") or ""
-    platform = page.evaluate("navigator.platform") or ""
-    lang = page.evaluate("navigator.language") or ""
-    languages = page.evaluate("navigator.languages") or []
-    screen_size = page.evaluate("[screen.width, screen.height]") or [0, 0]
-    viewport = page.evaluate("[window.innerWidth, window.innerHeight]") or [0, 0]
-    device_pixel_ratio = page.evaluate("window.devicePixelRatio") or 1
-    color_depth = page.evaluate("screen.colorDepth") or 0
+    # 审计修复：逐个包裹 try/except，避免单次 evaluate 失败导致整个检测中断（降级为默认值并记录日志）
+    try:
+        ua = page.evaluate("navigator.userAgent") or ""
+    except Exception as e:
+        logger.warning("获取 navigator.userAgent 失败: %s", e)
+        ua = ""
+    try:
+        platform = page.evaluate("navigator.platform") or ""
+    except Exception as e:
+        logger.warning("获取 navigator.platform 失败: %s", e)
+        platform = ""
+    try:
+        lang = page.evaluate("navigator.language") or ""
+    except Exception as e:
+        logger.warning("获取 navigator.language 失败: %s", e)
+        lang = ""
+    try:
+        languages = page.evaluate("navigator.languages") or []
+    except Exception as e:
+        logger.warning("获取 navigator.languages 失败: %s", e)
+        languages = []
+    try:
+        screen_size = page.evaluate("[screen.width, screen.height]") or [0, 0]
+    except Exception as e:
+        logger.warning("获取 screen.width/height 失败: %s", e)
+        screen_size = [0, 0]
+    try:
+        viewport = page.evaluate("[window.innerWidth, window.innerHeight]") or [0, 0]
+    except Exception as e:
+        logger.warning("获取 innerWidth/innerHeight 失败: %s", e)
+        viewport = [0, 0]
+    try:
+        device_pixel_ratio = page.evaluate("window.devicePixelRatio") or 1
+    except Exception as e:
+        logger.warning("获取 devicePixelRatio 失败: %s", e)
+        device_pixel_ratio = 1
+    try:
+        color_depth = page.evaluate("screen.colorDepth") or 0
+    except Exception as e:
+        logger.warning("获取 screen.colorDepth 失败: %s", e)
+        color_depth = 0
     report["base_info"] = {
         "ua_full": ua,
         "ua_short": ua[:100],
@@ -495,7 +532,12 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     # 尝试获取页面出口IP
     net["proxy_ip"] = proxy_ip or "unknown"
 
-    headers = page.request.headers if hasattr(page, "request") else {}
+    # 审计修复：安全获取请求头，异常时降级为空 dict 并记录日志，避免检测流程中断
+    try:
+        headers = page.request.headers if hasattr(page, "request") else {}
+    except Exception as e:
+        logger.warning("获取 page.request.headers 失败，降级为空: %s", e)
+        headers = {}
     net["missing_accept_lang"] = "Accept-Language" not in headers
     net["missing_sec_ch_ua"] = "Sec-Ch-Ua" not in headers
     report["network_ip"] = net
@@ -544,7 +586,9 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     if sec_ch_version_match and ua_browser_version:
         header_deep["ua_sec_ch_ua_version_match"] = sec_ch_version_match.group(1) == ua_browser_version
     else:
-        header_deep["ua_sec_ch_ua_version_match"] = True  # 无法检测时默认通过
+        # 审计修复：fail-open 改 fail-closed —— 无法检测时按“不匹配”处理（记为异常，抬高风险分）
+        logger.warning("UA 与 Sec-CH-UA 版本无法比对（sec_ch_ua=%r, ua_version=%r），按不匹配处理", sec_ch_ua[:80], ua_browser_version)
+        header_deep["ua_sec_ch_ua_version_match"] = False
 
     # 6.3 Sec-CH-UA-Platform 与 UA 平台一致性
     sec_ch_platform = ""
@@ -567,10 +611,12 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     header_deep["ua_declared_platform"] = ua_platform
     # macOS 在 Sec-CH-UA 中显示为 "macOS"
     platform_map = {"macOS": "macOS", "Windows": "Windows", "Linux": "Linux", "Android": "Android"}
-    header_deep["platform_consistent"] = (
-        platform_map.get(ua_platform, ua_platform) == sec_ch_platform
-        if sec_ch_platform else True
-    )
+    if sec_ch_platform:
+        header_deep["platform_consistent"] = platform_map.get(ua_platform, ua_platform) == sec_ch_platform
+    else:
+        # 审计修复：fail-open 改 fail-closed —— 缺少 Sec-CH-UA-Platform 时按“不一致”处理
+        logger.warning("缺少 Sec-CH-UA-Platform 请求头，平台一致性按不一致处理（ua_platform=%r）", ua_platform)
+        header_deep["platform_consistent"] = False
 
     # 6.4 Accept头合理性
     accept_header = ""
@@ -591,10 +637,12 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
             accept_lang = v
             break
     header_deep["accept_language_header"] = accept_lang[:80]
-    header_deep["accept_lang_matches_navigator"] = (
-        lang.split("-")[0].lower() in accept_lang.lower()
-        if accept_lang and lang else True
-    )
+    if accept_lang and lang:
+        header_deep["accept_lang_matches_navigator"] = lang.split("-")[0].lower() in accept_lang.lower()
+    else:
+        # 审计修复：fail-open 改 fail-closed —— 缺少 Accept-Language 或 navigator.language 时按“不匹配”处理
+        logger.warning("Accept-Language 与 navigator.language 无法比对（accept_lang=%r, lang=%r），按不匹配处理", accept_lang[:80], lang[:80])
+        header_deep["accept_lang_matches_navigator"] = False
 
     # 6.6 Sec-Fetch-* 系列完整性
     sec_fetch_headers = {}

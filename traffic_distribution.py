@@ -113,6 +113,61 @@ def weighted_country_sample(
 WEEKEND_SCALE_DEFAULT = 1.15
 WEEKDAY_SCALE_DEFAULT = 1.00
 
+# ============================================================================
+# 二点五、各国标准时区偏移（用于 local_hour → UTC 小时换算）
+#  注：这里取"标准时间"（不考虑夏令时 DST），对流量规划足够精确。
+#  正数 = UTC+X（东半球），负数 = UTC-X（西半球），None = 未知 → 按 UTC±0
+# ============================================================================
+COUNTRY_TZ_STANDARD_OFFSET_HOUR: Dict[str, float] = {
+    # 东亚
+    "CN": 8.0, "JP": 9.0, "KR": 9.0, "HK": 8.0, "TW": 8.0, "SG": 8.0, "MY": 8.0,
+    "TH": 7.0, "VN": 7.0, "ID": 7.0, "PH": 8.0,
+    # 南亚 / 东南亚
+    "IN": 5.5,  # UTC+5:30
+    "PK": 5.0, "BD": 6.0, "LK": 5.5, "NP": 5.75,
+    # 中东 / 俄罗斯
+    "RU": 3.0,  # 莫斯科 UTC+3
+    "TR": 3.0, "AE": 4.0, "SA": 3.0, "IR": 3.5, "IL": 2.0,
+    # 欧洲（标准时间，不考虑夏令时）
+    "GB": 0.0, "IE": 0.0, "PT": 0.0, "IS": 0.0,
+    "DE": 1.0, "FR": 1.0, "ES": 1.0, "IT": 1.0, "NL": 1.0, "BE": 1.0,
+    "SE": 1.0, "NO": 1.0, "DK": 1.0, "FI": 2.0, "PL": 1.0, "CZ": 1.0,
+    "AT": 1.0, "CH": 1.0, "GR": 2.0, "RO": 2.0, "HU": 1.0,
+    # 美洲（标准时间）
+    "US": -5.0,  # ET / 东部时间 UTC-5
+    "CA": -5.0,  # 多伦多/蒙特利尔 ET
+    "MX": -6.0,  # CST 中部
+    "BR": -3.0,  # 巴西利亚 UTC-3
+    "AR": -3.0, "CL": -4.0, "CO": -5.0, "PE": -5.0,
+    # 澳新
+    "AU": 10.0, "NZ": 12.0,
+    # 非洲
+    "ZA": 2.0, "EG": 2.0, "NG": 1.0, "KE": 3.0, "MA": 1.0,
+}
+DEFAULT_TZ_OFFSET_HOUR = 0.0
+
+
+def local_hour_to_utc_hour(country_code: str, local_hour: float) -> float:
+    """将某国本地小时（0~24）转换为 UTC 小时（0~24，超范围 mod 24）。
+
+    例：本地 20:00（CN, UTC+8）→ UTC = 12:00
+       本地 20:00（US, UTC-5）→ UTC = 次日 01:00 → 返回 1.0
+    未知国家 → 返回原值（UTC±0 不换算，向下兼容）。
+    """
+    off = COUNTRY_TZ_STANDARD_OFFSET_HOUR.get(country_code.upper())
+    if off is None:
+        return local_hour % 24.0
+    utc_h = (local_hour - off) % 24.0
+    return round(utc_h, 4)
+
+
+def utc_hour_to_local_hour(country_code: str, utc_hour: float) -> float:
+    """反向转换，用于日志/展示。"""
+    off = COUNTRY_TZ_STANDARD_OFFSET_HOUR.get(country_code.upper())
+    if off is None:
+        return utc_hour % 24.0
+    return round(((utc_hour + off) % 24.0), 4)
+
 # 各国主要节假日（仅示例，仅用于红队测试时调参；真实使用时可按需要扩充）
 # 格式：set of "MM-DD" 字符串
 COUNTRY_HOLIDAYS: Dict[str, set] = {

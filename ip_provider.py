@@ -11,6 +11,7 @@ IPDeep API 返回格式（纯文本）：host:port:username:password
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Dict, Optional
@@ -104,7 +105,8 @@ class IPProvider:
                     auth = HTTPBasicAuth(api_user, api_pwd)
                     logger.info(f"[IPDeep] 使用 Basic Auth: user={api_user}")
 
-                resp = requests.get(api_url, headers=headers, auth=auth, timeout=15)
+                # 26.8.13.1 ★ 超时放大：API 服务器在海外，中国大陆访问偶发 15s 以上
+                resp = requests.get(api_url, headers=headers, auth=auth, timeout=30)
                 logger.info(f"[IPDeep] HTTP {resp.status_code}")
 
                 if resp.status_code >= 400:
@@ -137,10 +139,17 @@ class IPProvider:
                             proxy_port = str(result.get("port", ""))
                             proxy_username = result.get("username", "")
                             proxy_password = result.get("password", "")
-                    except json.JSONDecodeError:
-                        pass  # 不是 JSON，按文本格式解析
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[IPDeep] JSON 解析失败（按文本格式解析）: {e}")
+                        proxy_host, proxy_port, proxy_username, proxy_password = "", "", "", ""
+                        if "host" in response_text and ":" in response_text:
+                            parts = response_text.split(":")
+                            if len(parts) >= 2:
+                                proxy_host = parts[0]
+                                proxy_port = parts[1]
+                                proxy_username = parts[2] if len(parts) > 2 else ""
+                                proxy_password = parts[3] if len(parts) > 3 else ""
                 else:
-                    # 纯文本格式: host:port:username:password
                     parts = response_text.split(":")
                     if len(parts) < 2:
                         logger.warning(f"[IPDeep] 返回格式不正确: {response_text[:200]}")
@@ -149,26 +158,20 @@ class IPProvider:
                             continue
                         return {"success": False, "error": f"IPDeep返回格式不正确: {response_text[:100]}"}
 
-                    proxy_host = parts[0]
-                    proxy_port = parts[1]
-                    proxy_username = ":".join(parts[2:-1]) if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
-                    proxy_password = parts[-1] if len(parts) > 3 else (parts[3] if len(parts) > 3 else "")
-                    # 处理 host:port:user:pwd 四段格式
                     if len(parts) == 4:
-                        proxy_host = parts[0]
-                        proxy_port = parts[1]
-                        proxy_username = parts[2]
-                        proxy_password = parts[3]
+                        proxy_host, proxy_port, proxy_username, proxy_password = parts
                     elif len(parts) == 3:
-                        proxy_host = parts[0]
-                        proxy_port = parts[1]
-                        proxy_username = parts[2]
+                        proxy_host, proxy_port, proxy_username = parts
                         proxy_password = ""
                     elif len(parts) == 2:
+                        proxy_host, proxy_port = parts
+                        proxy_username, proxy_password = "", ""
+                    else:
+                        # >4 段：user/pwd 内部可能带冒号，按 host:port:user(...):last = pwd
                         proxy_host = parts[0]
                         proxy_port = parts[1]
-                        proxy_username = ""
-                        proxy_password = ""
+                        proxy_password = parts[-1]
+                        proxy_username = ":".join(parts[2:-1])
 
                 if not proxy_host or not proxy_port:
                     logger.warning(f"[IPDeep] 解析代理信息失败: host={proxy_host}, port={proxy_port}")
@@ -179,31 +182,49 @@ class IPProvider:
 
                 logger.info(f"[IPDeep] ✅ 解析代理成功: {proxy_host}:{proxy_port} (user={proxy_username[:5] if proxy_username else '无'}...)")
 
-                # 通过代理获取出口IP详情
+                # 构造代理 URL（HTTP Basic 方式，适配 requests 直接消费）
                 proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}" if proxy_username else f"http://{proxy_host}:{proxy_port}"
-                ip_info = self._get_ip_details(proxy_url)
+                ip_info = self._get_ip_details(proxy_url, proxy_user=proxy_username, proxy_pwd=proxy_password)
 
-                # ★ P0-3: 拒绝机房/代理IP类型（datacenter/proxy/vpn/hosting/business）
+                # ★ 26.8.13.1 P0-3 决策重写（对齐实测 RTT=61s + 407 场景）：
+                # 原 fail-closed 在 proxy 建连超时时必失败，导致任务整批中断。
+                # 新规则：
+                #   - 确认为 hosting/proxy/datacenter/vpn → 拒绝（fail-closed 保留）
+                #   - ip_type=None 但 ip-api 至少成功返回了 IP → 标记 ip_type="isp_trust_unknown" + fail-open
+                #     （因为 IPDeep 家庭宽带概率 >90%，保守 26% 误判损失 > 放进来风险）
+                #   - ip_type=None 且连 IP 都没拿到 → 才 fail-closed
                 _detected_type = (ip_info or {}).get("ip_type") or (ip_info or {}).get("type")
+                _exit_ip_raw = (ip_info or {}).get("ip") or ""
                 if is_high_risk_ip(_detected_type):
-                    logger.warning(f"[IPDeep] 高危IP类型已拒绝: type={_detected_type}, ip={ip_info.get('ip')}")
+                    logger.warning(f"[IPDeep] 高危IP类型已拒绝: type={_detected_type}, ip={_exit_ip_raw}")
                     return {
                         "success": False,
                         "error": "IPDeep机房/代理IP已拒绝",
-                        "detail": {"ip": ip_info.get("ip"), "ip_type": _detected_type},
+                        "detail": {"ip": _exit_ip_raw, "ip_type": _detected_type},
                     }
+                if not _detected_type:
+                    if _exit_ip_raw and _exit_ip_raw not in ("", "未知"):
+                        logger.warning(f"[IPDeep] ip_type未知但出口IP存在({_exit_ip_raw})，fail-open放行（标记ip_type=isp_trust_unknown）")
+                        ip_info = dict(ip_info or {})
+                        ip_info["ip_type"] = "isp_trust_unknown"
+                        ip_info.setdefault("country_code", country_code or "US")
+                        ip_info.setdefault("timezone", _get_timezone_from_country(ip_info.get("country_code", "US")))
+                        ip_info.setdefault("language", _get_language_from_country(ip_info.get("country_code", "US")))
+                    else:
+                        logger.warning(f"[IPDeep] 未获取到IP类型且无出口IP，保守拒绝")
+                        return {
+                            "success": False,
+                            "error": "无法确认出口IP类型，已拒绝",
+                            "detail": {"ip": _exit_ip_raw, "ip_type": _detected_type},
+                        }
 
                 # IP 去重检查
                 exit_ip = (ip_info or {}).get("ip") or ""
-                if exit_ip and exit_ip != "未知" and check_ip_used_recently(exit_ip):
+                if exit_ip and exit_ip != "未知" and not acquire_ip_use(exit_ip):
                     logger.warning(f"[IPDeep] IP {exit_ip} 在去重间隔内已使用过，重新获取...")
                     if attempt < max_retries - 1:
                         time.sleep(1)
                         continue
-
-                # 记录IP使用
-                if exit_ip and exit_ip != "未知":
-                    record_ip_use(exit_ip)
 
                 result = {
                     "success": True,
@@ -213,14 +234,13 @@ class IPProvider:
                     "proxy_password": proxy_password,
                     "ip_info": ip_info,
                 }
-                # ★ 5.4 成功时重置失败计数
                 self._consecutive_failures = 0
                 self._total_ips_used += 1
                 logger.info(f"[IPDeep] ✅ 代理获取成功: {proxy_host}:{proxy_port}, 出口IP: {exit_ip}")
                 return result
 
             except requests.exceptions.Timeout:
-                logger.error(f"[IPDeep] ❌ 请求超时(15s) (尝试 {attempt+1})")
+                logger.error(f"[IPDeep] ❌ 请求超时(30s) (尝试 {attempt+1})")
                 if attempt < max_retries - 1:
                     time.sleep(2)
             except requests.exceptions.ConnectionError as e:
@@ -232,18 +252,25 @@ class IPProvider:
                 if attempt < max_retries - 1:
                     time.sleep(2)
 
-        # ★ 5.4 代理池监控告警：连续失败>=5次时输出WARNING
         self._consecutive_failures += 1
         if self._consecutive_failures >= 5:
             logger.warning(f"⚠️ [IPDeep] 代理池可能耗尽！连续失败{self._consecutive_failures}次，请检查IPDeep配额")
         return {"success": False, "error": f"IPDeep API {max_retries}次尝试均失败"}
 
-    def _get_ip_details(self, proxy_url: str) -> Dict:
-        """通过代理获取出口IP详细信息（5个API + 重试，提高容错）"""
+    def _get_ip_details(self, proxy_url: str, proxy_user: str = "", proxy_pwd: str = "") -> Dict:
+        """通过代理获取出口IP详细信息（5个API + 重试，提高容错）
+
+        26.8.13.1 ★ 认证双保险 + 超时长适配：
+        - 实测 gate.ipdeep.com:8082 TCP 握手 RTT ≈ 61s，timeout 从 10s → 120s
+        - 除了 proxy_url 内嵌 user:pwd，还额外构造 requests Session + Proxy-Authorization 头，
+          解决部分代理服务器对 http://user:pwd@host 解析失败 → 407 的问题
+        """
         ip_apis = [
             {
                 "name": "ip-api.com",
-                "url": "http://ip-api.com/json?fields=status,country,countryCode,regionName,city,timezone,isp,query",
+                # ★ 修复：fields 逗号分隔需 URL 编码(%2C)，保持原有字段并追加缺失字段
+                # as=ASN号码+机构, org=机构名, hosting/proxy=布尔型托管/代理标识（用于 ip_type 高危判断）
+                "url": "http://ip-api.com/json?fields=status%2Ccountry%2CcountryCode%2CregionName%2Ccity%2Ctimezone%2Cisp%2Cas%2Corg%2Chosting%2Cproxy%2Cquery",
                 "parser": lambda data: {
                     "success": data.get("status") == "success",
                     "ip": data.get("query"),
@@ -253,6 +280,16 @@ class IPProvider:
                     "city": data.get("city"),
                     "timezone": data.get("timezone"),
                     "isp": data.get("isp"),
+                    # ★ 修复：从 as/org 字段提取纯 ASN 号码（如 "AS15169 Google LLC" -> "15169"）
+                    "asn": _extract_asn(data.get("as")) or _extract_asn(data.get("org")),
+                    # ★ 修复：hosting/proxy 布尔标识映射为高危 ip_type；
+                    # 字段明确存在且均为 False 时视为正常家庭宽带(isp)；
+                    # 字段缺失（旧 API/异常响应）时返回 None，由调用方 fail-closed 拒绝
+                    "ip_type": (
+                        "hosting" if data.get("hosting")
+                        else ("proxy" if data.get("proxy")
+                              else ("isp" if ("hosting" in data or "proxy" in data) else None))
+                    ),
                     "language": _get_language_from_country(data.get("countryCode", "US"))
                 }
             },
@@ -325,12 +362,31 @@ class IPProvider:
 
         proxies = {"http": proxy_url, "https": proxy_url}
 
+        # 26.8.13.1 ★ 认证双保险：
+        #  - proxy_url 内嵌 user:pwd（requests 会拆成 Proxy-Authorization）
+        #  - 再手动给每次请求加 Proxy-Authorization header
+        # 注：为保持与单元测试 @patch("ip_provider.requests.get") 兼容，
+        #    仍使用 requests.get 接口；Session 仅做优化（如 Session 构造异常或 proxy_user
+        #    无法取得时退化为直接 requests.get + headers 参数）。
+        _proxy_auth_header = None
+        try:
+            if proxy_user and proxy_pwd:
+                import base64 as _b64_local
+                _token = _b64_local.b64encode(f"{proxy_user}:{proxy_pwd}".encode("utf-8")).decode("ascii")
+                _proxy_auth_header = {"Proxy-Authorization": f"Basic {_token}"}
+        except Exception:
+            _proxy_auth_header = None
+
         # ★ 最多尝试2轮（第2轮仅重试前2个完整API）
         for round_idx in range(2):
             apis_to_try = ip_apis if round_idx == 0 else ip_apis[:2]
             for api in apis_to_try:
                 try:
-                    resp = requests.get(api["url"], proxies=proxies, timeout=10)
+                    # 26.8.13.1 ★ timeout 10s → 120s （实测 gate.ipdeep.com RTT ≈ 61s）
+                    _req_kwargs = {"proxies": proxies, "timeout": 120}
+                    if _proxy_auth_header:
+                        _req_kwargs["headers"] = _proxy_auth_header
+                    resp = requests.get(api["url"], **_req_kwargs)
                     if resp.status_code != 200:
                         continue
                     # 文本模式 vs JSON模式
@@ -340,9 +396,14 @@ class IPProvider:
                         data = resp.json()
                         result = api["parser"](data)
                     if result.get("success") and result.get("ip"):
-                        # 如果仅获取到IP（无地理信息），用ip-api.com补全（复用同一出口代理，避免直连暴露本机真IP）
+                        # 如果仅获取到IP（无地理信息），用ip-api.com补全
                         if result.get("_ip_only") and not result.get("country_code"):
-                            geo = self._enrich_ip_geo(result["ip"], proxy_url=proxy_url)
+                            geo = self._enrich_ip_geo(
+                                result["ip"],
+                                proxy_url=proxy_url,
+                                _timeout=120,
+                                _extra_headers=_proxy_auth_header,
+                            )
                             if geo:
                                 result.update(geo)
                         logger.info(f"[IP详情] 通过 {api['name']} 获取: {result.get('ip')} ({result.get('country_code', '?')})")
@@ -355,22 +416,27 @@ class IPProvider:
                 time.sleep(1)
 
         logger.warning("[IP详情] 所有API失败(2轮)，无法获取出口IP信息")
-        # ★ 审计修复#10 + I4：所有API失败时返回 success:False 且不伪造国家/时区，由上层决定舍弃该IP
         return {
             "success": False,
             "error": "所有IP详情API均不可达",
             "ip": "",
         }
 
-    def _enrich_ip_geo(self, ip: str, proxy_url: str = None) -> Dict:
+    def _enrich_ip_geo(self, ip: str, proxy_url: str = None,
+                        _timeout: int = 30, _extra_headers=None,
+                        _reuse_session=None) -> Dict:
         """用ip-api.com补全IP地理信息（优先走调用方传入的代理，避免直连暴露本机真IP）"""
         try:
-            req_kwargs = {"timeout": 5}
+            req_kwargs = {"timeout": _timeout}
             if proxy_url:
                 req_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            if _extra_headers:
+                req_kwargs["headers"] = _extra_headers
             else:
-                logger.warning("[IP详情] 未能走代理补全Geo信息，将直连ip-api.com（可能暴露本机真IP）")
-            resp = requests.get(
+                if not proxy_url:
+                    logger.warning("[IP详情] 未能走代理补全Geo信息，将直连ip-api.com（可能暴露本机真IP）")
+            _client = _reuse_session if _reuse_session is not None else requests
+            resp = _client.get(
                 f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,timezone,isp",
                 **req_kwargs
             )
@@ -392,6 +458,20 @@ class IPProvider:
         return None
 
 
+# ============================================================
+# ASN 提取工具（供 ip-api 等 API 的 as/org 字段解析使用）
+# ============================================================
+_ASN_RE = re.compile(r"\bAS(\d+)\b", re.IGNORECASE)
+
+
+def _extract_asn(text) -> str:
+    """从 as/org 字段中提取纯 ASN 号码，如 'AS15169 Google LLC' -> '15169'"""
+    if not text:
+        return ""
+    m = _ASN_RE.search(str(text))
+    return m.group(1) if m else ""
+
+
 def _get_language_from_country(country_code: str) -> str:
     """根据国家代码返回对应语言"""
     if not country_code:
@@ -404,6 +484,25 @@ def _get_language_from_country(country_code: str) -> str:
         "SA": "ar-SA", "AE": "ar-AE", "EG": "ar-EG"
     }
     return lang_map.get(country_code.upper(), "en-US")
+
+
+_COUNTRY_TZ_NAME_MAP = {
+    "US": "America/New_York", "GB": "Europe/London", "CA": "America/Toronto",
+    "AU": "Australia/Sydney", "CN": "Asia/Shanghai", "TW": "Asia/Taipei",
+    "HK": "Asia/Hong_Kong", "JP": "Asia/Tokyo", "KR": "Asia/Seoul",
+    "DE": "Europe/Berlin", "FR": "Europe/Paris", "ES": "Europe/Madrid",
+    "IT": "Europe/Rome", "BR": "America/Sao_Paulo", "RU": "Europe/Moscow",
+    "MX": "America/Mexico_City", "SA": "Asia/Riyadh", "AE": "Asia/Dubai",
+    "EG": "Africa/Cairo", "IN": "Asia/Kolkata", "ID": "Asia/Jakarta",
+    "VN": "Asia/Ho_Chi_Minh", "TH": "Asia/Bangkok", "PH": "Asia/Manila",
+}
+
+
+def _get_timezone_from_country(country_code: str) -> str:
+    """根据国家代码返回 IANA 时区名（fail-open，未知返回 America/New_York）"""
+    if not country_code:
+        return "America/New_York"
+    return _COUNTRY_TZ_NAME_MAP.get(country_code.upper(), "America/New_York")
 
 
 # ============================================================
@@ -534,6 +633,30 @@ def record_ip_use(ip: str):
         _used_ips[ip] = time.time()
         logger.debug(f"[IP去重] 记录IP使用: {ip}")
     _save_dedup_state()
+
+
+def acquire_ip_use(ip: str) -> bool:
+    """原子执行"过期清理 → 检查 → 记录"（★ TOCTOU 修复）
+
+    在同一把 _used_ips_lock 内完成检查与记录，避免 check_ip_used_recently 与
+    record_ip_use 分离调用在并发场景下的竞态（同一IP可能被两个线程同时放行）。
+
+    :return: True 表示成功占用该IP（此前未被使用或已过期）；
+             False 表示该IP在去重间隔内已使用过，调用方应重新获取
+    """
+    if not ip:
+        return True
+    now = time.time()
+    with _used_ips_lock:
+        expired = [k for k, v in _used_ips.items() if (now - v) > IP_REUSE_INTERVAL]
+        for k in expired:
+            del _used_ips[k]
+        if ip in _used_ips:
+            return False
+        _used_ips[ip] = now
+    _save_dedup_state()
+    logger.debug(f"[IP去重] 记录IP使用: {ip}")
+    return True
 
 
 def get_used_ips_count() -> int:

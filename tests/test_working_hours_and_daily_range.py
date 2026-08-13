@@ -40,11 +40,17 @@ with open(CFG_PATH, "r") as _f:
     BASE_CFG = json.load(_f)
 
 
-# ─────────────────────────── helper ───────────────────────────
+# ───────────────────────── helper ─────────────────────────
 def _task_local_hour(task_utc_ts, country_code):
-    """把任务 actual_start (UTC epoch) 换成 chosen_country 的浮点数小时。"""
+    """把任务 actual_start（相对 today_utc_start 的 UTC 秒）换算成 chosen_country 的浮点数小时。
+
+    ⚠️ 26.8.13.1 修复测试误读：actual_start 不是 epoch 秒（如 43200 会被
+    fromtimestamp 当成 1970-01-01 12:00 UTC，US 当地 07:00 → 18 个假失败），
+    而是"今天 UTC 0 点起的秒数"，必须加到 today_utc_start 上再转目标时区。
+    """
     tz = pytz.timezone(get_timezone_for_country(country_code))
-    local = dt.datetime.fromtimestamp(task_utc_ts, pytz.UTC).astimezone(tz)
+    today_utc_start = dt.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    local = (today_utc_start + dt.timedelta(seconds=task_utc_ts)).astimezone(tz)
     return local.hour + local.minute / 60.0
 
 

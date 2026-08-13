@@ -20,7 +20,6 @@ selenium_traffic_system/
 ├── ip_provider.py          (526行)  IP代理获取模块
 ├── risk_check.py           (576行)  风控检测模块
 ├── seo_query_module.py     (595行)  SEO查询配置模块
-├── proxy_server_new.py     (1.1K)   代理服务器
 ├── ip_info_resolver.py     (253行)  IP信息解析
 ├── ip_region_module.py     (316行)  IP区域模块
 ├── test_full_workflow.py   (397行)  集成测试脚本 (不要动)

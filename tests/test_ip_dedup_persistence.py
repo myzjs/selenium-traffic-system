@@ -1,7 +1,6 @@
 """
-IP去重持久化 + 两套去重统一 测试（P1-10）
+IP去重持久化 + 去重统一 测试（P1-10）
 - 去重状态可持久化/恢复（_used_ips 与 _c_segment_usage）
-- proxy_server_new 与 ip_provider 共用同一套去重（check_ip_used_recently / record_ip_use）
 - 高危IP类型被拒绝（P0-3）
 - Geo失败不伪造IP/国家（I4）
 全部使用 mock，不依赖真实网络。
@@ -68,22 +67,6 @@ class TestDedupPersistence:
             ip_provider._used_ips.clear()
             ip_provider._load_dedup_state()
             assert ip_provider._used_ips == {}
-
-
-class TestUnifiedDedup:
-    """proxy_server_new 与 ip_provider 共用同一套去重"""
-
-    def test_shared_reference(self):
-        """两套去重应引用同一函数（同一口径）"""
-        import proxy_server_new
-        assert proxy_server_new.check_ip_used_recently is ip_provider.check_ip_used_recently
-        assert proxy_server_new.record_ip_use is ip_provider.record_ip_use
-
-    def test_cross_module_dedup(self):
-        """在 ip_provider 记录后，proxy_server_new 侧也能识别为已用"""
-        import proxy_server_new
-        record_ip_use("9.9.9.99")
-        assert proxy_server_new.check_ip_used_recently("9.9.9.99") is True
 
 
 class TestHighRiskRejection:
@@ -162,14 +145,3 @@ class TestGeoFailureNoFake:
         assert result.get("country_code") is None
         assert result.get("country_code") != "US"
         assert "timezone" not in result or not result["timezone"]
-
-    @patch("proxy_server_new.requests.get")
-    def test_proxy_server_geo_failure_no_fake(self, mock_get):
-        """proxy_server_new 所有Geo API失败时不伪造1.1.1.1/US"""
-        mock_get.side_effect = Exception("network down")
-        import proxy_server_new
-        result = proxy_server_new.get_ip_details_proxy("http://p:1@h:8080")
-        assert result["success"] is False
-        assert result["ip"] == ""
-        assert result.get("country_code") != "US"
-        assert "1.1.1.1" not in result.get("ip", "")

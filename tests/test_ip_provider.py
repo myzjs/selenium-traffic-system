@@ -84,7 +84,9 @@ class TestIPProviderGetIP:
             "regionName": "California",
             "city": "Los Angeles",
             "timezone": "America/Los_Angeles",
-            "isp": "TestISP"
+            "isp": "TestISP",
+            "hosting": False,
+            "proxy": False,
         }
 
         mock_get.side_effect = [mock_resp1, mock_resp2]
@@ -123,7 +125,9 @@ class TestIPProviderGetIP:
             "regionName": "England",
             "city": "London",
             "timezone": "Europe/London",
-            "isp": "TestISP UK"
+            "isp": "TestISP UK",
+            "hosting": False,
+            "proxy": False,
         }
 
         mock_get.side_effect = [mock_resp1, mock_resp2]
@@ -243,7 +247,9 @@ class TestIPProviderConvenienceFunctions:
             "regionName": "NSW",
             "city": "Sydney",
             "timezone": "Australia/Sydney",
-            "isp": "TestISP AU"
+            "isp": "TestISP AU",
+            "hosting": False,
+            "proxy": False,
         }
 
         mock_get.side_effect = [mock_resp1, mock_resp2]
@@ -259,14 +265,26 @@ class TestIPProviderConvenienceFunctions:
 
     @patch("ip_provider.requests.get")
     def test_get_proxy_from_api_url_with_cache(self, mock_get):
-        """get_proxy_from_api_url 缓存机制"""
-        mock_resp1 = MagicMock()
-        mock_resp1.status_code = 200
-        mock_resp1.text = "20.0.0.1:7070:cuser:cpass"
+        """get_proxy_from_api_url 缓存机制（★ 缓存+IP去重联动）
 
-        mock_resp2 = MagicMock()
-        mock_resp2.status_code = 200
-        mock_resp2.json.return_value = {
+        P1 修复后行为：缓存命中时若缓存 IP 已在 24h 去重池中（刚被占用），
+        缓存必须失效并重新获取新 IP，防止同一 IP 被重复使用触发风控；
+        仅当缓存 IP 可复用（不在去重间隔内）时才直接返回缓存、不发请求。
+        """
+        import time as _t
+        import ip_provider as _ip
+
+        def _mk_resp(text_or_json):
+            r = MagicMock()
+            r.status_code = 200
+            if isinstance(text_or_json, str):
+                r.text = text_or_json
+            else:
+                r.json.return_value = text_or_json
+            return r
+
+        mock_resp1 = _mk_resp("20.0.0.1:7070:cuser:cpass")
+        mock_resp2 = _mk_resp({
             "status": "success",
             "query": "11.22.33.44",
             "country": "Canada",
@@ -274,19 +292,42 @@ class TestIPProviderConvenienceFunctions:
             "regionName": "Ontario",
             "city": "Toronto",
             "timezone": "America/Toronto",
-            "isp": "TestISP CA"
-        }
-
-        mock_get.side_effect = [mock_resp1, mock_resp2]
+            "isp": "TestISP CA",
+            "hosting": False,
+            "proxy": False,
+        })
+        mock_resp3 = _mk_resp("21.0.0.1:7071:cuser:cpass")
+        mock_resp4 = _mk_resp({
+            "status": "success",
+            "query": "22.33.44.55",
+            "country": "Canada",
+            "countryCode": "CA",
+            "regionName": "Ontario",
+            "city": "Toronto",
+            "timezone": "America/Toronto",
+            "isp": "TestISP CA",
+            "hosting": False,
+            "proxy": False,
+        })
+        mock_get.side_effect = [mock_resp1, mock_resp2, mock_resp3, mock_resp4]
 
         cache_url = "http://cache-test-api.example.com/proxy"
         result1 = get_proxy_from_api_url(cache_url, api_user="u", api_pwd="p", use_cache=True)
         assert result1["success"] is True
 
-        # 第二次调用命中缓存，不再发请求
-        call_count_before = mock_get.call_count
+        # 第二次调用：缓存命中但 IP 11.22.33.44 已在去重池（刚被占用）
+        # → 缓存失效，重新获取不同 IP
         result2 = get_proxy_from_api_url(cache_url, api_user="u", api_pwd="p", use_cache=True)
         assert result2["success"] is True
+        assert result2["ip_info"]["ip"] != result1["ip_info"]["ip"]
+
+        # 缓存 IP 已过 24h 去重期（可复用）→ 缓存命中直接返回，不发请求
+        cached_ip = result2["ip_info"]["ip"]
+        with _ip._used_ips_lock:
+            _ip._used_ips[cached_ip] = _t.time() - 25 * 3600
+        call_count_before = mock_get.call_count
+        result3 = get_proxy_from_api_url(cache_url, api_user="u", api_pwd="p", use_cache=True)
+        assert result3["success"] is True
         assert mock_get.call_count == call_count_before
 
         invalidate_proxy_cache(cache_url)

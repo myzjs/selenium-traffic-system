@@ -188,11 +188,17 @@ def evaluate_golden_vs_system(
     system_verdict_field: str = "system_verdict",
     fraud_verdicts=("fraud", "suspicious", "blocked", "rejected"),
     normal_verdicts=("normal", "clean", "passed"),
+    write_back: bool = True,
 ) -> RedTeamEvaluation:
     """
     读取 day report，结合反欺诈系统回填的 system_verdict 字段，计算评估指标。
 
     使用前：先用反欺诈系统的 API/日志把每条记录的 system_verdict 回填。
+
+    参数:
+      date_str:  YYYYMMDD 日期；None 取本地当日
+      write_back: 26.8.13.1 新增，是否把每条的 evaluation_match 结果回写 JSONL 文件
+                    （tp/fp/tn/fn 四象限，审计时可逐条对账，默认 true）
     """
     if not date_str:
         date_str = datetime.now().strftime("%Y%m%d")
@@ -218,21 +224,29 @@ def evaluate_golden_vs_system(
         baseline_count=baseline, fraud_count=fraud, suspicious_count=susp,
     )
 
-    # 先算有判定的样本
+    def _expected_pos(r):
+        return r.get("expected_verdict") in ("fraud", "suspicious")
+
+    def _system_pos(r):
+        return r.get(system_verdict_field) in fraud_verdicts
+
+    # 先算有判定的样本 + 逐条回写 evaluation_match
     judged = [r for r in records if r.get(system_verdict_field)]
     if judged:
-        tp = sum(1 for r in judged
-                 if r.get("expected_verdict") in ("fraud", "suspicious")
-                 and r.get(system_verdict_field) in fraud_verdicts)
-        fn = sum(1 for r in judged
-                 if r.get("expected_verdict") in ("fraud", "suspicious")
-                 and r.get(system_verdict_field) in normal_verdicts)
-        fp = sum(1 for r in judged
-                 if r.get("expected_verdict") == "normal"
-                 and r.get(system_verdict_field) in fraud_verdicts)
-        tn = sum(1 for r in judged
-                 if r.get("expected_verdict") == "normal"
-                 and r.get(system_verdict_field) in normal_verdicts)
+        tp, fn, fp, tn = 0, 0, 0, 0
+        for r in judged:
+            ep, sp = _expected_pos(r), _system_pos(r)
+            if ep and sp:
+                tag = "tp"; tp += 1
+            elif ep and not sp:
+                tag = "fn"; fn += 1
+            elif not ep and sp:
+                tag = "fp"; fp += 1
+            else:
+                tag = "tn"; tn += 1
+            # ★ 26.8.13.1 回写每条判定四象限标签（可用于事后逐条对账 & 过滤某一类样本）
+            r["evaluation_match"] = tag
+
         pos = tp + fn
         neg = fp + tn
         if pos > 0:
@@ -249,36 +263,37 @@ def evaluate_golden_vs_system(
         for dim_name in set(r.get("dimension", "") for r in judged):
             if not dim_name:
                 continue
-            dim_pos = [r for r in judged if r.get("dimension") == dim_name
-                       and r.get("expected_verdict") in ("fraud", "suspicious")]
+            dim_pos = [r for r in judged if r.get("dimension") == dim_name and _expected_pos(r)]
             if dim_pos:
-                dim_hit = sum(1 for r in dim_pos if r.get(system_verdict_field) in fraud_verdicts)
+                dim_hit = sum(1 for r in dim_pos if _system_pos(r))
                 ev.dimension_recall[dim_name] = round(dim_hit / len(dim_pos), 4)
         for sid in set(r.get("scenario_id", "") for r in judged):
             if not sid:
                 continue
-            s_pos = [r for r in judged if r.get("scenario_id") == sid
-                     and r.get("expected_verdict") in ("fraud", "suspicious")]
+            s_pos = [r for r in judged if r.get("scenario_id") == sid and _expected_pos(r)]
             if s_pos:
-                s_hit = sum(1 for r in s_pos if r.get(system_verdict_field) in fraud_verdicts)
+                s_hit = sum(1 for r in s_pos if _system_pos(r))
                 ev.scenario_recall[sid] = round(s_hit / len(s_pos), 4)
         tag_count: Dict[str, List[bool]] = {}
         for r in judged:
-            is_positive = r.get("expected_verdict") in ("fraud", "suspicious")
-            detected = r.get(system_verdict_field) in fraud_verdicts
+            detected = _system_pos(r)
             for t in r.get("injected_tags", []):
-                tag_count.setdefault(t, []).append(detected if is_positive else False)
+                tag_count.setdefault(t, []).append(detected if _expected_pos(r) else False)
         ev.tag_recall = {
             t: round(sum(hit_list) / len(hit_list), 4)
             for t, hit_list in tag_count.items() if len(hit_list) >= 3
         }
 
         # 未匹配（本该命中但系统漏判 / 误判）
-        ev.unmatched_records = [
-            r for r in judged
-            if (r.get("expected_verdict") in ("fraud", "suspicious") and r.get(system_verdict_field) in normal_verdicts)
-            or (r.get("expected_verdict") == "normal" and r.get(system_verdict_field) in fraud_verdicts)
-        ]
+        ev.unmatched_records = [r for r in judged if r.get("evaluation_match") in ("fn", "fp")]
+
+    # 26.8.13.1 把evaluation_match写回 JSONL（默认回写，便于审计时直接读文件看对账结果）
+    if write_back and os.path.exists(path):
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
 
     return ev
 

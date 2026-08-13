@@ -181,10 +181,11 @@ class _IsolatePool:
         供单测验证：
           - 不同 adv_id → 归一化 adv 不同 → 键空间完全不相交（互不污染）；
           - 同 adv_id + 同资源 → 键相同 → 互斥判定命中。
+        审计修复：asn 缺失时置空，不再用 C 段 IP 冒充 ASN（避免把不同 ASN 的用户错误合并隔离）。
         """
         adv = _normalize_adv_id(adv_id)
         c_seg = _ip_c_segment(ip)
-        asn_val = (asn or c_seg).strip()
+        asn_val = (asn or "").strip()
         fp = str(fingerprint or ua or "anon").strip()[:128]
         return (adv, c_seg, asn_val, fp)
 
@@ -202,7 +203,7 @@ class _IsolatePool:
         """
         返回 (是否允许使用该组合, 拒绝原因)。
         adv_id 为空/占位时归一为 '__default_adv__'，隔离判定依然严格生效（不再直接放行）。
-        asn 缺失时用 ip 粗粒度近似（但不精确，推荐调用方从 ip_info 传 ASN）。
+        审计修复：asn 缺失时置空、跳过 ASN 维度判定与写入，不再用 C 段 IP 冒充（推荐调用方从 ip_info 传 ASN）。
         """
         adv, c_seg, asn_val, fp = self.derive_keys(adv_id, ip, fingerprint, ua, asn)
 
@@ -215,13 +216,14 @@ class _IsolatePool:
                 reason = f"P0-1:C段重复 adv={adv} c_seg={c_seg} 剩余{remain/3600:.1f}h"
                 _decision_log("P0-1 reject", reason=reason, ip=ip)
                 return False, reason
-            # ASN 7 天
-            asn_last = self._asn[adv].get(asn_val, 0.0)
-            if now - asn_last < self.ASN_WINDOW and asn_last > 0:
-                remain = self.ASN_WINDOW - (now - asn_last)
-                reason = f"P0-1:ASN重复 adv={adv} asn={asn_val} 剩余{remain/3600:.1f}h"
-                _decision_log("P0-1 reject", reason=reason, ip=ip)
-                return False, reason
+            # ASN 7 天（审计修复：asn 为空时跳过 ASN 维度判定，不冒充）
+            if asn_val:
+                asn_last = self._asn[adv].get(asn_val, 0.0)
+                if now - asn_last < self.ASN_WINDOW and asn_last > 0:
+                    remain = self.ASN_WINDOW - (now - asn_last)
+                    reason = f"P0-1:ASN重复 adv={adv} asn={asn_val} 剩余{remain/3600:.1f}h"
+                    _decision_log("P0-1 reject", reason=reason, ip=ip)
+                    return False, reason
             # FP 30 天
             fp_last = self._fp[adv].get(fp, 0.0)
             if now - fp_last < self.FP_WINDOW and fp_last > 0:
@@ -232,7 +234,8 @@ class _IsolatePool:
 
             # 写入记录
             self._c[adv][c_seg] = now
-            self._asn[adv][asn_val] = now
+            if asn_val:
+                self._asn[adv][asn_val] = now
             self._fp[adv][fp] = now
             # 顺便清理 10% 过期项（避免内存无限涨）
             self._gc_locked()
@@ -1319,6 +1322,8 @@ class _BehaviorCopula:
     def __init__(self) -> None:
         self._l = None  # Cholesky 分解
         self._lock = threading.Lock()
+        # 审计修复：独立 RNG 实例，避免 random.seed 污染全局随机流（影响其他调用方）
+        self._rng = random.Random()
         # host-country 分层覆盖：每个 (host,cc) 单独维护一个小样本后验，
         # 初始先验就是全局参数，有数据后慢慢偏到后验。
         self._host_stats: Dict[Tuple[str, str], List[Tuple[float, int, float]]] = defaultdict(list)
@@ -1345,13 +1350,14 @@ class _BehaviorCopula:
             _BehaviorCopula._lock_cls = threading.Lock()
         return _BehaviorCopula._lock_cls  # type: ignore[return-value]
 
-    @staticmethod
-    def _gauss_sample(n: int = 3) -> List[float]:
+    def _gauss_sample(self, n: int = 3, rng: Optional[random.Random] = None) -> List[float]:
         # Box-Muller：避免依赖 numpy
+        # 审计修复：改用独立 RNG 实例（不触碰全局 random 流），rng 为空时用实例内置 self._rng
+        rng = rng or self._rng
         out = []
         for _ in range((n + 1) // 2):
-            u1 = max(1e-12, random.random())
-            u2 = random.random()
+            u1 = max(1e-12, rng.random())
+            u2 = rng.random()
             z0 = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
             z1 = math.sqrt(-2 * math.log(u1)) * math.sin(2 * math.pi * u2)
             out.extend([z0, z1])
@@ -1403,9 +1409,12 @@ class _BehaviorCopula:
         engagement_sec：总互动秒数（在调用方 split 到每页即可）。
         """
         if seed is not None:
-            random.seed(seed)
+            # 审计修复：seed 用独立 Random 实例，不再 random.seed 污染全局随机流
+            rng = random.Random(seed)
+        else:
+            rng = None
         L = self._chol()
-        z0 = self._gauss_sample(3)
+        z0 = self._gauss_sample(3, rng)
         # 关联
         z = [
             L[0][0] * z0[0],
@@ -1418,7 +1427,9 @@ class _BehaviorCopula:
         eng = self._gamma_ppf(u[2], 5.2, 22.0)
         # ---- host-country 后验微调 ---- #
         key = (str(host or "").strip()[:64], str(country or "").strip()[:8])
-        data = self._host_stats[key]
+        # 审计修复：加锁读取 _host_stats，避免与 record_observed 并发写造成竞态
+        with self._lock:
+            data = list(self._host_stats[key])
         if len(data) >= 20:
             # 对 prior 和经验均值做 EMA（α=0.3）
             b_emp = sum(1 for d in data if d[0] < 0.35) / len(data)
@@ -1436,7 +1447,9 @@ class _BehaviorCopula:
         self, host: str, country: str, bounce: float, pages: int, engagement: float
     ) -> None:
         key = (str(host or "").strip()[:64], str(country or "").strip()[:8])
-        self._host_stats[key].append((float(bounce), int(pages), float(engagement)))
+        # 审计修复：加锁写入，避免与 sample_behavior 并发读造成竞态
+        with self._lock:
+            self._host_stats[key].append((float(bounce), int(pages), float(engagement)))
         if len(self._host_stats[key]) > 2000:
             self._host_stats[key] = self._host_stats[key][-1000:]
 

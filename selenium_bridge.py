@@ -49,6 +49,11 @@ import signal as _signal
 _active_drivers = []
 _active_drivers_lock = threading.Lock()
 
+# ★ 窗口切换/句柄枚举互斥锁：多个守护线程（popunder 触发/心跳采集）与主线程
+#   并发调用 switch_to.window / window_handles 存在竞态（窗口焦点被互相篡改、
+#   句柄枚举期间切换导致 IndexError），统一用该锁串行化窗口级操作。
+_window_focus_lock = threading.Lock()
+
 # 停止检查回调：由 app.py 注入，返回 True 表示任务应当停止。
 # 用于让 goto/wait 等阻塞循环及时中断，避免"点停止后仍卡在加载等待里"。
 _stop_check_callback = None
@@ -863,21 +868,39 @@ class Request:
 
 
 class Route:
-    """模拟 Playwright Route - Selenium下通过CDP/js预处理，此为兼容层"""
+    """模拟 Playwright Route - Selenium下通过CDP/js预处理，此为兼容层。
+
+    ★ 26.8.13.3 修复：abort/continue_/fulfill 从空操作改为记录路由决策，
+    由 Page 的请求采集管道读取决策并汇总日志（物理拦截能力受 Selenium
+    限制为近似实现：fetch/XHR 级阻断由 JS hook 负责，CDP 无法改写已发出请求）。
+    """
+
     def __init__(self, request: Request = None):
         self.request = request or Request()
+        # ★ 路由决策状态：abort / fulfill / continue 三选一，供采集管道读取
+        self._aborted = False
+        self._fulfilled = None  # (status, body, content_type)
+        self._continued = False
 
     def continue_(self, headers: dict = None, **kwargs):
-        """继续请求（Selenium下请求已通过CDP/js预处理，此处为空操作）"""
-        pass
+        """继续请求（放行）。Selenium 无法改写已发出的请求头，headers 仅记录。"""
+        self._continued = True
+        if headers:
+            try:
+                self.request.headers.update(headers)
+            except Exception:
+                pass
 
     def abort(self, error_code: str = "failed", **kwargs):
-        """中止请求（Selenium下通过host-rules/js hook实现）"""
-        pass
+        """中止请求（记录拦截决策并记日志，物理拦截由 JS hook 阻断表兜底）"""
+        self._aborted = True
+        logger.info(f"Route.abort 拦截请求: {self.request.url} (error_code={error_code})")
 
     def fulfill(self, status: int = 200, body: str = "", **kwargs):
-        """完成请求"""
-        pass
+        """用本地响应替代请求（记录决策；物理替代受 Selenium 能力限制为近似实现）"""
+        content_type = kwargs.get("content_type") or kwargs.get("contentType") or "text/html"
+        self._fulfilled = (int(status), body, content_type)
+        logger.debug(f"Route.fulfill 本地响应替代: {self.request.url} status={status}")
 
 
 # ========== Page 兼容类 ==========
@@ -915,6 +938,16 @@ class Page:
         self._network_interception_enabled = False
         self._cdp_listener = None
         self._request_id_map = {}
+        # ★ 事件系统（Playwright 兼容）：on/once/off/emit
+        self._event_handlers: Dict[str, List] = {}
+        self._event_lock = threading.Lock()
+        # ★ 网络请求采集管道：JS hook 写入 window.__sb_requests，
+        #   轮询线程 drain 后存入 _request_records，并派发 request 事件 / route handlers
+        self._request_records: List[Dict] = []
+        self._request_records_lock = threading.Lock()
+        self._collecting = False
+        self._collect_stop = threading.Event()
+        self._collect_thread = None
         # ★ 窗口句柄绑定：None=主页面（沿用焦点语义）；非空=弹窗等副标签，
         #   操作前自动切到绑定窗口，避免共享driver焦点被其它标签篡改
         self._window_handle = None
@@ -923,14 +956,75 @@ class Page:
         Page._set_current_page(self)
 
     def _focus_window(self):
-        """★ 若绑定了窗口句柄且当前焦点不在其上，先切换焦点（失败不阻断）"""
+        """★ 若绑定了窗口句柄且当前焦点不在其上，先切换焦点（失败不阻断）。
+        用模块级 _window_focus_lock 串行化窗口切换，避免多个守护线程并发
+        switch_to.window 互相篡改焦点（弹窗触发线程/心跳采集线程/主线程三方竞态）。
+        """
         if not self._window_handle:
             return
         try:
-            if self.driver.current_window_handle != self._window_handle:
-                self.driver.switch_to.window(self._window_handle)
+            with _window_focus_lock:
+                if self.driver.current_window_handle != self._window_handle:
+                    self.driver.switch_to.window(self._window_handle)
         except Exception:
             pass
+
+    # ================= 事件系统（Playwright 兼容） =================
+    # ★ 26.8.13.3 新增：on/once/off/emit。重点支持 "request" 事件——
+    #   上层 popunder_trigger 的 popunder_page.on("request", _on_pop_request)
+    #   依赖它采集弹窗页网络请求（url / method / resource_type）。
+    def on(self, event: str, handler: Callable):
+        """注册事件监听器。event=="request" 时自动启动网络请求采集管道；
+        CDP 采集不可用时仅记 warning 不抛异常（保证上层注册不被异常打断）。
+        """
+        if event == "request":
+            self._start_request_collection()
+        with self._event_lock:
+            self._event_handlers.setdefault(event, []).append(handler)
+        return None
+
+    def once(self, event: str, handler: Callable):
+        """注册一次性监听器（触发一次后自动移除）"""
+        def _wrapper(*args, **kwargs):
+            try:
+                handler(*args, **kwargs)
+            finally:
+                self.off(event, _wrapper)
+        if event == "request":
+            self._start_request_collection()
+        with self._event_lock:
+            self._event_handlers.setdefault(event, []).append(_wrapper)
+        return None
+
+    def off(self, event: str, handler: Callable = None):
+        """移除监听器；handler 为 None 时移除该事件全部监听器"""
+        with self._event_lock:
+            hs = self._event_handlers.get(event)
+            if not hs:
+                return
+            if handler is None:
+                self._event_handlers[event] = []
+            else:
+                self._event_handlers[event] = [h for h in hs if h is not handler and h != handler]
+
+    def emit(self, event: str, *args, **kwargs):
+        """触发事件：快照 handler 列表后在锁外调用，避免回调内再注册/注销导致死锁"""
+        with self._event_lock:
+            hs = list(self._event_handlers.get(event, []))
+        for h in hs:
+            try:
+                h(*args, **kwargs)
+            except Exception as e:
+                logger.debug(f"Page.emit({event}) 回调异常(忽略): {e}")
+
+    def drain_request_records(self) -> List[Dict]:
+        """取走并清空已采集的网络请求记录（供上层做心跳/流量分析）。
+        每条记录含 url / method / resource_type / timestamp 字段。
+        """
+        with self._request_records_lock:
+            records = self._request_records
+            self._request_records = []
+        return records
 
     @property
     def context(self):
@@ -966,6 +1060,19 @@ class Page:
 
     @property
     def viewport_size(self) -> Dict:
+        # ★ 修复：窗口外框（get_window_size）≠ 视口，改用 JS 读取真实视口，
+        #   JS 失败（about:blank/布局未完成/驱动异常）时回退原逻辑。
+        try:
+            self._focus_window()
+            vp = self.driver.execute_script(
+                "var de = document.documentElement;"
+                "return {w: de.clientWidth || window.innerWidth || 0,"
+                "        h: de.clientHeight || window.innerHeight || 0};"
+            )
+            if isinstance(vp, dict) and vp.get("w") and vp.get("h"):
+                return {"width": int(vp["w"]), "height": int(vp["h"])}
+        except Exception:
+            pass
         try:
             size = self.driver.get_window_size()
             return {"width": size.get("width", 1920), "height": size.get("height", 1080)}
@@ -1366,6 +1473,232 @@ class Page:
         except Exception:
             pass
 
+    # ================= 网络请求采集（on("request") 数据源） =================
+    # ★ 26.8.13.3 新增：Selenium 无官方 CDP 事件订阅 API，采用组合方案：
+    #   1) CDP Network.enable（尽力而为，失败仅记 warning 不阻断）
+    #   2) JS hook（fetch/XHR/sendBeacon/Image）写入 window.__sb_requests 数组
+    #   3) 守护线程轮询 drain 数组 → 存入 _request_records → 派发 route handlers
+    #      与 request 事件（心跳监听/流量分析）
+    def _start_request_collection(self):
+        """启动网络请求采集管道（幂等）：on("request") 注册时自动调用。"""
+        if self._collecting:
+            return
+        self._collecting = True
+        self._collect_stop.clear()
+        # 1) CDP Network.enable（失败不抛异常，仅记 warning；JS hook 仍可采集）
+        try:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+            self._network_interception_enabled = True
+        except Exception as e:
+            logger.warning(f"Page 网络采集 CDP Network.enable 失败，仅依赖 JS hook: {e}")
+        # 2) JS hook：立即注入当前文档 + 注册到后续新文档
+        self._inject_request_hook()
+        # 3) 轮询守护线程
+        self._collect_thread = threading.Thread(
+            target=self._poll_request_records, name="sb-req-collect", daemon=True
+        )
+        self._collect_thread.start()
+
+    def _stop_request_collection(self):
+        """停止网络请求采集（幂等）：通知轮询线程退出（Page.close() 时调用）。"""
+        if not self._collecting:
+            return
+        self._collecting = False
+        self._collect_stop.set()
+        t = self._collect_thread
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        self._collect_thread = None
+
+    def _inject_request_hook(self):
+        """注入 JS hook：把 fetch/XHR/sendBeacon/Image 请求写入 window.__sb_requests。
+        数组元素形如 {u: url, m: method, t: resourceType, n: 时间戳}，
+        轮询线程 drain 时翻译成 Request 记录。
+        """
+        hook_js = r"""
+        (function() {
+            try {
+                if (window.__sb_req_hooked) { return; }
+                window.__sb_req_hooked = true;
+                if (!window.__sb_requests) { window.__sb_requests = []; }
+                function _sb_push(u, m, t) {
+                    try {
+                        if (!u || String(u).indexOf('about:') === 0) { return; }
+                        window.__sb_requests.push({u: String(u), m: String(m || 'GET'), t: String(t || 'other'), n: Date.now()});
+                        if (window.__sb_requests.length > 2000) {
+                            window.__sb_requests.splice(0, window.__sb_requests.length - 2000);
+                        }
+                    } catch(e) {}
+                }
+                // fetch
+                if (window.fetch) {
+                    var _f = window.fetch;
+                    window.fetch = function(resource, init) {
+                        var u = (typeof resource === 'string') ? resource : (resource && resource.url);
+                        var m = (init && init.method) || (resource && resource.method) || 'GET';
+                        _sb_push(u, m, 'fetch');
+                        return _f.apply(this, arguments);
+                    };
+                }
+                // XMLHttpRequest
+                var _oOpen = XMLHttpRequest.prototype.open;
+                var _oSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this._sb = {m: method, u: url};
+                    return _oOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    if (this._sb) { _sb_push(this._sb.u, this._sb.m, 'xhr'); }
+                    return _oSend.apply(this, arguments);
+                };
+                // sendBeacon（心跳/埋点常用）
+                if (navigator.sendBeacon) {
+                    var _sb = navigator.sendBeacon.bind(navigator);
+                    navigator.sendBeacon = function(url, data) {
+                        _sb_push(url, 'POST', 'beacon');
+                        return _sb(url, data);
+                    };
+                }
+                // Image（new Image().src 埋点）：劫持原型 setter，稳健且覆盖所有实例
+                var _srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+                if (_srcDesc && _srcDesc.set) {
+                    Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                        set: function(v) { _sb_push(v, 'GET', 'img'); _srcDesc.set.call(this, v); },
+                        get: function() { return _srcDesc.get.call(this); }
+                    });
+                }
+            } catch(e) {}
+        })();
+        """
+        # 注册到后续所有新文档（弹窗 about:blank → 重定向 → 落地页全程生效）
+        try:
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": hook_js
+            })
+        except Exception as e:
+            logger.debug(f"Page 请求 hook 注册新文档失败: {e}")
+        # 立即注入当前文档
+        try:
+            self.driver.execute_script(hook_js)
+        except Exception:
+            pass
+
+    def _poll_request_records(self):
+        """轮询守护线程：每 0.5s 从绑定窗口的 JS 数组 drain 请求记录。
+        页面不可用/驱动异常时静默跳过；stop 事件或全局停止标志触发后退出。
+        """
+        while not self._collect_stop.is_set():
+            if _should_stop():
+                break
+            items = []
+            try:
+                if self._window_handle:
+                    # 绑定窗口已关闭 → 等下一轮（避免 drain 到其它窗口的数据）
+                    if self._window_handle not in list(self.driver.window_handles):
+                        time.sleep(0.5)
+                        continue
+                    self._focus_window()
+                items = self.driver.execute_script(
+                    "var a = window.__sb_requests || []; window.__sb_requests = []; return a;"
+                ) or []
+            except Exception:
+                items = []
+            if items:
+                self._handle_collected_items(items)
+            time.sleep(0.5)
+
+    def _handle_collected_items(self, items):
+        """翻译 JS 数组元素为 Request 记录：入库 + 派发 route handlers + request 事件"""
+        records = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                url = str(it.get("u") or "")
+                if not url or url.startswith("about:"):
+                    continue
+                records.append({
+                    "url": url,
+                    "method": str(it.get("m") or "GET"),
+                    "resource_type": str(it.get("t") or "other"),
+                    "timestamp": float(it.get("n") or time.time()),
+                })
+            except Exception:
+                continue
+        if not records:
+            return
+        with self._request_records_lock:
+            self._request_records.extend(records)
+        for rec in records:
+            try:
+                req = Request(url=rec["url"], headers={})
+                req.method = rec["method"]
+                req.resource_type = rec["resource_type"]
+                # B：先执行 route handlers（可 abort/fulfill/continue），再派发 request 事件
+                self._dispatch_route_handlers(req)
+                self.emit("request", req)
+            except Exception:
+                continue
+
+    def _dispatch_route_handlers(self, req: Request):
+        """按注册顺序执行全部 route handlers（页面级 + context 级），保持
+        "每次请求都执行 handler 列表" 的语义；handler 异常捕获，不阻断采集。
+        注意：context.route() 会同时写入 context._route_handlers 与主页面
+        _request_handlers，合并时按 (pattern, handler) 去重，避免同一 handler 双跑。
+        """
+        merged: List[tuple] = []
+        seen = set()
+        for pattern, handler in list(self._request_handlers):
+            key = (pattern, id(handler))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((pattern, handler))
+        ctx = self._context
+        if ctx is not None:
+            for pattern, handler in list(getattr(ctx, "_route_handlers", []) or []):
+                key = (pattern, id(handler))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append((pattern, handler))
+        if not merged:
+            return
+        route = Route(request=req)
+        for pattern, handler in merged:
+            if not self._route_pattern_match(pattern, req.url):
+                continue
+            try:
+                handler(route, req)
+            except Exception as e:
+                logger.debug(f"Route handler 异常(忽略): {e}")
+        # 汇总决策日志（abort / fulfill / continue 语义由状态机记录）
+        if route._aborted:
+            logger.info(f"[Route] 请求已被拦截: {req.url}")
+        elif route._fulfilled is not None:
+            logger.info(f"[Route] 本地响应替代: {req.url} status={route._fulfilled[0]}")
+
+    @staticmethod
+    def _route_pattern_match(pattern: str, url: str) -> bool:
+        """近似匹配 Playwright glob 模式（**、**/*、**/*.mp4 等）。
+        fnmatch 把 ** 视为 *，可覆盖本项目实际用到的全部模式；匹配失败返回 False 放行。
+        """
+        if not pattern:
+            return True
+        try:
+            p = str(pattern)
+            if p in ("**", "**/*", "/*", "*"):
+                return True
+            import fnmatch as _fnmatch
+            if _fnmatch.fnmatch(url, p) or _fnmatch.fnmatch(url.lower(), p.lower()):
+                return True
+            return False
+        except Exception:
+            return False
+
     def _setup_request_interception(self):
         """配置请求拦截（在页面首次加载前调用）"""
         # Selenium CDP请求拦截比较复杂，这里用JS fetch/xhr hook作为替代
@@ -1454,25 +1787,48 @@ class Page:
 class _CDPSession:
     """模拟 Playwright CDPSession：.send(method, params) -> driver.execute_cdp_cmd"""
 
-    def __init__(self, driver, page=None):
+    def __init__(self, driver, page=None, session_id=None):
         self.driver = driver
         self.page = page
+        # ★ 26.8.13 修复：支持调用方显式传入 session_id；
+        # Selenium 3 手工注入兜底时优先使用它（driver.session_id 可能不存在）
+        self.session_id = session_id or getattr(driver, "session_id", None)
 
     def send(self, method: str, params: Dict = None) -> Any:
         """发送 CDP 命令（Selenium 3/4/5 通吃的兼容实现）
         - 优先使用 Selenium 4+ 官方 API: driver.execute_cdp_cmd(method, params)
-        - 若 driver 没有该属性（Selenium 3.x 场景），走 command_executor 兜底
+        - 若失败（TypeError/KeyError 等），走 driver.execute 兜底（自动注入 sessionId）
+        - 再不行，走 _commands 手工注入兜底（补 sessionId）
+
+        ★ 26.8.11.11 修复【根因】：旧兜底直接调 _cmd_exec.execute() 没带 sessionId，
+          URL 模板 /session/$sessionId/goog/cdp/execute 在替换时抛 KeyError: 'sessionId'，
+          导致 Pop-under CDP 点击 100% 失败 → HilltopAds 零点击零收益。
         """
         _params = params or {}
         driver = self.driver
-        # 方法 1：Selenium 4.0+ 原生 execute_cdp_cmd
+
+        # 方法 1：Selenium 4.0+ 原生 execute_cdp_cmd（最稳，优先）
         if hasattr(driver, "execute_cdp_cmd") and callable(getattr(driver, "execute_cdp_cmd", None)):
             try:
                 return driver.execute_cdp_cmd(method, _params)
-            except TypeError:
-                # 个别版本签名不匹配，跳过走兜底
+            except (TypeError, KeyError):
+                # 个别版本签名不匹配 / 内部异常，降级走 driver.execute
                 pass
-        # 方法 2：Selenium 3.x → 通过 command_executor 注入 executeCdpCommand 端点
+
+        # 方法 2：走 driver.execute（Selenium 4 WebDriver.execute 会自动注入 sessionId）
+        #   — 这是最接近官方实现的兜底，URL 模板替换有保证
+        if hasattr(driver, "execute") and callable(getattr(driver, "execute", None)):
+            try:
+                resp = driver.execute("executeCdpCommand", {"cmd": method, "params": _params})
+                if isinstance(resp, dict) and "value" in resp:
+                    return resp["value"]
+                return resp
+            except Exception:
+                # 还不行再退到手工注入
+                pass
+
+        # 方法 3：Selenium 3.x → 通过 command_executor 手工注入 executeCdpCommand 端点
+        #   ★ 关键修复：params 里必须带 sessionId，否则 URL 模板 $sessionId 替换抛 KeyError
         _cmd_exec = getattr(driver, "command_executor", None)
         if _cmd_exec is not None and hasattr(_cmd_exec, "_commands"):
             if "executeCdpCommand" not in _cmd_exec._commands:
@@ -1483,12 +1839,15 @@ class _CDPSession:
                     )
                 except Exception:
                     pass
+            # ★ 补 sessionId（从 driver.session_id 取），修复 KeyError: 'sessionId'
+            _exec_params = {"cmd": method, "params": _params}
+            _sid = getattr(driver, "session_id", None)
+            if _sid and "sessionId" not in _exec_params:
+                _exec_params["sessionId"] = _sid
             try:
-                result = _cmd_exec.execute(
-                    "executeCdpCommand",
-                    {"cmd": method, "params": _params},
-                )
+                result = _cmd_exec.execute("executeCdpCommand", _exec_params)
             except TypeError:
+                # 极少数老版本 execute 签名是 (command, name, params)
                 try:
                     result = _cmd_exec.execute("executeCdpCommand", method, _params)
                 except Exception:
@@ -1496,6 +1855,7 @@ class _CDPSession:
             if isinstance(result, dict) and "value" in result:
                 return result["value"]
             return result
+
         raise RuntimeError(
             f"当前 Selenium 驱动不支持发送 CDP 命令（driver={type(driver).__name__}，"
             f"has_execute_cdp_cmd={hasattr(driver, 'execute_cdp_cmd')}）"
@@ -1517,6 +1877,8 @@ class BrowserContext:
         self._pages = []
         self._cookies = []
         self._closed = False
+        # ★ Browser 反向引用（Browser.new_context 中设置），close() 时从 contexts 移除
+        self._browser = None
 
         # 创建默认page
         self._main_page = Page(driver, context=self)
@@ -1924,6 +2286,7 @@ class Browser:
     def new_context(self, **kwargs) -> BrowserContext:
         """创建新的浏览器上下文"""
         context = BrowserContext(self.driver, kwargs)
+        context._browser = self  # ★ 反向引用，供 context.close() 从 contexts 移除
         self._contexts.append(context)
         return context
 

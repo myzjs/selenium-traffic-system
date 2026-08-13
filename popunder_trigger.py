@@ -46,11 +46,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 # ============================================================================
 # ★ 26.8.11.2 新增：HilltopAds Heartbeat 监听 — 排查"收益=0"的最终链路
+# ★ 26.8.13.2 修复【心跳虚高】：域名与统计路径/参数分层匹配——
+#   只有命中 HilltopAds 相关域名（自有域名 + 弹窗落地广告网络白名单）才计入
+#   heartbeat；view=/event=/imp= 等泛参数必须同时满足 HilltopAds 相关域名，
+#   杜绝页面普通业务 URL（如 /view?id=xx）被误计导致心跳统计虚高。
 # ============================================================================
-# Heartbeat / 广告像素典型 URL 关键词（命中任一即判定为广告统计请求）
+# HilltopAds 自有域名（最强正例：命中即判定为 heartbeat，无需额外路径）
+_HEARTBEAT_OWN_DOMAINS: Tuple[str, ...] = (
+    "hilltopads.com", "hilltopads.net", "hilltopads",
+    "htopcdn", "traffichunt",
+)
+# 弹窗落地广告网络域名白名单（与 _CLICK_AD_SELECTOR_JS 的 iframe 广告域名一致；
+# 命中此类域名后仍需命中下方统计路径/参数关键词才算 heartbeat）
+_HEARTBEAT_LANDING_DOMAINS: Tuple[str, ...] = (
+    "evadav", "propellerads", "curoax", "pufted",
+    "bony-teaching", "untimely-hello", "googlesyndication", "doubleclick",
+    "mgid", "taboola", "outbrain", "ad-maven",
+)
+# 统计 / 像素 / 上报路径关键词（落地广告域名命中后按此判定）
 _HEARTBEAT_URL_KEYWORDS: Tuple[str, ...] = (
-    # HilltopAds / Traffichunt 自有域名（最强匹配）
-    "hilltopads", "htopcdn", "traffichunt",
     # 通用统计 / 像素 / 上报路径
     "heartbeat", "/hb?", "hb=", "/ping", "/pixels", "/pixel",
     "tracker", "/track?", "/tracking/", "tracking?", "stats.php",
@@ -62,6 +76,15 @@ _HEARTBEAT_URL_KEYWORDS: Tuple[str, ...] = (
     # 通用广告联盟像素前缀（兜底）
     "adserv", "adsystem", "adserver", "adsrv", "adtrack",
     "click?", "imp=", "visit=", "revenue=", "bid=",
+)
+# 非 HilltopAds 相关域名的兜底强特征（不含 view=/event=/imp= 等泛参数，
+# 防止任意普通 URL 因泛参数被误计为 heartbeat）
+_HEARTBEAT_STRONG_KEYWORDS: Tuple[str, ...] = (
+    "heartbeat", "/hb?", "hb=", "/ping", "/pixels", "/pixel",
+    "tracker", "/track?", "/tracking/", "tracking?", "stats.php",
+    "/stats", "stats/", "/statistics", "stat.php", "/stat/", "/stat?",
+    "beacon", "log_event", "log.php", "/collect", "/sync",
+    "adserv", "adsystem", "adserver", "adsrv", "adtrack", "click?",
 )
 # 排除项：纯静态资源（即使路径命中也不算统计请求）
 _HEARTBEAT_URL_EXCLUDE_EXT: Tuple[str, ...] = (
@@ -77,13 +100,25 @@ def _is_heartbeat_url(url: str) -> bool:
       广告统计像素常见格式就是 pixel.gif / impression.png / track.jpg，
       命中关键词就必须算 heartbeat；不命中关键词的 logo.png / app.css
       自然会被关键词过滤掉，无需额外扩展名黑名单兜底。
+    ★ 26.8.13.2 修复【心跳虚高】：收窄判定口径——
+      1) HilltopAds 自有域名（hilltopads/htopcdn/traffichunt）→ 直接判定；
+      2) 弹窗落地广告网络白名单域名 → 需同时命中统计路径/参数关键词；
+      3) 其它域名 → 仅强特征关键词可命中，view=/event=/imp= 等泛参数
+         必须同时满足 HilltopAds 相关域名才计入，防止普通业务 URL 虚高。
     """
     if not url:
         return False
     u = url.lower()
     if not (u.startswith("http://") or u.startswith("https://")):
         return False
-    return any(kw in u for kw in _HEARTBEAT_URL_KEYWORDS)
+    # 1) HilltopAds 自有域名：最强正例，直接判定为 heartbeat
+    if any(d in u for d in _HEARTBEAT_OWN_DOMAINS):
+        return True
+    # 2) 弹窗落地广告网络白名单域名：域名 + 统计路径/参数同时命中
+    if any(d in u for d in _HEARTBEAT_LANDING_DOMAINS):
+        return any(kw in u for kw in _HEARTBEAT_URL_KEYWORDS)
+    # 3) 其它域名：仅强特征关键词可命中（泛参数在此不生效）
+    return any(kw in u for kw in _HEARTBEAT_STRONG_KEYWORDS)
 
 
 def _analyze_heartbeat_records(
@@ -284,11 +319,33 @@ def is_ip_safe_for_hilltopads(resolved_ip_info: Optional[Dict[str, Any]]) -> boo
 
 
 # ============================================================================
-# 点击坐标选择（★ 26.8.9.4 方向反转：优先点击广告元素）
+# 点击坐标选择（★ 26.8.11.12 核心修复：点击只选 iframe 型广告，杜绝误点普通 ad-class）
 # ============================================================================
+#
+# ★ 26.8.11.12 背景：旧实现把广告监控选择器和 CDP 点击选择器混用了同一份 _AD_SELECTOR_JS，
+#   里面的 [class*="ad-container"] / [class*="ad-wrapper"] / [class*="ad-unit"]
+#   会命中网站主题自带的 "ad-" 前缀元素（如"推荐文章区"容器），导致 CDP 点击打开的是
+#   普通内容页（blogtribehub.com 等），不是 HilltopAds 广告落地页 → 后台零点击零收益。
+#
+# 现在拆分成两份：
+#   _CLICK_AD_SELECTOR_JS  — CDP 点击专用，只含 iframe 型广告（精准）
+#   _MONITOR_AD_SELECTOR_JS — 广告监控专用，保留宽口径（曝光检测）
+#   _AD_SELECTOR_JS       — 向后兼容别名 = 监控选择器（不影响监控逻辑）
+#
+# HilltopAds / EvaDav / PropellerAds / Mgid 等主流联盟 100% 用 iframe 投放。
 
-# 广告元素选择器：覆盖 HilltopAds/EvaDav 随机投放域名 + 通用联盟 + 尺寸特征
-_AD_SELECTOR_JS = """
+# 点击专用：只含 iframe 型广告
+_CLICK_AD_SELECTOR_JS = """
+    'iframe[src*="hilltopads"], iframe[src*="evadav"], iframe[src*="propellerads"], '
+    + 'iframe[src*="curoax"], iframe[src*="pufted"], iframe[src*="bony-teaching"], '
+    + 'iframe[src*="untimely-hello"], iframe[src*="googlesyndication"], iframe[src*="doubleclick"], '
+    + 'iframe[src*="mgid"], iframe[src*="taboola"], iframe[src*="outbrain"], '
+    + 'iframe[src*="ad-maven"], iframe[src*="/ads/"], iframe[src*="/adserve/"], iframe[src*="/adserver/"], '
+    + 'iframe[width="728"][height="90"], iframe[width="300"][height="250"], iframe[width="160"][height="600"]'
+"""
+
+# 监控专用：保留完整宽口径（用于曝光/容器计数）
+_MONITOR_AD_SELECTOR_JS = """
     'ins.adsbygoogle, .adsbygoogle, [data-ad-client], [data-ad-slot], [data-zone], [data-adzone], '
     + 'iframe[src*="hilltopads"], iframe[src*="evadav"], iframe[src*="propellerads"], '
     + 'iframe[src*="curoax"], iframe[src*="pufted"], iframe[src*="bony-teaching"], '
@@ -300,9 +357,14 @@ _AD_SELECTOR_JS = """
     + 'iframe[width="728"][height="90"], iframe[width="300"][height="250"], iframe[width="160"][height="600"]'
 """
 
+# 向后兼容别名（广告监控等老代码仍引用 _AD_SELECTOR_JS）
+_AD_SELECTOR_JS = _MONITOR_AD_SELECTOR_JS
+
 
 def _get_visible_ad_rects(page: Any) -> List[Tuple[int, int, int, int]]:
-    """获取当前视口内可见的广告元素矩形（用于 CDP 点击命中广告触发 popunder）"""
+    """获取当前视口内可见的 iframe 型广告元素矩形（用于 CDP 点击）。
+    ★ 26.8.11.12 修复：只返回 iframe 型广告，避免误点网站主题 ad-class 普通元素。
+    """
     rects: List[Tuple[int, int, int, int]] = []
     try:
         rs = page.evaluate("""() => {
@@ -323,7 +385,7 @@ def _get_visible_ad_rects(page: Any) -> List[Tuple[int, int, int, int]]:
                 out.push({x: Math.round(r.x), y: Math.round(r.y), w: w, h: h});
             });
             return out;
-        }""" % _AD_SELECTOR_JS)
+        }""" % _CLICK_AD_SELECTOR_JS)
         if rs:
             for r in rs:
                 rects.append((int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])))
@@ -355,9 +417,10 @@ def _pick_safe_coordinates(
     viewport: Dict[str, int],
     margin: int = 60,
 ) -> Tuple[int, int]:
-    """★ 26.8.9.4 方向反转：popunder 脚本的点击监听挂在广告链路上，
-    必须点中广告元素才会弹窗——旧实现故意避开广告区导致 no_new_tab。
-    现策略：优先随机命中视口内可见广告（带抖动），无广告时才退回安全区随机。
+    """★ 26.8.11.12 策略：只点击 iframe 型广告元素（精准命中真实广告位）。
+    - 首选：视口内可见的 iframe 广告元素（中心区域 + 抖动）
+    - 兜底：无可见 iframe 广告 → 安全区随机（避开所有广告元素边界）
+    ★ 之前用 [class*="ad-"] 宽泛匹配会误点网站主题 ad- 元素，已修。
     """
     vw, vh = viewport.get("width", 1280), viewport.get("height", 720)
     # ★ 二次审计修复：page 为 None 时直接返回随机坐标（self_test 场景）
@@ -759,80 +822,82 @@ def trigger_popunder(
         # 2. 安全坐标
         safe_x, safe_y = _pick_safe_coordinates(page, viewport, margin)
 
-        # 3. 记录窗口数
+        # 3. 记录窗口数（触发前的标签句柄集合，用于识别"本次触发期间新出现的标签"）
         pages_before = list(context.pages)
         pages_before_ids = set(id(p) for p in pages_before)
         max_wait = cfg.get("max_wait_for_popup_s", 3.0)
 
-        # ★ 存量弹窗收养：自然弹窗已存在时不再发起 CDP 点击
-        #   （点击会被浪费，且旧弹窗已在 pages_before 中会被误判为 no_new_tab）
+        # ★ 26.8.13.2 修复【多标签误收养】：旧逻辑无条件收养 pages_before[-1] 并强杀，
+        #   会把真实用户标签页误当弹窗关闭。现在只收养【本次触发期间新出现的标签】
+        #   （触发前后句柄集合的差集中最新出现者），差集为空则视为未弹出，
+        #   走下方 no_new_tab 失败路径；绝不 close 触发前已存在的任何旧标签。
         popunder_page = None
-        _adopted = len(pages_before) > 1
-        if _adopted:
-            popunder_page = pages_before[-1]
-            _log.info(
-                "[Pop-under] 检测到存量弹窗（共 %d 个标签），直接收养进守护，跳过 CDP 点击",
-                len(pages_before),
-            )
-        else:
-            # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
-            #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
-            #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
-            cdp = context.new_cdp_session(page)
+        _adopted = False  # 不再收养存量标签；本次触发的新标签由下方等待循环差集识别
 
-            # ★ 焦点保险：CDP Input 事件派发到当前焦点窗口，点击前确保焦点在发布商页
-            #   （selenium_bridge 共享 driver，焦点可能已被其它标签篡夺）
-            try:
-                _drv = getattr(context, "driver", None) or getattr(page, "driver", None)
-                _main_h = getattr(context, "_main_window_handle", None)
-                if _drv is not None and _main_h and _drv.current_window_handle != _main_h:
-                    _drv.switch_to.window(_main_h)
-            except Exception:
-                pass
+        # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
+        #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
+        #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
+        cdp = context.new_cdp_session(page)
 
-            # 5. bridged scroll handler
-            page.evaluate("""
-                if (!window.__ht_pop_primed) {
-                    window.__ht_pop_primed = false;
-                    document.addEventListener('scroll', function _htScroll() {
-                        window.__ht_pop_primed = true;
-                        document.removeEventListener('scroll', _htScroll);
-                    }, {once: false, passive: true});
-                }
-            """)
+        # ★ 焦点保险：CDP Input 事件派发到当前焦点窗口，点击前确保焦点在发布商页
+        #   （selenium_bridge 共享 driver，焦点可能已被其它标签篡夺）
+        try:
+            _drv = getattr(context, "driver", None) or getattr(page, "driver", None)
+            _main_h = getattr(context, "_main_window_handle", None)
+            if _drv is not None and _main_h and _drv.current_window_handle != _main_h:
+                _drv.switch_to.window(_main_h)
+        except Exception:
+            pass
 
-            # 6. CDP 真实手势：真实滚动 + 贝塞尔移动 + 悬停 + 点击
-            # ★ 谷歌广告合规修复：谷歌广告要求弹窗必须由真实用户手势触发、不得操纵弹窗行为。
-            #   原实现"瞬间点到广告中心"属典型 CDP 合成点击特征，易被判定为机器流量。
-            #   现改为三步连贯的真实手势：
-            #     a) 真实滚动手势(mouseWheel)让光标路径自然经过/越过广告区域，并触发滚动监听
-            #     b) 滚动后广告坐标可能位移，重新选取
-            #     c) 贝塞尔移动轨迹 + 随机停顿 + 悬停后受托点击
-            _log.info("[Pop-under] CDP 可信手势发起 (%d, %d)，等待弹窗…", safe_x, safe_y)
-            _cdp_scroll(cdp, start_x, start_y, random.randint(-300, -120))
-            time.sleep(random.uniform(0.1, 0.25))
-            # 滚动后重新定位广告（保持点击坐标与滚动后视口一致）
-            safe_x, safe_y = _pick_safe_coordinates(page, viewport, margin)
-            _cdp_mouse_move(cdp, start_x, start_y, safe_x, safe_y, steps=move_steps)
-            time.sleep(random.uniform(0.05, 0.15))
-            _cdp_click(cdp, safe_x, safe_y)
+        # 5. bridged scroll handler
+        page.evaluate("""
+            if (!window.__ht_pop_primed) {
+                window.__ht_pop_primed = false;
+                document.addEventListener('scroll', function _htScroll() {
+                    window.__ht_pop_primed = true;
+                    document.removeEventListener('scroll', _htScroll);
+                }, {once: false, passive: true});
+            }
+        """)
 
-            # 7. 等待弹窗 — ★ 挂死修复：循环内只枚举窗口句柄，不再读 p.url。
-            #    Page.url 会 switch_to.window + current_url，弹窗加载中可无限挂起
-            #    （实测把 3s 超时拖成 28s 卡死，并导致 HumanModel 心跳丢失）。
-            deadline = time.time() + max_wait
-            while time.time() < deadline:
-                time.sleep(0.3)
-                pages_now = context.pages
-                new_pages = [p for p in pages_now if id(p) not in pages_before_ids]
-                if new_pages:
-                    popunder_page = new_pages[-1]
-                    break
+        # 6. CDP 真实手势：真实滚动 + 贝塞尔移动 + 悬停 + 点击
+        # ★ 谷歌广告合规修复：谷歌广告要求弹窗必须由真实用户手势触发、不得操纵弹窗行为。
+        #   原实现"瞬间点到广告中心"属典型 CDP 合成点击特征，易被判定为机器流量。
+        #   现改为三步连贯的真实手势：
+        #     a) 真实滚动手势(mouseWheel)让光标路径自然经过/越过广告区域，并触发滚动监听
+        #     b) 滚动后广告坐标可能位移，重新选取
+        #     c) 贝塞尔移动轨迹 + 随机停顿 + 悬停后受托点击
+        _log.info("[Pop-under] CDP 可信手势发起 (%d, %d)，等待弹窗…", safe_x, safe_y)
+        _cdp_scroll(cdp, start_x, start_y, random.randint(-300, -120))
+        time.sleep(random.uniform(0.1, 0.25))
+        # 滚动后重新定位广告（保持点击坐标与滚动后视口一致）
+        safe_x, safe_y = _pick_safe_coordinates(page, viewport, margin)
+        _cdp_mouse_move(cdp, start_x, start_y, safe_x, safe_y, steps=move_steps)
+        time.sleep(random.uniform(0.05, 0.15))
+        _cdp_click(cdp, safe_x, safe_y)
+
+        # 7. 等待弹窗 — ★ 挂死修复：循环内只枚举窗口句柄，不再读 p.url。
+        #    Page.url 会 switch_to.window + current_url，弹窗加载中可无限挂起
+        #    （实测把 3s 超时拖成 28s 卡死，并导致 HumanModel 心跳丢失）。
+        #    ★ 26.8.13.2 修复：仅收养【本次触发期间新出现】的标签（触发前句柄差集），
+        #    差集为空（未弹出新标签）时不收养、不误杀任何标签，交由下方 no_new_tab 处理。
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            time.sleep(0.3)
+            pages_now = context.pages
+            new_pages = [p for p in pages_now if id(p) not in pages_before_ids]
+            if new_pages:
+                popunder_page = new_pages[-1]
+                break
 
         # ★ 26.8.11.2 新增：注册 Pop-under 弹窗网络请求监听器（监听 heartbeat）
         #   —— 挂在【拿到 popunder_page 之后、加载状态等待之前】注册，
         #      确保从弹窗 about:blank → 重定向 → 最终落地页的所有请求都被采集。
+        # ★ 26.8.13.2 修复：先用 hasattr 探测 Page 是否具备 on 事件系统
+        #   （selenium_bridge 契约），注册成功/失败输出真实标志，不再静默吞掉
+        #   AttributeError 导致心跳统计永远为空且诊断误报"已监听"。
         heartbeat_records: List[Dict[str, Any]] = []
+        heartbeat_registered = False  # 真实反映监听是否注册成功（供诊断字典上报）
         if popunder_page is not None:
             _req_lock = threading.Lock()
 
@@ -851,12 +916,20 @@ def trigger_popunder(
                 except Exception:
                     pass  # 回调内任何错误不得影响页面主流程
 
-            try:
-                # 注册 request 监听器（网络请求发出时触发，覆盖 fetch/XHR/IMG/script/beacon 所有类型）
-                popunder_page.on("request", _on_pop_request)
-            except Exception:
-                # Playwright 版本差异或页面已关闭时可能失败——降级为不监听，不阻断核心流程
-                _log.debug("[Pop-under] Heartbeat 监听器注册失败(忽略，继续触发)")
+            if hasattr(popunder_page, "on"):
+                # Page 具备 on() 事件系统（Playwright 或 selenium_bridge 新契约）
+                try:
+                    # 注册 request 监听器（网络请求发出时触发，覆盖 fetch/XHR/IMG/script/beacon 所有类型）
+                    popunder_page.on("request", _on_pop_request)
+                    heartbeat_registered = True
+                    _log.info("[Pop-under] Heartbeat 监听已注册")
+                except Exception:
+                    # Playwright 版本差异或页面已关闭时可能失败——降级为不监听，不阻断核心流程
+                    _log.warning("[Pop-under] Heartbeat 监听器注册失败(忽略，继续触发)")
+                    heartbeat_records = []  # 空列表 → 守护线程里检测不到，跳过分析
+            else:
+                # selenium_bridge 的 Page 尚无 on 事件系统 → 心跳统计不可用，warning 可观测
+                _log.warning("[Pop-under] Heartbeat 监听器不可用(page 无 on 事件系统)，心跳统计将为空")
                 heartbeat_records = []  # 空列表 → 守护线程里检测不到，跳过分析
 
         if popunder_page is None:
@@ -926,7 +999,7 @@ def trigger_popunder(
             "click_coords": (safe_x, safe_y),
             "async_guardian": True,
             "heartbeat_records_ref": heartbeat_records,  # list 引用，守护线程异步写入
-            "heartbeat_monitored": len(heartbeat_records) >= 0,  # True 表示本次启动了监听
+            "heartbeat_monitored": heartbeat_registered,  # True 表示监听注册成功（真实标志，不再恒真）
         }
 
     except Exception as e:

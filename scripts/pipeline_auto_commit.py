@@ -26,7 +26,7 @@ REMOTE_DIR = "/root/selenium_traffic_system"
 DEPLOY_FILES = [
     "app.py", "selenium_bridge.py", "ip_provider.py", "ip_info_resolver.py",
     "ip_region_module.py", "popunder_trigger.py", "risk_check.py",
-    "seo_query_module.py", "local_proxy_relay.py", "utils.py",
+    "seo_query_module.py", "utils.py",
     "scripts/contract_test_pipeline.py", "scripts/pipeline_auto_commit.py",
 ]
 

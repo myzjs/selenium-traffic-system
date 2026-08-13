@@ -9,6 +9,7 @@ IP 信息精准解析模块 - 1.0 版
 """
 import json
 import logging
+import os
 import re
 import urllib.request
 import urllib.error
@@ -99,10 +100,20 @@ def _normalize_country_code(country_raw: str) -> Optional[str]:
     return name_map.get(s.lower())
 
 
+def _resolve_env_proxy() -> Optional[str]:
+    """从环境变量解析代理 URL（HTTPS_PROXY/HTTP_PROXY/ALL_PROXY，兼容小写变体）"""
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return None
+
+
 def _http_get_json(url: str, timeout: float = 15.0, proxy_url: str = None) -> Optional[Dict]:
     """简单 HTTP GET JSON（用 stdlib，避免新增依赖）
 
-    若传入 proxy_url 则走代理（避免向Geo服务商暴露本机真IP），否则直连并记录 warning。
+    ★ 修复：优先使用调用方传入 proxy_url；未传入时回退读取环境变量配置的代理，
+    避免向 Geo 服务商直连暴露本机真实 IP；两者都没有时才直连并记录 warning。
     """
     try:
         req = urllib.request.Request(
@@ -112,9 +123,11 @@ def _http_get_json(url: str, timeout: float = 15.0, proxy_url: str = None) -> Op
                 "Accept-Language": "en-US,en;q=0.9",
             }
         )
-        if proxy_url:
+        # ★ 修复：未显式传入代理时，从环境变量解析（避免直连暴露本机真IP）
+        effective_proxy = proxy_url or _resolve_env_proxy()
+        if effective_proxy:
             opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                urllib.request.ProxyHandler({"http": effective_proxy, "https": effective_proxy})
             )
             with opener.open(req, timeout=timeout) as resp:
                 if resp.status != 200:
@@ -238,13 +251,17 @@ def resolve_ip_info(ip: str, proxy_ip_info: Optional[Dict] = None, proxy_url: st
             result["language"] = lang
             result["source"].append("proxy:language")
 
-        # ★ H1: 代理返回的 IP 质量字段优先透传
-        for _pk, _rk in (("isp", "isp"), ("asn", "asn"), ("type", "ip_type")):
+        # ★ H1: 代理返回的 IP 质量字段优先透传（兼容 type / ip_type 两种键名）
+        for _pk, _rk in (("isp", "isp"), ("asn", "asn"), ("type", "ip_type"), ("ip_type", "ip_type")):
             if proxy_ip_info.get(_pk):
                 result[_rk] = proxy_ip_info[_pk]
     
-    # ---- Step 2: 缺失字段时调外部免费 API ----
-    if not (result["country_code"] and result["timezone"]):
+    # ---- Step 2: 缺失字段（含质量字段）时调外部免费 API ----
+    # ★ 修复（早停短路）：三要素齐全但 isp/asn/ip_type 质量字段缺失时，也必须查外部 API 回填，
+    # 否则机房/托管 IP 过滤（HilltopAds 等）永远拿不到质量字段
+    need_geo = not (result["country_code"] and result["timezone"])
+    need_quality = not (result["isp"] or result["asn"] or result["ip_type"])
+    if need_geo or need_quality:
         for api_name, api_func in [
             ("ip-api", _query_ip_api),
             ("ipapi.co", _query_ipapi_co),
@@ -278,8 +295,10 @@ def resolve_ip_info(ip: str, proxy_ip_info: Optional[Dict] = None, proxy_url: st
                 _asn_match = _ASN_RE.match(_org)
                 if _asn_match:
                     result["asn"] = _asn_match.group(1)
-            # 三者齐了就早停
-            if result["country_code"] and result["timezone"] and result["language"]:
+            # ★ 修复：三要素齐全 且 质量字段（isp/asn/ip_type）齐全 时才早停；
+            # 质量字段未拿全则继续尝试后续 API 回填
+            if (result["country_code"] and result["timezone"] and result["language"]
+                    and result["isp"] and result["asn"] and result["ip_type"]):
                 break
     
     # ---- Step 3: 根据 country_code 映射兜底 language / timezone ----

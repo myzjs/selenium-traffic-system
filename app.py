@@ -14,15 +14,65 @@ import time
 import random
 import uuid
 import math
-import pytz
+try:
+    import pytz
+except ImportError:  # 环境兜底：无 pytz 时用标准库 zoneinfo（Python 3.9+），补齐 localize/normalize API
+    import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    class _PytzTzInfo:
+        """包装 zoneinfo，兼容 pytz.timezone() 返回对象的 tzinfo 协议 + localize/normalize"""
+
+        def __init__(self, key):
+            self._zi = _ZoneInfo(key)
+            self.zone = key
+
+        def localize(self, dt, is_dst=None):
+            return dt.replace(tzinfo=self._zi)
+
+        def normalize(self, dt, is_dst=None):
+            return dt.astimezone(self._zi)
+
+        def utcoffset(self, dt):
+            return None if dt is None else self._zi.utcoffset(dt)
+
+        def dst(self, dt):
+            return None if dt is None else self._zi.dst(dt)
+
+        def tzname(self, dt):
+            return None if dt is None else self._zi.tzname(dt)
+
+        def fromutc(self, dt):
+            return self._zi.fromutc(dt)
+
+        def __repr__(self):
+            return f"<zoneinfo '{self.zone}'>"
+
+    class _PytzFallback:
+        UTC = _dt.timezone.utc
+
+        class exceptions:
+            class UnknownTimeZoneError(Exception):
+                pass
+
+        @staticmethod
+        def timezone(key):
+            try:
+                return _PytzTzInfo(key)
+            except Exception as e:
+                raise _PytzFallback.exceptions.UnknownTimeZoneError(str(e))
+
+    pytz = _PytzFallback()
 from datetime import datetime
 from selenium_bridge import sync_playwright, PlaywrightTimeoutError, Stealth
 import selenium_bridge as _selenium_bridge
 
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。
-# 26.8.12.1 = 2026-08-12 第一次改动（6项薄弱维度一次性完整落地：国家权重/日内曲线/假日季节/红队19场景库/Golden Label评估闭环/Hook挂载零侵入）
-APP_VERSION = "26.8.12.1"
+# 26.8.12.2 = 2026-08-12 第二次改动（缺陷修复A-J）
+# 26.8.13.1 = 2026-08-13 第一次改动（IPDeep 三修复/日内曲线时区/红队DOM冲突/
+#              SyntaxWarning→SyntaxError/真实任务钩子确认/补 bs4/pytz/selenium 依赖声明）
+APP_VERSION = "26.8.13.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -61,7 +111,6 @@ from seo_query_module import get_seo_query
 from ip_region_module import get_ip_recognizer, REGION_CHINA, REGION_US_EU, REGION_OTHER, REGION_FAILED
 from ip_info_resolver import resolve_ip_info
 import ip_provider as _ip_provider
-from local_proxy_relay import start_relay as _start_proxy_relay, stop_relay as _stop_proxy_relay
 
 # ★ 风控增强模块（P0 / P1 / P2 统一整改落地）— 最小侵入式接入
 try:
@@ -618,10 +667,13 @@ def weighted_country_hours_for_tasks(num_tasks, country_codes, *, min_hour=8.0, 
     """26.8.12.4 ★ 日内小时精细化：按 enabled_countries 人口权重，逐任务抽目标国，
     再调用 traffic_distribution.weighted_local_hours 采样该国独立日内曲线。
 
-    这样每个任务的发起小时，都**精确对应其目标国的本地波峰/波谷**：
-    - CN 任务出现在 20-22 晚间（本地晚高峰 1.8×），不是 UTC 全局统一曲线
-    - IN 任务出现在 19-23 IST（与 CN 接近但稍晚）
-    - US 东部任务 21-23 ET / 西部 UTC 0-2 工作在早晨，各自偏移
+    26.8.13.1 ★ 时区换算根因修复（原 Bug：本地小时直接加 UTC 基准秒，波峰错位 +8/+5h）：
+      每个任务生成后，调用 traffic_distribution.local_hour_to_utc_hour(cc, local_h)
+      把"本地小时"换算为"UTC 小时"，再返回给调用方做 tp = seconds_now_utc + h*3600。
+      例：
+        - CN 本地 20:00（UTC+8）→ UTC 12:00，下午晚高峰落在 UTC 白天
+        - US 本地 20:00（UTC-5）→ UTC 01:00，美东晚高峰落在 UTC 凌晨（真实）
+
     失败（模块未找到/无国家）→ 静默回退 MODEL_FUNCTIONS["bimodal"] 通用双峰。
 
     参数:
@@ -629,8 +681,8 @@ def weighted_country_hours_for_tasks(num_tasks, country_codes, *, min_hour=8.0, 
       country_codes: list[str]，参与国家列表；空 → 回退 bimodal 通用
       min_hour / max_hour: 硬工作小时边界（与 enforce_working_hours 一致：8~23）
     返回:
-      list[float]，长度 ~num_tasks；每个元素是"相对起点的小时数"（0~24），
-      调用方加上自己的 UTC 基准秒数即可（legacy: seconds_now_utc；多天: today_utc_start + tp）。
+      list[float]，长度 ~num_tasks；每个元素是"相对起点的**UTC**小时数"（0~24），
+      调用方加上自己的 UTC 基准秒数即可。
     """
     if num_tasks <= 0:
         return []
@@ -643,7 +695,7 @@ def weighted_country_hours_for_tasks(num_tasks, country_codes, *, min_hour=8.0, 
             COUNTRY_POPULATION_WEIGHTS,
             DEFAULT_COUNTRY_WEIGHT,
             weighted_local_hours,
-            COUNTRY_HOUR_PROFILES,
+            local_hour_to_utc_hour,
         )
         ccs = [c.upper() for c in country_codes if c]
         weights = [COUNTRY_POPULATION_WEIGHTS.get(c, DEFAULT_COUNTRY_WEIGHT) for c in ccs]
@@ -654,9 +706,10 @@ def weighted_country_hours_for_tasks(num_tasks, country_codes, *, min_hour=8.0, 
             # 若该国有独立 profile → 走独立曲线；否则 weighted_local_hours 内部会给通用双峰
             hrs = weighted_local_hours(cc, 1, min_hour=min_hour, max_hour=max_hour)
             if hrs:
-                hours.append(hrs[0])
+                # ★ 26.8.13.1 关键修复：本地小时 → UTC 小时
+                hours.append(local_hour_to_utc_hour(cc, hrs[0]))
             else:
-                # 兜底：通用 bimodal 抽一个
+                # 兜底：通用 bimodal 抽一个（也是"本地 UTC±0"，无需换算）
                 hours.append(enforce_working_hours(generate_bimodal_hours(1), min_hour, max_hour)[0])
         return sorted(hours)
     except Exception as _h_e:
@@ -1472,7 +1525,14 @@ def generate_daily_tasks(cfg):
     today_local_start = local_tz.localize(_dt.datetime(local_now.year, local_now.month, local_now.day, 0, 0, 0))
     today_local_start_utc = today_local_start.astimezone(pytz.UTC)
     seconds_now_local = (local_now - today_local_start).total_seconds()
-    plan_window_end = seconds_now_utc + plan_days * 86400
+    # ★ 26.8.13.1 根因修复：计划窗口必须与北京日历日对齐。
+    #   之前 plan_window_end = seconds_now_utc + plan_days*86400（从现在起 5×24h），
+    #   与"今天起 N 个北京日历日"的日界（today_local_start + N 天）不对齐，
+    #   窗口比 5 个日历日多出约 12 小时 → 按北京本地日期聚合任务时出现
+    #   "幽灵第 N+1 天"（如 08-18 仅 449 个任务），且最后一天被截断（08-17 gen=487 < 500），
+    #   击穿 daily_traffic_range 日流量下限。
+    #   现在：窗口终点 = 第 plan_days 个北京日界的 UTC 秒，精确覆盖"今天起 N 个完整日历日"。
+    plan_window_end = (today_local_start + _dt.timedelta(days=plan_days) - today_utc_start).total_seconds()
 
     country_segments = {}
     all_covered_segments = []
@@ -1536,10 +1596,16 @@ def generate_daily_tasks(cfg):
     country_quota_used = {cc: 0 for cc in enabled_countries}
     compensated_count = 0
     total_tasks_planned = 0
-    prev_end_time = seconds_now_local
-    is_first_task = True
 
     for day_idx in range(plan_days):
+        # ★ 26.8.13.1 根因修复：跨天状态必须每天重置！
+        #   之前 prev_end_time/is_first_task 只在函数开头初始化一次，任务密集
+        #   （高峰日 ×1.5-2.5 + task_gap/浏览时长累积 ~258s/任务）时 prev_end_time
+        #   单调漂移到后续天 → actual_start_utc 越过 plan_window_end 提前 break
+        #   → 后续天 generated_tasks=0，击穿 daily_traffic_range 日流量下限。
+        #   prev_end_time 为"北京本地当日秒"域：day0 以 now 为起点，dayN 从 N*86400 起。
+        prev_end_time = seconds_now_local if day_idx == 0 else day_idx * 86400
+        is_first_task = True
         day_local_start = today_local_start + _dt.timedelta(days=day_idx)
         day_local_end = day_local_start + _dt.timedelta(days=1)
         day_start_sec = (day_local_start.astimezone(pytz.UTC) - today_utc_start).total_seconds()
@@ -2214,8 +2280,13 @@ _cleanup_zombie_chromium()
 import threading as _th_z
 def _schedule_cleanup():
     _cleanup_zombie_chromium()
-    _th_z.Timer(1800, _schedule_cleanup).start()
-_th_z.Timer(1800, _schedule_cleanup).start()
+    # daemon=True：防止非 daemon Timer 阻塞进程退出（pytest/import 场景会卡死 shutdown）
+    _t = _th_z.Timer(1800, _schedule_cleanup)
+    _t.daemon = True
+    _t.start()
+_t = _th_z.Timer(1800, _schedule_cleanup)
+_t.daemon = True
+_t.start()
 
 # ========== Flask 安全配置 ==========
 import secrets
@@ -2225,36 +2296,38 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 # secrets.SystemRandom() 基于 os.urandom()，提供不可预测的随机数
 _secure_rng = secrets.SystemRandom()
 
-# ========== HTTP Basic Auth 中间件（已禁用）==========
-# from functools import wraps
+# ========== HTTP Basic Auth 中间件 ==========
+AUTH_USER = os.environ.get("APP_AUTH_USER", "admin")
+AUTH_PASS = os.environ.get("APP_AUTH_PASS", "")  # 默认无密码，生产环境必须设置
+# ★ 未设置密码时认证不生效（避免"默认密码"造成安全假象），仅打印启动警告
+_AUTH_ENABLED = bool(AUTH_PASS)
+if not _AUTH_ENABLED:
+    logging.warning("[安全] HTTP Basic Auth 未启用：未设置环境变量 APP_AUTH_PASS，"
+                    "生产环境必须设置账号密码并重启后认证才生效")
 
-# AUTH_USER = os.environ.get("FLASK_AUTH_USER", "admin")
-# AUTH_PASS = os.environ.get("FLASK_AUTH_PASS", "")  # 默认无密码，生产环境必须设置
+def _check_basic_auth():
+    """检查 HTTP Basic Auth，返回是否认证通过"""
+    if not _AUTH_ENABLED:
+        return True
+    auth = request.authorization
+    if not auth:
+        return False
+    return auth.username == AUTH_USER and auth.password == AUTH_PASS
 
-# def _check_basic_auth():
-#     """检查 HTTP Basic Auth，返回是否认证通过"""
-#     if not AUTH_PASS:
-#         # 未配置密码时仅允许本地访问
-#         if request.remote_addr not in ("127.0.0.1", "::1"):
-#             return False
-#         return True
-#     auth = request.authorization
-#     if not auth:
-#         return False
-#     return auth.username == AUTH_USER and auth.password == AUTH_PASS
-
-# @app.before_request
-# def require_auth():
-#     """全局认证中间件，跳过健康检查接口"""
-#     if request.path in ("/health", "/ping"):
-#         return None
-#     if not _check_basic_auth():
-#         return Response(
-#             "Authentication required",
-#             status=401,
-#             headers={"WWW-Authenticate": 'Basic realm="Login Required"'}
-#         )
-#     return None
+@app.before_request
+def require_auth():
+    """全局认证中间件，跳过健康检查接口"""
+    if not _AUTH_ENABLED:
+        return None
+    if request.path in ("/health", "/ping"):
+        return None
+    if not _check_basic_auth():
+        return Response(
+            "Authentication required",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="Login Required"'}
+        )
+    return None
 
 # 全局变量
 config = {
@@ -3555,12 +3628,22 @@ def video_interruptible_sleep(seconds, check_interval=0.5):
 
 
 def _human_model_supervisor_loop():
-    """心跳监督线程：定期检查 last_heartbeat，超时则清除 running 标志位。"""
+    """心跳监督线程：定期检查 last_heartbeat，超时则清除 running 标志位。
+
+    ★ 单例保障：每次启动时记录自己的代际号(my_gen)，重启后代际号变化，
+    旧线程在下一轮循环（最长8s内）检测到代际不符即自行退出，杜绝线程堆积。"""
+    with human_model_lock:
+        my_gen = human_model_supervisor_gen
     while True:
         try:
             human_model_stop_event.wait(timeout=8)
         except Exception:
             pass
+        # ★ 代际检查：已有更新的监督线程被启动，本线程立即退出
+        with human_model_lock:
+            if human_model_supervisor_gen != my_gen:
+                log.debug("[HumanModel] 监督线程代际变化，旧线程自退出")
+                return
         if human_model_stop_event.is_set():
             return
         try:
@@ -3646,6 +3729,9 @@ def ensure_human_model_alive():
         time.sleep(0.6)
         human_model_stop_event.clear()
         with human_model_lock:
+            # ★ 代际递增：令旧监督线程在下一轮循环自退出，避免新旧线程堆积
+            global human_model_supervisor_gen
+            human_model_supervisor_gen += 1
             human_model_state["last_heartbeat"] = time.time()
             human_model_state["running"] = True
             human_model_state["last_source"] = "ensure_alive_reboot"
@@ -4067,6 +4153,8 @@ def create_ad_monitor():
         # 用于跨扫描计算时长：上次扫描时间戳 + 上次处于 ≥50% 曝光的广告位集合
         "last_scan_ts": None,
         "prev_exposed50": set(),
+        # ★ 分段计时法：key -> 当前连续"≥50%可见"分段的起始时间戳（未在曝光态则无记录）
+        "exposed50_since": {},
     }
 
 
@@ -4252,22 +4340,41 @@ def scan_ads_during_task(page, ad_monitor, stage="页面"):
                 loaded_count += 1
 
         # ===== 广告位累计曝光时长 + 有效曝光达标判定 =====
-        # 思路：相邻两次扫描间，对“两次都处于 ≥50% 可见”的广告位累加其间隔时长；
-        # 累计时长达到阈值(默认1000ms，AdSense“≥50%可见且持续≥1秒”)即判定为有效曝光。
+        # ★ 根因修复（分段计时法，替代原"两次扫描交集区间法"）：
+        #   ① 首扫丢帧：广告位首次进入曝光态即开启分段计时，之后每轮滚动累计，首段不丢失；
+        #   ② 30s截断：原实现按"单次扫描间隔"累计并上限30s，长时间停留的任务实际曝光被截断；
+        #      现按"分段起点→本次扫描"逐轮滚动累计（每轮已见广告位仍曝光），时长如实累加；
+        #   ③ 中断丢失：广告位在两次扫描之间离开曝光态时，原交集法完全不计该段；
+        #      现按退出时刻结算整段时长，不再丢失。剩余未结算分段由 finalize_ad_monitor 收尾。
         now_ts = time.time()
         effective_threshold_ms = int(config.get("ad_effective_exposure_ms", 1000) or 1000)
-        last_ts = ad_monitor.get("last_scan_ts")
         prev_exposed50 = ad_monitor.get("prev_exposed50") or set()
-        if last_ts is not None:
-            delta_ms = int(max(0.0, now_ts - last_ts) * 1000)
-            # 单次间隔过长（如长时间停留）做上限保护，避免高估
-            delta_ms = min(delta_ms, int(config.get("ad_exposure_max_gap_ms", 30000) or 30000))
-            # 只对“上次和本次都 ≥50% 可见”的广告位累加（说明这段时间它持续曝光）
-            for key in (prev_exposed50 & cur_exposed50):
-                acc = ad_monitor["exposure_duration_ms"].get(key, 0) + delta_ms
-                ad_monitor["exposure_duration_ms"][key] = acc
-                if acc >= effective_threshold_ms:
-                    ad_monitor["effective_exposed"].add(key)
+        since = ad_monitor.setdefault("exposed50_since", {})
+        # 1) 结算已离开曝光态的广告位：整段 [进入,本次扫描] 时长补进累计
+        for key in (prev_exposed50 - cur_exposed50):
+            _st = since.pop(key, None)
+            if _st is None:
+                continue
+            _seg_ms = int(max(0.0, now_ts - _st) * 1000)
+            acc = ad_monitor["exposure_duration_ms"].get(key, 0) + _seg_ms
+            ad_monitor["exposure_duration_ms"][key] = acc
+            if acc >= effective_threshold_ms:
+                ad_monitor["effective_exposed"].add(key)
+        # 2) 持续曝光中的广告位：累计 [分段起点,本次扫描] 时长，并把分段起点滚动到本次
+        for key in (prev_exposed50 & cur_exposed50):
+            _st = since.get(key)
+            if _st is None:
+                _st = now_ts  # 兜底：分段起点缺失（如进程中途介入）时从本次开始计
+            _seg_ms = int(max(0.0, now_ts - _st) * 1000)
+            acc = ad_monitor["exposure_duration_ms"].get(key, 0) + _seg_ms
+            ad_monitor["exposure_duration_ms"][key] = acc
+            since[key] = now_ts
+            if acc >= effective_threshold_ms:
+                ad_monitor["effective_exposed"].add(key)
+        # 3) 首次进入曝光态的广告位：仅开启分段计时（首个分段的时长从下一次扫描起算）
+        for key in (cur_exposed50 - prev_exposed50):
+            if key not in since:
+                since[key] = now_ts
         ad_monitor["last_scan_ts"] = now_ts
         ad_monitor["prev_exposed50"] = cur_exposed50
 
@@ -5228,6 +5335,8 @@ human_model_state = {
 human_model_lock = threading.Lock()
 human_model_stop_event = threading.Event()
 human_model_thread = None
+# ★ 监督线程代际号：ensure_alive/重启时递增，旧线程在下一轮循环检测到代际变化后自退出，杜绝线程堆积
+human_model_supervisor_gen = 0
 HUMAN_MODEL_HEARTBEAT_TIMEOUT = 120
 
 # HTML 模板
@@ -5566,12 +5675,12 @@ HTML_TEMPLATE = r"""
             <!-- 红框 - 配置区域（2/3宽度） -->
             <div class="config-panel">
                 <div class="config-inner">
-            <div class="tab-buttons">
-                <button class="tab-btn active" onclick="switchTab('websitetraffic', this)">网站流量</button>
-                <button class="tab-btn" onclick="switchTab('network', this)">网络</button>
-                <button class="tab-btn" onclick="switchTab('seo', this)">SEO</button>
-                <button class="tab-btn" onclick="switchTab('model', this)">模型</button>
-                <button class="tab-btn" onclick="switchTab('taskvalidation', this)">任务验证</button>
+            <div class="tab-buttons" id="main-tab-buttons">
+                <button class="tab-btn active" data-tab="tab-websitetraffic" onclick="switchTab('websitetraffic', this)">网站流量</button>
+                <button class="tab-btn" data-tab="tab-network" onclick="switchTab('network', this)">网络</button>
+                <button class="tab-btn" data-tab="tab-seo" onclick="switchTab('seo', this)">SEO</button>
+                <button class="tab-btn" data-tab="tab-model" onclick="switchTab('model', this)">模型</button>
+                <button class="tab-btn" data-tab="tab-taskvalidation" onclick="switchTab('taskvalidation', this)">任务验证</button>
             </div>
             
             <!-- QA任务Tab -->
@@ -6328,9 +6437,17 @@ HTML_TEMPLATE = r"""
         let originalLogHTML = '';
         
         function switchTab(tabName, btn) {
-            // 隐藏所有Tab
-            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            // 26.8.13.1 ★ DOM 类名冲突根因修复：
+            // 原 querySelectorAll('.tab-btn' / '.tab-content') 作用于整个文档，
+            // 会误把红队评估内部 .tab-btn（#drillModeRisk 内的双切换按钮）一起抹掉 active，
+            // 导致顶层Tab切换后，红队按钮状态被扰乱。
+            // 修复：限定查找范围为顶层主Tab容器 .top-tabs-wrapper（外层），
+            // 且仅匹配 id 以 "tab-" 开头的顶层内容（红队 drillModeRisk/drillModeRed 不用此前缀）。
+            const topBox = document.querySelector('.top-tabs-wrapper') || document.body;
+            topBox.querySelectorAll('.top-tab-content').forEach(el => el.classList.remove('active'));
+            topBox.querySelectorAll('.top-tab-btn').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-content[id^="tab-"]').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn[data-tab^="tab-"]').forEach(el => el.classList.remove('active'));
             // 显示选中的Tab
             const targetTab = document.getElementById('tab-' + tabName);
             if (targetTab) {
@@ -8357,10 +8474,23 @@ HTML_TEMPLATE = r"""
 </html>
 """
 
+class _BoundedMessages(list):
+    """有上限的消息列表：即使绕过 StructuredLogger 方法直接 append，
+    也无法突破内存上限（防御性硬化，杜绝 log.messages 直写路径内存无限增长）"""
+    def __init__(self, max_lines=500):
+        super().__init__()
+        self.max_lines = max_lines
+
+    def append(self, item):
+        super().append(item)
+        if len(self) > self.max_lines:
+            del self[:len(self) - self.max_lines]
+
+
 class StructuredLogger:
     """结构化日志记录器"""
     def __init__(self, max_lines=500):
-        self.messages = []
+        self.messages = _BoundedMessages(max_lines)
         self.max_lines = max_lines
     
     def _add_log(self, module, content):
@@ -8666,10 +8796,12 @@ def _safe_page_wait(page, min_wait=2.5, max_wait=5.5, ad_wait=False, deadline=No
 
     策略：domcontentloaded + 温和随机等待；若目标站包含广告，则额外等广告元素最多 4s。
     """
+    human_model_tick("_safe_page_wait")  # ★ 阻塞点心跳续期，防止长等待触发supervisor超时
     try:
         page.wait_for_load_state("domcontentloaded", timeout=45000)
     except Exception as _e:
         log.debug(f"[_safe_page_wait] domcontentloaded 等待放弃: {type(_e).__name__}")
+    human_model_tick("_safe_page_wait")
     t = random.uniform(min_wait, max_wait)
     if deadline:
         t = min(t, max(0.5, deadline - time.time()))
@@ -8704,8 +8836,10 @@ def _hard_timeout_goto(page, url, timeout=60, **kwargs):
             exc[0] = e
 
     worker = _watchdog_threading.Thread(target=_run, daemon=True)
+    human_model_tick("_hard_timeout_goto")  # ★ 阻塞点心跳续期（goto 可能阻塞数十秒）
     worker.start()
     worker.join(timeout=timeout + 8)
+    human_model_tick("_hard_timeout_goto")
     if worker.is_alive():
         log.error(f"🚫 [_hard_timeout_goto] 硬超时({timeout + 8}s)：{str(url)[:120]}，尝试关闭页面兜底")
         try:
@@ -8818,6 +8952,7 @@ def is_cloudflare_challenge(page):
 def solve_cloudflare_challenge(page):
     """尝试解决Cloudflare验证挑战"""
     try:
+        human_model_tick("solve_cloudflare_challenge")  # ★ 阻塞点心跳续期
         log.info("🔐 尝试解决Cloudflare验证挑战...")
         
         # 检查是否需要点击验证按钮
@@ -11133,7 +11268,7 @@ def click_link_containing_text(page, text_list, current_x, current_y, config, ta
         # ★ 使用 JS evaluate 在浏览器内完成链接匹配（比Python逐一遍历CDP快10倍+）
         for attempt in range(2):
             try:
-                _js_result = page.evaluate("""
+                _js_result = page.evaluate(r"""
                     (keywords) => {
                         const links = document.querySelectorAll('a[href]');
                         const candidates = [];
@@ -11312,7 +11447,7 @@ def click_link_with_fallback(page, text_list, fallback_urls, current_x, current_
 
     # ★ 新增：通用链接点击回退——在当前页面点击任意内容链接（排除导航/功能链接）
     try:
-        _generic_result = page.evaluate("""
+        _generic_result = page.evaluate(r"""
             () => {
                 const exclude = /login|logout|admin|register|signup|cart|checkout|account|privacy|terms|dmca|refund|contact|about|faq|mailto|javascript/i;
                 const links = document.querySelectorAll('a[href]');
@@ -12190,8 +12325,9 @@ def _generate_proxy_auth_extension(proxy_host, proxy_port, username, password):
     扩展仅处理代理认证(onAuthRequired)，代理服务器由--proxy-server参数指定。
     返回扩展目录路径，供--load-extension使用。"""
     import json as _json
-    ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.proxy_auth_ext')
-    os.makedirs(ext_dir, exist_ok=True)
+    import tempfile as _tempfile
+    # 每次生成独立临时目录，避免并发任务共用目录导致扩展缓存冲突
+    ext_dir = _tempfile.mkdtemp(prefix="proxy_auth_ext_")
     manifest = {
         "version": "1.0.0",
         "manifest_version": 3,
@@ -12210,12 +12346,31 @@ chrome.webRequest.onAuthRequired.addListener(
   ["asyncBlocking"]
 );
 """
-    with open(os.path.join(ext_dir, 'manifest.json'), 'w') as f:
+    _manifest_path = os.path.join(ext_dir, 'manifest.json')
+    _bg_path = os.path.join(ext_dir, 'background.js')
+    with open(_manifest_path, 'w') as f:
         _json.dump(manifest, f)
-    with open(os.path.join(ext_dir, 'background.js'), 'w') as f:
+    with open(_bg_path, 'w') as f:
         f.write(background_js)
+    # 扩展内含代理账号密码明文，收紧文件权限防止同机其他用户读取
+    try:
+        os.chmod(_manifest_path, 0o600)
+        os.chmod(_bg_path, 0o600)
+    except Exception as _chmod_err:
+        log.warning(f"[代理认证] 设置扩展文件权限失败(忽略): {_chmod_err}")
     log.info(f"[代理认证] 生成MV3认证扩展: {ext_dir} (user={username[:6]}...)")
     return ext_dir
+
+def _cleanup_proxy_auth_extension(ext_dir):
+    """清理代理认证扩展临时目录（浏览器关闭后调用）。"""
+    if not ext_dir:
+        return
+    try:
+        import shutil as _shutil
+        _shutil.rmtree(ext_dir, ignore_errors=True)
+        log.debug(f"🧹 已清理代理认证扩展目录: {ext_dir}")
+    except Exception as _cleanup_err:
+        log.warning(f"⚠️ 清理代理认证扩展失败(忽略): {_cleanup_err}")
 
 def ensure_xvfb_for_headed_mode(headless):
     """服务器无 DISPLAY 时，为 headed 模式自动启动 Xvfb 虚拟显示器。"""
@@ -12323,7 +12478,15 @@ def get_direct_public_ip(timeout=10):
 def redial_adsl_and_get_ip(profile=None, min_interval=None, sleep_func=None, status_obj=None):
     """本机执行 ADSL/PPPoE 重拨并返回 24 小时内未使用过的公网 IP 信息。"""
     global _adsl_last_redial_ts, adsl_status, _adsl_redial_timestamps
-    profile = profile or config.get("adsl_profile", "pppoe")
+    # 26.8.13.1 ★ C-5 命令注入根因修复：
+    #  (1) profile 必须严格匹配 [a-zA-Z0-9_-]{1,32}（Linux peers 文件命名规则），
+    #      避免用户提交包含 shell 元字符 / 路径穿越的名称。
+    #  (2) subprocess.run 传参使用 list（已满足），但 profile 字符白名单仍做双保险。
+    import re
+    _prof_raw = profile or config.get("adsl_profile", "pppoe")
+    if not isinstance(_prof_raw, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", _prof_raw):
+        raise ValueError(f"[ADSL] adsl_profile 不符合 Linux peers 文件命名规则（仅字母数字/_- 1-32 字符），拒绝拨号：{_prof_raw!r}")
+    profile = _prof_raw
     min_interval = int(min_interval or config.get("adsl_min_redial_interval", 30) or 30)
     max_attempts = max(1, int(config.get("adsl_ip_redial_max_attempts", 10) or 10))
     blacklist_hours = float(config.get("adsl_ip_blacklist_hours", 24) or 24)
@@ -12388,12 +12551,16 @@ def redial_adsl_and_get_ip(profile=None, min_interval=None, sleep_func=None, sta
             continue
         # IP 类型检测（住宅/数据中心/移动/代理）；数据中心/代理IP对广告风控高危，自动拒绝
         _ip_type = resolved.get("ip_type")
-        if _ip_type:
-            if _ip_type in ("datacenter", "proxy", "vpn", "hosting"):
-                log.error(f"🚫 [风控铁律] IP {public_ip} 类型={_ip_type}（数据中心/代理/VPN/托管，广告风控高危），自动拒绝并重新获取")
-                continue  # ★ 阻断式：高危IP直接拒绝，重新获取
-            else:
-                log.info(f"[ADSL] IP {public_ip} 类型={_ip_type}（住宅/移动，安全）")
+        if not _ip_type:
+            # ★ fail-closed：类型未知（解析接口未返回 ip_type）时保守拒绝，
+            # 防止"类型未知"的裸奔IP绕过风控进入任务队列
+            status_ref["status"] = "IP类型未知，重新拨号"
+            log.warning(f"[ADSL] IP {public_ip} 类型未知（ip_type为空），保守拒绝并重新获取")
+            continue
+        if _ip_type in ("datacenter", "proxy", "vpn", "hosting"):
+            log.error(f"🚫 [风控铁律] IP {public_ip} 类型={_ip_type}（数据中心/代理/VPN/托管，广告风控高危），自动拒绝并重新获取")
+            continue  # ★ 阻断式：高危IP直接拒绝，重新获取
+        log.info(f"[ADSL] IP {public_ip} 类型={_ip_type}（住宅/移动，安全）")
         sync_process_timezone_to_ip(resolved)
         _record_adsl_ip_use(public_ip, resolved)
         status_ref["country"] = resolved.get("country_code") or resolved.get("country_name") or ""
@@ -13534,20 +13701,20 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     # 直接使用 IPDeep 返回的 HTTP 代理出网
                     proxy_username = proxy_info.get('proxy_username', '')
                     proxy_password = proxy_info.get('proxy_password', '')
-                    # ★ Chrome 150+ 不支持 --proxy-server 内嵌凭证，使用本地代理转发器
-                    # 本地转发器: 127.0.0.1:18082 (无需认证) → IPDeep代理 (自动添加认证头)
-                    if proxy_username and proxy_password:
-                        _relay_addr = _start_proxy_relay(proxy_host, int(proxy_port), proxy_username, proxy_password)
-                        proxy_server = _relay_addr  # http://127.0.0.1:18082
-                        log.info(f"[代理配置] ✅ 启动本地代理转发器: {_relay_addr} → {proxy_host}:{proxy_port}")
-                    else:
-                        proxy_server = f"http://{proxy_host}:{proxy_port}"
-                        log.info(f"[代理配置] ✅ 直连代理(无认证): {proxy_host}:{proxy_port}")
+                    # ★ Chrome 150+ 不支持 --proxy-server 内嵌凭证：
+                    # 直连代理 + 动态生成 MV3 认证扩展（onAuthRequired 自动携带账号密码）
+                    proxy_server = f"http://{proxy_host}:{proxy_port}"
                     proxy_config = {
                         "server": proxy_server,
                         "username": proxy_username,
                         "password": proxy_password,
                     }
+                    if proxy_username and proxy_password:
+                        proxy_config["ext_dir"] = _generate_proxy_auth_extension(
+                            proxy_host, int(proxy_port), proxy_username, proxy_password)
+                        log.info(f"[代理配置] ✅ 直连代理(带认证扩展): {proxy_host}:{proxy_port}")
+                    else:
+                        log.info(f"[代理配置] ✅ 直连代理(无认证): {proxy_host}:{proxy_port}")
                 except Exception as e:
                     log.error(f"❌ 构建代理配置失败: {e}")
                     log.error(f"❌ 错误类型: {type(e).__name__}")
@@ -13611,6 +13778,7 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 _launch_lang = fingerprint.get("language", "en-US")
                 _launch_tz = fingerprint.get("timezone", "America/New_York")
                 _launch_args = []
+                _proxy_ext_dir = None
                 if proxy_config is not None:
                     _launch_args.extend([
                         f"--proxy-server={proxy_config['server']}",
@@ -13621,7 +13789,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 仅保留 Chrome 安全浏览和组件更新等内部服务
                         "--proxy-bypass-list=safebrowsing.googleapis.com;safebrowsinghttpgateway.googleapis.com;clients2.google.com;update.googleapis.com;edgedl.me.gvt1.com",
                     ])
-                    # ★ 本地代理转发器已处理认证，无需Chrome扩展
+                    # ★ 代理认证由 MV3 扩展处理（--proxy-server 不支持内嵌凭证）
+                    _proxy_ext_dir = proxy_config.get("ext_dir")
+                    if _proxy_ext_dir:
+                        _launch_args.append(f"--load-extension={_proxy_ext_dir}")
+                        log.info(f"[代理配置] 已加载代理认证扩展: {_proxy_ext_dir}")
                 # WebRTC防护：仅强制走代理，不完全禁用（完全禁用是强检测信号）
                 # init_script 已通过包装 RTCPeerConnection + 过滤 ICE candidate 实现 IP 泄露防护
                 if config.get("webrtc_leak_check_enabled", True):
@@ -13659,6 +13831,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     "--dns-over-https-mode=secure",
                 ])
                 
+                # 存在代理认证扩展时仅禁用其它扩展，否则完全禁用扩展
+                if _proxy_ext_dir:
+                    _launch_args.append(f"--disable-extensions-except={_proxy_ext_dir}")
+                else:
+                    _launch_args.append("--disable-extensions")
+
                 _launch_args.extend([
                         f"--lang={_launch_lang}",
                         f"--window-size={width},{height}",
@@ -13675,7 +13853,6 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--disable-popup-blocking",
-                        "--disable-extensions",
                         "--disable-background-networking",
                         "--safebrowsing-disable-auto-update",
                         "--disable-domain-reliability",
@@ -13743,6 +13920,12 @@ def worker_task(single_task=False, adsl_ip_task=False):
                     ]
                     if proxy_config is not None:
                         args.insert(0, f"--proxy-server={proxy_config['server']}")
+                        _min_ext_dir = proxy_config.get("ext_dir")
+                        if _min_ext_dir:
+                            args.append(f"--load-extension={_min_ext_dir}")
+                            args.append(f"--disable-extensions-except={_min_ext_dir}")
+                    else:
+                        args.append("--disable-extensions")
                     return {"headless": True, "args": args}
 
                 browser = None
@@ -15424,15 +15607,10 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             for retry in range(3):
                                 try:
                                     def optimized_page_goto(page, url, max_retries=2, referer=None):
-                                        # ★ 严禁拦截任何资源类型！
-                                        # 图片(.png/.jpg/.webp/.gif)是广告素材的核心载体，
-                                        # 拦截后 AdSense 广告将显示空白，无法形成有效曝光。
-                                        # 仅拦截大体积视频文件以提升加载速度。
-                                        try:
-                                            page.route("**/*.mp4", lambda route: route.abort())
-                                            page.route("**/*.webm", lambda route: route.abort())
-                                        except Exception:
-                                            pass
+                                        # ★ 严禁拦截任何资源类型（已移除全部资源拦截）！
+                                        # 图片与视频都是广告素材的核心载体，拦截后
+                                        # AdSense/视频广告将显示空白，无法形成有效曝光。
+                                        # 现不做任何资源拦截（该拦截逻辑已移除）。
                                         for attempt in range(max_retries):
                                             try:
                                                 # ★ 风控核心：使用 window.location.href 自然跳转
@@ -16095,6 +16273,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         except Exception:
                             pass
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "任务结束汇总前")
+                        # ★ 收尾结算：任务结束瞬间仍在曝光态的广告位，补计最后一段曝光时长
+                        _finalize_ad_monitor(ad_monitor)
                         ad_found = len(ad_monitor.get("containers", set())) > 0
                         ad_in_viewport = len(ad_monitor.get("visible", set())) > 0
                         ad_loaded = ad_found
@@ -16571,10 +16751,9 @@ def worker_task(single_task=False, adsl_ip_task=False):
                             else:
                                 log.warning("⚠️ 关闭 browser 超时，已跳过强制杀进程，等待系统自然回收")
     
-                        # ★ 停止本地代理转发器
+                        # ★ 清理代理认证扩展临时目录
                         try:
-                            _stop_proxy_relay()
-                            log.debug("🧹 已停止本地代理转发器")
+                            _cleanup_proxy_auth_extension(proxy_config.get("ext_dir") if proxy_config else None)
                         except Exception:
                             pass
 
@@ -16809,8 +16988,18 @@ def get_video_task_history():
         log.error(f"获取视频任务历史记录失败: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
 
+# ★ save_config 全局互斥锁：防止并发请求交错修改全局 config 或写坏 config.json
+_save_config_lock = threading.Lock()
+
 @app.route('/save_config', methods=['POST'])
 def save_config():
+    global config, pending_plan
+    # ★ 并发锁：串行化整个保存过程（多标签页自动保存/手动保存并发时，避免配置互相覆盖）
+    with _save_config_lock:
+        return _save_config_impl()
+
+
+def _save_config_impl():
     global config, pending_plan
     data = request.get_json(silent=True) or {}  # ★ 审计修复#4：防止None崩溃
     
@@ -16907,12 +17096,26 @@ def save_config():
     log.info("配置已保存")
     return jsonify({"success": True, "status": "ok"})
 
+def _masked_config_payload():
+    """返回脱敏后的配置副本：隐藏 IPDeep 密码与代理池账号密码（前2位+***），
+    避免前端/调试接口泄露明文凭据；仅在副本上操作，不影响全局 config。"""
+    cfg = copy.deepcopy(config)
+    if "ip_proxy_pwd" in cfg:
+        cfg["ip_proxy_pwd"] = ""
+    _pool = cfg.get("proxy_pool")
+    if isinstance(_pool, list):
+        for _item in _pool:
+            if isinstance(_item, dict) and _item.get("proxy_pwd"):
+                _item["proxy_pwd"] = str(_item["proxy_pwd"])[:2] + "***"
+    return cfg
+
+
 @app.route('/get_config', methods=['GET'])
 def get_config():
-    """获取当前配置，用于页面加载时恢复代理池等配置"""
+    """获取当前配置，用于页面加载时恢复代理池等配置（已脱敏，不返回明文密码）"""
     return jsonify({
         "status": "ok",
-        "config": config
+        "config": _masked_config_payload()
     })
 
 
@@ -16991,7 +17194,8 @@ def clean_logs():
     """清空日志（包括前端显示和文件日志）"""
     import os
     # 1. 清空前端显示的内存日志列表
-    log.messages = []
+    # ★ 修复：使用 clear() 而非重新赋值 []，保留 _BoundedMessages 内存上限保护
+    log.messages.clear()
     
     # 2. 清空 logs/ 目录下的 .log 文件（VPS终端日志）
     logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -18315,10 +18519,11 @@ def dwell_monitor_stop():
 
 @app.route('/api/debug_config')
 def debug_config():
-    """调试接口：查看当前配置内容"""
+    """调试接口：查看当前配置内容（已脱敏，不返回明文密码）"""
+    _cfg = _masked_config_payload()
     return jsonify({
-        "proxy_pool_count": len(config.get('proxy_pool', [])),
-        "proxy_pool": config.get('proxy_pool', [])
+        "proxy_pool_count": len(_cfg.get('proxy_pool', [])),
+        "proxy_pool": _cfg.get('proxy_pool', [])
     })
 
 @app.route('/save_seo_config', methods=['POST'])

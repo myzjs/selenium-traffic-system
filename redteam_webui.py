@@ -634,18 +634,19 @@ function switchDrillMode(mode) {
   const redBtn  = document.getElementById('drillTabRed');
   const riskPanel = document.getElementById('drillModeRisk');
   const redPanel  = document.getElementById('drillModeRed');
-  // 还要把原有的进度条/结果容器移动到正确的 Tab（原攻防演练进度条 result 直接在面板里）
-  const drillProgressContainer = document.querySelector('#drillStage')?.parentElement?.parentElement;
-  const drillResult = document.getElementById('drillResult');
+  // 26.8.13.1 ★ 进度条 DOM 漂移修复：
+  //   原 riskPanel.appendChild(drillProgressContainer) 会从原 DOM 树中把攻防演练进度条/结果
+  //   真的移走，顶层切换 Tab（网站流量→SEO→任务验证）再回来时，原 SEO 面板进度条位置
+  //   是空的或被打乱。修复改为纯 CSS display 控制显示/隐藏，不移动原节点。
+  //   红队需要自己独立的进度条（id=drillRedProgress / drillRedResult），不影响原风控演练。
   if (mode === 'risk') {
-    riskBtn.classList.add('active'); redBtn.classList.remove('active');
-    riskPanel.style.display = '';   redPanel.style.display = 'none';
-    // 把原攻防演练的进度条和结果搬到 risk Tab
-    if (riskPanel && drillProgressContainer) riskPanel.appendChild(drillProgressContainer);
-    if (riskPanel && drillResult) riskPanel.appendChild(drillResult);
+    riskBtn?.classList.add('active'); redBtn?.classList.remove('active');
+    if (riskPanel) riskPanel.style.display = '';
+    if (redPanel)  redPanel.style.display = 'none';
   } else {
-    riskBtn.classList.remove('active'); redBtn.classList.add('active');
-    riskPanel.style.display = 'none';   redPanel.style.display = '';
+    riskBtn?.classList.remove('active'); redBtn?.classList.add('active');
+    if (riskPanel) riskPanel.style.display = 'none';
+    if (redPanel)  redPanel.style.display = '';
   }
 }
 

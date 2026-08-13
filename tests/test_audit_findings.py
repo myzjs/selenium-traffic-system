@@ -61,8 +61,14 @@ class TestXSSInGetLogs:
         try:
             resp = client.get('/get_logs')
             body = resp.data.decode('utf-8')
-            assert 'onerror=' not in body, \
-                "XSS漏洞：/get_logs返回了未转义的事件处理器"
+            # 修复后：payload 中的 < > 必须被转义为 &lt; &gt;，
+            # 浏览器按纯文本渲染，事件处理器无法执行。
+            # 注意：转义后 onerror= 文本仍在（实体转义不删除字符），
+            # 因此断言必须检查「未转义的原始标签」是否存在。
+            assert '&lt;img src=x onerror=alert(1)&gt;' in body, \
+                "XSS修复失效：日志消息未进行HTML实体转义"
+            assert '<img src=x onerror=' not in body, \
+                "XSS漏洞：/get_logs返回了未转义的事件处理器标签"
         finally:
             if payload in app_module.log.messages:
                 app_module.log.messages.remove(payload)
@@ -83,8 +89,13 @@ class TestStartTaskRaceCondition:
 
         def fire_start():
             barrier.wait()
-            resp = client.post('/start_task')
-            results.append(resp.status_code)
+            # ★ 每个线程必须使用独立的 test_client：
+            # Flask 3.x 的请求/应用上下文基于 contextvars，
+            # 跨线程共享同一个 client 会破坏上下文状态，导致后续测试
+            # 报 "Token was created in a different Context"。
+            with app_module.app.test_client() as c:
+                resp = c.post('/start_task')
+                results.append(resp.status_code)
 
         t1 = threading.Thread(target=fire_start)
         t2 = threading.Thread(target=fire_start)

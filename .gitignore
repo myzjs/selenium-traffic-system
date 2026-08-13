@@ -4,6 +4,8 @@ __pycache__/
 .DS_Store
 .env
 report/
+# 单数/复数双保险：实际报告目录使用 reports/ 而非 report/，之前漏忽略导致 golden_label JSONL、auto_test_report 会入库
+reports/
 test_reports/
 feedback/
 config.json
@@ -25,3 +27,6 @@ deploy_to_target.py
 # 运行时状态产物（测试运行生成，非代码）
 .risk_state/ip_dedup_state.json
 behavior_stats_result.json
+plan_progress.json
+# 本地临时调试脚本（下划线前缀只用于本地，禁止提交）
+_*.py
