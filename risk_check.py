@@ -150,6 +150,28 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
         "risk_calc": {}
     }
 
+    # 审计修复(D4)：Playwright Python 的 page.request 是 APIRequestContext，没有 .headers 属性。
+    # 改用 page.on("request") 捕获主文档请求的真实请求头；主文档请求通常在外部 goto 时已发生，
+    # 故在此 reload 一次触发导航以完成捕获（无 on/reload 能力的 mock 或桥接对象自动跳过，不影响检测）。
+    _captured_headers = {}
+    try:
+        def _on_request_capture(req):
+            nonlocal _captured_headers
+            try:
+                if getattr(req, "resource_type", "document") != "document":
+                    return
+                hdrs = getattr(req, "headers", None)
+                if isinstance(hdrs, dict) and hdrs:
+                    _captured_headers = dict(hdrs)
+            except Exception:
+                pass
+        if hasattr(page, "on"):
+            page.on("request", _on_request_capture)
+        if hasattr(page, "reload"):
+            page.reload(timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        logger.warning("page.on('request') 捕获请求头不可用（不影响检测）: %s", e)
+
     # ====================== 1. 基础环境信息 ======================
     # 审计修复：逐个包裹 try/except，避免单次 evaluate 失败导致整个检测中断（降级为默认值并记录日志）
     try:
@@ -532,12 +554,19 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
     # 尝试获取页面出口IP
     net["proxy_ip"] = proxy_ip or "unknown"
 
-    # 审计修复：安全获取请求头，异常时降级为空 dict 并记录日志，避免检测流程中断
-    try:
-        headers = page.request.headers if hasattr(page, "request") else {}
-    except Exception as e:
-        logger.warning("获取 page.request.headers 失败，降级为空: %s", e)
-        headers = {}
+    # 审计修复(D4)：优先使用 page.on("request") 捕获的真实请求头；
+    # 兜底兼容 selenium_bridge 的 page.request.headers（Request 对象），失败时降级为空 dict。
+    headers = _captured_headers or {}
+    if not headers:
+        try:
+            req_obj = getattr(page, "request", None)
+            if req_obj is not None and hasattr(req_obj, "headers"):
+                hdrs = req_obj.headers
+                if isinstance(hdrs, dict):
+                    headers = hdrs
+        except Exception as e:
+            logger.warning("获取请求头失败，降级为空: %s", e)
+            headers = {}
     net["missing_accept_lang"] = "Accept-Language" not in headers
     net["missing_sec_ch_ua"] = "Sec-Ch-Ua" not in headers
     report["network_ip"] = net

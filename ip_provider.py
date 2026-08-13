@@ -225,6 +225,13 @@ class IPProvider:
                     if attempt < max_retries - 1:
                         time.sleep(1)
                         continue
+                    # 审计修复(E1)：最后一次尝试仍撞去重冲突时，必须返回失败，
+                    # 不能再 fall-through 到下方 success=True（否则重复IP会被放行使用）。
+                    return {
+                        "success": False,
+                        "error": "出口IP去重冲突（所有尝试均为重复IP），已拒绝",
+                        "detail": {"ip": exit_ip},
+                    }
 
                 result = {
                     "success": True,

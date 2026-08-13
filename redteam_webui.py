@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -194,7 +195,9 @@ def api_stop():
         if not _rt_state["running"]:
             return jsonify({"status": "warning", "message": "当前没有运行中的红队演练"})
         _rt_state["stop_requested"] = True
-        _append_log("[控制] 已请求停止红队演练（完成当前任务后退出）")
+    # ★ 审计修复(D1)：_append_log 内部会再次获取 _rt_lock（普通 Lock 不可重入），
+    # 持锁调用会必现死锁；必须先释放锁再写日志。
+    _append_log("[控制] 已请求停止红队演练（完成当前任务后退出）")
     return jsonify({"status": "ok"})
 
 
@@ -218,11 +221,12 @@ def _run_redteam_thread(
         specific = [_RTL.get(s) for s in scenario_ids if _RTL.get(s)]
 
         for idx in range(1, task_count + 1):
-            # 停止请求
+            # 停止请求 —— 先释放锁再写日志（_append_log 内部会再次获取 _rt_lock）
             with _rt_lock:
-                if _rt_state.get("stop_requested"):
-                    _append_log("[停止] 收到停止请求，退出")
-                    break
+                _stop_requested = bool(_rt_state.get("stop_requested"))
+            if _stop_requested:
+                _append_log("[停止] 收到停止请求，退出")
+                break
 
             # ---- 抽场景 ----
             if specific and random.random() < 0.80:
@@ -399,24 +403,40 @@ def _run_redteam_thread(
                 # 没回填就用简单规则先填充一份演示评估（severity 高更容易命中）
                 path = os.path.join(_BASE_DIR, "reports", "redteam", f"redteam_golden_{_rt_state['report_date']}.jsonl")
                 if os.path.exists(path):
+                    # 只回填缺失 system_verdict 的记录；原始行（含解析失败行）一律保留，
+                    # 避免 "w" 覆盖写入丢失其它记录（审计修复 D3）
                     lines = open(path, "r", encoding="utf-8").readlines()
                     updated = []
+                    changed = False
                     for line in lines:
                         try:
                             r = json.loads(line)
-                            sev = int(r.get("severity") or 0)
-                            golden = r.get("expected_verdict")
-                            if golden == "normal":
-                                r["system_verdict"] = "fraud" if random.random() < 0.08 else "normal"
+                            if r.get("system_verdict") is None:
+                                sev = int(r.get("severity") or 0)
+                                golden = r.get("expected_verdict")
+                                if golden == "normal":
+                                    r["system_verdict"] = "fraud" if random.random() < 0.08 else "normal"
+                                else:
+                                    p = {0: 0.0, 1: 0.4, 2: 0.55, 3: 0.75, 4: 0.9, 5: 0.98}.get(sev, 0.5)
+                                    r["system_verdict"] = "fraud" if random.random() < p else "normal"
+                                updated.append(json.dumps(r, ensure_ascii=False))
+                                changed = True
                             else:
-                                p = {0: 0.0, 1: 0.4, 2: 0.55, 3: 0.75, 4: 0.9, 5: 0.98}.get(sev, 0.5)
-                                r["system_verdict"] = "fraud" if random.random() < p else "normal"
-                            updated.append(r)
+                                updated.append(line.rstrip("\n"))
                         except Exception:
-                            pass
-                    with open(path, "w", encoding="utf-8") as f:
-                        for r in updated:
-                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                            updated.append(line.rstrip("\n"))
+                    if changed:
+                        # 原子写回：临时文件 + os.replace，避免写一半损坏 JSONL
+                        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+                        try:
+                            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                                for l in updated:
+                                    f.write(l + "\n")
+                            os.replace(tmp_path, path)
+                        except Exception:
+                            if os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                            raise
                     ev = evaluate_golden_vs_system(date_str=_rt_state["report_date"])
         except Exception as _ee:
             _append_log(f"[评估] 警告：评估计算异常：{_ee}")

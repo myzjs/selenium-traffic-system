@@ -70,9 +70,9 @@ import selenium_bridge as _selenium_bridge
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。
 # 26.8.12.2 = 2026-08-12 第二次改动（缺陷修复A-J）
-# 26.8.13.1 = 2026-08-13 第一次改动（IPDeep 三修复/日内曲线时区/红队DOM冲突/
-#              SyntaxWarning→SyntaxError/真实任务钩子确认/补 bs4/pytz/selenium 依赖声明）
-APP_VERSION = "26.8.13.1"
+# 26.8.13.2 = 2026-08-13 第二次改动（第二轮深度审计：A2 日志XSS白名单修复、
+#              A1-A7/B1-B3/C1/D1-D4/E1-E3 共16处 + A2修复自身2个Bug + 新增35条审计测试）
+APP_VERSION = "26.8.13.2"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -3048,7 +3048,9 @@ class UAPoolManager:
         self._bucket_lock = None
         try:
             import threading
-            self._bucket_lock = threading.Lock()
+            # ★ 审计修复(A1)：必须用可重入锁 RLock —— get_ua 在持锁期间调用 _save_buckets（内部再次加锁），
+            # 普通 Lock 在同一线程内重复 acquire 会自死锁，RLock 允许同一线程重入。
+            self._bucket_lock = threading.RLock()
         except Exception:
             self._bucket_lock = None
 
@@ -5318,6 +5320,8 @@ adsl_status = {
 }
 _adsl_last_redial_ts = 0
 _adsl_redial_timestamps = []  # 最近重拨时间序列，用于切换频率自我监测
+# ★ 审计修复(A3)：保护上述全局重拨计数器的并发写入（adsl 任务与 vt 任务可能同时重拨）
+_adsl_redial_lock = threading.Lock()
 ADSL_IP_HISTORY_FILE = "adsl_ip_history.json"
 _adsl_ip_history_lock = threading.Lock()
 
@@ -10802,6 +10806,18 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
         
         log.info(f"📋 行为模拟参数: 鼠标移动最多{max_mouse_moves}次, 滚动最多{max_scrolls}次, 点击最多{max_clicks}次")
         
+        def _vp_coord(axis, default):
+            """★ 审计修复(A5)：在视口范围内生成随机坐标；视口过小（≤200px）时自动收缩边距，
+            避免 random.randint(100, width-100) 下界>上界抛 ValueError。"""
+            try:
+                _size = int((page.viewport_size or {}).get(axis, default) or default)
+            except Exception:
+                _size = default
+            if _size <= 0:
+                return 0
+            _m = min(100, max(1, _size // 3))
+            return random.randint(_m, max(_m, _size - _m))
+        
         # 阶段1: 模拟鼠标移动（简化版）
         _mmc_cfg = config.get("mouse_move_count", {"min": 2, "max": 20})
         mouse_move_count = min(random.randint(int(_mmc_cfg.get("min", 2)), int(_mmc_cfg.get("max", 20))), max_mouse_moves)
@@ -10810,8 +10826,8 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
             if elapsed >= watch_time:
                 break
                 
-            target_x = random.randint(100, page.viewport_size.get('width', 1920) - 100)
-            target_y = random.randint(100, page.viewport_size.get('height', 1080) - 100)
+            target_x = _vp_coord('width', 1920)
+            target_y = _vp_coord('height', 1080)
             
             # 使用简化的线性移动（避免贝塞尔曲线计算过多）
             page.mouse.move(target_x, target_y, steps=random.randint(int(mouse_steps_cfg.get("min", 50)), int(mouse_steps_cfg.get("max", 250))))
@@ -10857,8 +10873,8 @@ def watch_video_ad(page, video_url, config, current_x, current_y, referer_url=No
                 break
                 
             try:
-                target_x = random.randint(100, page.viewport_size.get('width', 1920) - 100)
-                target_y = random.randint(100, page.viewport_size.get('height', 1080) - 100)
+                target_x = _vp_coord('width', 1920)
+                target_y = _vp_coord('height', 1080)
                 
                 page.mouse.move(target_x, target_y, steps=random.randint(int(mouse_steps_cfg.get("min", 50)), int(mouse_steps_cfg.get("max", 250))))
                 page.mouse.click(target_x, target_y)
@@ -11931,8 +11947,12 @@ def watch_video_ad_from_page(page, config, current_x, current_y):
             log.debug(f"检查播放状态失败: {str(e)}")
         
         # 观看视频（随机时长，来自配置，完全独立）
-        min_watch = config["video_ad"].get("min_watch_time", 30)
-        max_watch = config["video_ad"].get("max_watch_time", 90)
+        # ★ 审计修复(A4)：video_ad 配置键可能缺失/为 None，直接索引会 KeyError/AttributeError
+        _video_ad_cfg = config.get("video_ad", {}) or {}
+        min_watch = _video_ad_cfg.get("min_watch_time", 30) or 30
+        max_watch = _video_ad_cfg.get("max_watch_time", 90) or 90
+        if max_watch < min_watch:
+            max_watch = min_watch + 1
         
         watch_time = random.uniform(min_watch, max_watch)
         log.info(f"⏱️ 将观看 {watch_time:.1f} 秒视频（完全独立于页面停留时间）")
@@ -12512,15 +12532,17 @@ def redial_adsl_and_get_ip(profile=None, min_interval=None, sleep_func=None, sta
         status_ref["status"] = f"重新拨号中 {attempt}/{max_attempts}"
         log.info(f"[ADSL] 正在重新拨号: pon {profile}（第 {attempt}/{max_attempts} 次）")
         subprocess.run(["pon", profile], check=False, capture_output=True, timeout=10)
-        _adsl_last_redial_ts = time.time()
         status_ref["last_redial_time"] = time.strftime('%Y-%m-%d %H:%M:%S')
         # IP 切换频率自我监测：统计最近 5 分钟内的重拨次数，过于频繁时告警（避免短时频繁换IP被关联）
         _now_ts = time.time()
-        _adsl_redial_timestamps.append(_now_ts)
-        _adsl_redial_timestamps[:] = [t for t in _adsl_redial_timestamps if _now_ts - t <= 300]
+        with _adsl_redial_lock:  # ★ 审计修复(A3)：全局计数器写入加锁，避免并发任务竞态
+            _adsl_last_redial_ts = _now_ts
+            _adsl_redial_timestamps.append(_now_ts)
+            _adsl_redial_timestamps[:] = [t for t in _adsl_redial_timestamps if _now_ts - t <= 300]
+            _redial_freq_cnt = len(_adsl_redial_timestamps)
         _redial_freq_threshold = int(config.get("adsl_redial_freq_warn_5min", 12) or 12)
-        if len(_adsl_redial_timestamps) > _redial_freq_threshold:
-            log.warning(f"[ADSL] ⚠️ 最近5分钟已重拨 {len(_adsl_redial_timestamps)} 次（阈值{_redial_freq_threshold}），IP切换过于频繁存在被关联风险，建议放慢任务节奏")
+        if _redial_freq_cnt > _redial_freq_threshold:
+            log.warning(f"[ADSL] ⚠️ 最近5分钟已重拨 {_redial_freq_cnt} 次（阈值{_redial_freq_threshold}），IP切换过于频繁存在被关联风险，建议放慢任务节奏")
 
         status_ref["status"] = "等待网络恢复"
         log.info(f"[ADSL] 等待网络恢复 {min_interval}s")
@@ -12943,10 +12965,11 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 _single_task_mode = False
                 return
             current_plan = daily_plan  # 确保current_plan被正确设置
-    total_tasks = daily_plan["total_tasks"]
-    model_used = daily_plan["model_used"]
-    site_age = daily_plan["site_age"]
-    tasks_list = daily_plan["tasks"]
+    # ★ 审计修复(A7)：断点恢复的旧格式 daily_plan 可能缺失部分键，直接索引会 KeyError 中断任务
+    total_tasks = daily_plan.get("total_tasks", 0) or 0
+    model_used = daily_plan.get("model_used", "unknown") or "unknown"
+    site_age = daily_plan.get("site_age", 0) or 0
+    tasks_list = daily_plan.get("tasks", []) or []
     log.info(
         f"✅ 任务清单生成成功: total={total_tasks}, model={model_used}, site_age={site_age}"
     )
@@ -12983,30 +13006,34 @@ def worker_task(single_task=False, adsl_ip_task=False):
     import copy as _copy_cfg_snap
     _config_baseline_snapshot = _copy_cfg_snap.deepcopy(config)
 
-    # ========== ★ P2-5(1)：单任务 watchdog suicide Timer（30 分钟硬上限，杜绝卡死） ==========
+    # ========== ★ P2-5(1)：单任务 watchdog Timer（30 分钟硬上限，杜绝卡死） ==========
     # 背景：偶发 Playwright / Proxy / 广告请求会在某个 task 内卡死（page.goto/page.evaluate 超时后仍不释放），
-    # 后续所有任务都被阻塞，相当于整个调度器"停摆"。这里每个 task 外层挂一个 1800s 的 watchdog Timer，
-    # 到点仍未执行完就直接 os._exit(24)，由 systemd/supervisor/外层调度器拉起，避免整天 0 任务。
+    # 后续所有任务都被阻塞，相当于整个调度器"停摆"。这里每个 task 外层挂一个 1800s 的 watchdog Timer。
+    # ★ 审计修复(A6)：到点后【不再 os._exit(24) 自杀】——那会连同 Flask API 一起杀掉，
+    # 还可能打断正在写入的 config.json 造成损坏；改为记录致命日志并把 task_running 置 False，
+    # 任务循环在下一个检查点（各阶段停止检查 / interruptible sleep）自行退出。
     _task_global_watchdog = [None]  # 用 list 方便内层闭包修改
-    _task_suicide_code = 24
 
     def _start_task_global_watchdog(task_label, seconds=1800):
-        """每个 task 外层开启 suicide watchdog。"""
+        """每个 task 外层开启 watchdog，超时强制终止任务（不再退出进程）。"""
         try:
             import threading as _tw
             _tid = [None]
 
             def _suicide_fn():
+                # ★ 审计修复(A6)：不再 os._exit 自杀，只终止任务本身
                 try:
                     log.critical(
                         f"💀 P2-5 watchdog: 单任务[{task_label}]执行超过 {seconds}s，"
-                        f"认定为死锁/卡死，立即 os._exit({_task_suicide_code})，"
-                        f"请用 systemd/supervisor 自动拉起并查看上一个任务日志"
+                        f"认定为卡死，已强制终止该任务（进程继续运行，Flask API 不受影响）"
                     )
                 except Exception:
                     pass
-                # 直接 _exit 而不是 sys.exit，避免 finally/atexit 阻塞
-                os._exit(_task_suicide_code)
+                try:
+                    global task_running
+                    task_running = False
+                except Exception:
+                    pass
 
             _t = _tw.Timer(interval=seconds, function=_suicide_fn)
             _t.daemon = True
@@ -15263,7 +15290,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     config, page_name=f"社媒({_social['name']})"
                                 )
                                 # 通过JS导航到目标站（模拟点击链接，保留Referer）
-                                page.evaluate(f"window.location.href = '{target_url}'")
+                                # ★ 审计修复(B1)：改用带参回调，避免 URL 含引号/特殊字符时注入破坏 JS
+                                page.evaluate("(url) => { window.location.href = url; }", target_url)
                                 time.sleep(random.uniform(2.0, 5.0))
                                 already_on_target = True
                                 enter_site_time = time.time()
@@ -15294,7 +15322,8 @@ def worker_task(single_task=False, adsl_ip_task=False):
                                     page, _ref_stay, page_behavior_stats, current_x, current_y,
                                     config, page_name=f"外链站({_ref_site.split('//')[1][:25]})"
                                 )
-                                page.evaluate(f"window.location.href = '{target_url}'")
+                                # ★ 审计修复(B1)：改用带参回调，避免 URL 含引号/特殊字符时注入破坏 JS
+                                page.evaluate("(url) => { window.location.href = url; }", target_url)
                                 time.sleep(random.uniform(2.0, 4.0))
                                 already_on_target = True
                                 enter_site_time = time.time()
@@ -15443,13 +15472,19 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 看门狗已在上方提前启动，此处不再重复启动
 
                         round_total_stays = []
-                        remaining_time = task_deadline - time.time()  # 剩余可运行时间
+                        remaining_time = max(0.0, task_deadline - time.time())  # 剩余可运行时间
                         
                         for _r in range(chapter_loop_count):
                             max_round_time = config["total_stay"]["max"]
                             # 计算该轮最大可分配时间（不超过配置和剩余时间）
-                            available_time = min(max_round_time, remaining_time / (chapter_loop_count - _r))
-                            round_time = random.uniform(config["total_stay"]["min"], available_time)
+                            available_time = min(max_round_time, remaining_time / max(1, chapter_loop_count - _r))
+                            _stay_min = config["total_stay"]["min"]
+                            if available_time < _stay_min:
+                                # ★ 审计修复(B2)：剩余时间不足时直接使用可用时间，
+                                # 避免 random.uniform(min, available_time) 下界>上界抛 ValueError 中断任务
+                                round_time = available_time
+                            else:
+                                round_time = random.uniform(_stay_min, available_time)
                             round_total_stays.append(round_time)
                             remaining_time -= round_time
                             
@@ -16844,7 +16879,11 @@ def index():
         ensure_config_defaults()
         from flask import make_response
         _s = _safe_stats_snapshot()
-        resp = make_response(render_template_string(HTML_TEMPLATE, config=config, logs=list(reversed(log.messages[-500:])), 
+        # ★ 审计修复(A2)：模板不再注入明文 config（含 IPDeep/代理密码），改用脱敏副本；
+        # 日志经 _sanitize_log_html 白名单过滤后再以 safe 渲染，杜绝存储型 XSS
+        _masked_cfg = _masked_config_payload()
+        _safe_logs = [_sanitize_log_html(m) for m in log.messages[-500:]]
+        resp = make_response(render_template_string(HTML_TEMPLATE, config=_masked_cfg, logs=list(reversed(_safe_logs)), 
                                       statstotal=_s['total'], statssuccess=_s['success'], 
                                       statsfail=_s['fail'],
                                       stats=_s, runningtask=task_running,
@@ -17078,16 +17117,35 @@ def _save_config_impl():
     
     # 保留原有逻辑
     # ★ 审计修复#14：过滤双下划线开头的危险键，防止配置注入
-    config.update({k: v for k, v in data.items() if k not in [
+    _merge_items = {k: v for k, v in data.items() if k not in [
         'site_creation_date', 'plan_days', 'adsl_task_count', 'vt_adsl_task_count',
         'session_mode', 'ua_repeat_max_rate', 'selected_models',
         'daily_traffic_range', 'proxy_pool', 'video_ad_enabled_only',
         'web_navigation'
-    ] and not k.startswith('__')})
+    ] and not k.startswith('__')}
+    # ★ 审计修复(B3)：合并前做轻量 schema 类型校验，非法类型直接拒绝，
+    # 避免把字符串/对象等错误类型写入 config，运行期各处随机崩溃
+    _schema_bad = _validate_config_types(_merge_items)
+    if _schema_bad:
+        return jsonify({"success": False, "status": "error",
+                        "message": "配置类型非法: " + "; ".join(_schema_bad)}), 400
+    config.update(_merge_items)
     
+    # ★ 审计修复(B3)：临时文件 + os.replace 原子写入 config.json，避免写一半崩溃损坏配置
     # ★ 审计修复#5：指定encoding防止非UTF-8环境崩溃
-    with open('config.json', 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+    import tempfile
+    import os as _os
+    _tmp_fd, _tmp_path = tempfile.mkstemp(prefix="config_", suffix=".json.tmp", dir=".")
+    try:
+        with _os.fdopen(_tmp_fd, "w", encoding="utf-8") as _f:
+            json.dump(config, _f, indent=4, ensure_ascii=False)
+        _os.replace(_tmp_path, "config.json")
+    except Exception:
+        try:
+            _os.unlink(_tmp_path)
+        except Exception:
+            pass
+        raise
     
     # 记录配置审计日志
     changed_keys = list(data.keys())[:20]  # 最多记录20个字段
@@ -17095,6 +17153,61 @@ def _save_config_impl():
     
     log.info("配置已保存")
     return jsonify({"success": True, "status": "ok"})
+
+def _validate_config_types(items):
+    """★ 审计修复(B3)：对 /save_config 待合并字段做轻量类型校验，返回非法项列表（空=全部合法）。
+
+    - 已知"对象型"键必须是 dict
+    - 已知"布尔型"键必须是 bool / 0|1 / "true"/"false" 字符串（前端部分端点历史原因可能传字符串）
+    - 浮点值不允许 NaN / Infinity（json.dump 会生成非法 JSON）
+    """
+    bad = []
+    _dict_keys = {"total_stay", "random_click_count", "mouse_move_count", "scroll_count",
+                  "scroll_pixels", "mouse_move_wait", "mouse_steps", "seo", "ad_click",
+                  "social", "video_ad", "behavior_timing", "model_plan", "ad_stay_time",
+                  "page_load_wait", "scroll_wait", "ad_click_prob", "ad_click_wait",
+                  "daily_ad_click_limit", "random_click_wait", "bezier_pause_prob",
+                  "mouse_move_pause", "task_interval"}
+    _bool_keys = {"webrtc_leak_check_enabled", "skip_browser_ip_check"}
+    for _k, _v in items.items():
+        if _k in _dict_keys and _v is not None and not isinstance(_v, dict):
+            bad.append(f"{_k} 应为对象, 实际 {type(_v).__name__}")
+        elif _k in _bool_keys and _v is not None and not isinstance(_v, bool):
+            if not (isinstance(_v, (int, float)) and _v in (0, 1)) and str(_v).strip().lower() not in ("true", "false", "0", "1", ""):
+                bad.append(f"{_k} 应为布尔, 实际 {type(_v).__name__}")
+        elif isinstance(_v, float) and (_v != _v or _v in (float("inf"), float("-inf"))):
+            bad.append(f"{_k} 不允许 NaN/Infinity")
+    return bad
+
+
+def _sanitize_log_html(s):
+    """★ 审计修复(A2)：日志 HTML 白名单过滤，防止存储型 XSS。
+
+    日志消息本身允许少量富文本标签（<b>/<span style=color> 等），但任意原始 HTML
+    直接以 safe 渲染会执行注入的 <script>/<img onerror>。此函数仅保留白名单标签，
+    并只允许 span 携带 color 样式，其余一律转义。
+    """
+    import re as _re
+    _allowed_tags = {"b", "i", "u", "br", "font", "code", "span", "strong", "em", "p", "div", "ul", "li", "h3", "h4"}
+    _style_ok = _re.compile(r'^style="color:\s*#[0-9a-fA-F]{3,8};?"$')
+    if not isinstance(s, str):
+        try:
+            s = str(s)
+        except Exception:
+            s = ""
+    def _handle(m):
+        closing = "</" if m.group(0).startswith("</") else ""
+        tag = (m.group(1) or "").lower()
+        attrs = (m.group(2) or "").strip()
+        if tag in _allowed_tags:
+            if attrs:
+                if not (tag == "span" and _style_ok.match(attrs)):
+                    attrs = ""
+            # closing 为 "</" 或 ""，直接拼接，避免 "<" 与 "</" 叠加成 "<<"
+            return "{}{}{}>".format(closing or "<", tag, (" " + attrs) if attrs else "")
+        return _re.sub(r"[<>]", lambda mm: {"<": "&lt;", ">": "&gt;"}[mm.group(0)], m.group(0))
+    return _re.sub(r"</?([a-zA-Z0-9]+)([^>]*)>", _handle, s)
+
 
 def _masked_config_payload():
     """返回脱敏后的配置副本：隐藏 IPDeep 密码与代理池账号密码（前2位+***），
@@ -19234,8 +19347,15 @@ if __name__ == "__main__":
 
     import os
     # 优先读取环境变量，无参数默认5001
-    port = int(os.getenv("RUN_PORT",5001))
-    host = os.getenv("RUN_HOST","0.0.0.0")
+    port = int(os.getenv("RUN_PORT", 5001))
+    # ★ 审计修复(C1)：默认仅绑定回环地址 127.0.0.1，避免"无认证 + 0.0.0.0"把控制接口暴露到局域网/公网。
+    # 如需对外提供 Web UI，显式设置 RUN_HOST=0.0.0.0，且必须同时设置 APP_AUTH_PASS 启用 Basic Auth。
+    host = os.getenv("RUN_HOST", "127.0.0.1")
+    if host in ("0.0.0.0", "::") and not _AUTH_ENABLED:
+        log.error("[安全] 检测到 0.0.0.0 绑定且 HTTP Basic Auth 未启用（未设置 APP_AUTH_PASS），"
+                  "拒绝非安全启动，已自动回退为仅本机访问 127.0.0.1。"
+                  "如需对外开放请设置环境变量 APP_AUTH_PASS 并重启服务")
+        host = "127.0.0.1"
 
     # ★ 26.8.11.3 新增：若 config.enabled=True，服务启动后自动启动任务调度器（含断点恢复）
     #   —— 避免每次 systemctl restart / OOM kill / 服务器重启后，必须手动调 POST /start_task

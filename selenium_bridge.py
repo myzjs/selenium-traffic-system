@@ -1093,6 +1093,11 @@ class Page:
 
     def close(self, timeout: int = 10000, **kwargs):
         """关闭页面标签"""
+        # 审计修复(E2)：关闭页面前先停止网络请求采集轮询线程，避免线程泄漏/空转
+        try:
+            self._stop_request_collection()
+        except Exception:
+            pass
         try:
             if self._window_handle:
                 # ★ 绑定句柄的弹窗页：先切到自身再关闭，防止误关主窗口
