@@ -70,9 +70,11 @@ import selenium_bridge as _selenium_bridge
 # ========== 应用版本号 ==========
 # ★ 规则三：版本号 = 当天日期 + 当日序号。
 # 26.8.12.2 = 2026-08-12 第二次改动（缺陷修复A-J）
-# 26.8.13.2 = 2026-08-13 第二次改动（第二轮深度审计：A2 日志XSS白名单修复、
-#              A1-A7/B1-B3/C1/D1-D4/E1-E3 共16处 + A2修复自身2个Bug + 新增35条审计测试）
-APP_VERSION = "26.8.13.2"
+# 26.8.13.2 = 2026-08-13 第二次改动（第二轮深度审计）
+# 26.8.13.3 = 2026-08-13 第三次改动（攻防演练按钮默认改红队19场景）
+# 26.8.13.4 = 2026-08-13 第四次改动（根因修复VPS日志写飞Bug：RotatingFileHandler 相对路径→绝对路径；
+#              启动时打印日志绝对路径定位信息，防止以后cwd不同日志找不到）
+APP_VERSION = "26.8.13.4"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2194,12 +2196,27 @@ try:
 except Exception as _rt_e:
     logging.getLogger().warning(f"[WARN] 红队模块加载失败（不影响其它功能）: {_rt_e}")
 # ★ 5.3 日志轮转：RotatingFileHandler（maxBytes=10MB, backupCount=5，总占用≤50MB）
+# 26.8.13.4 ★ 根因修复：之前用相对路径 'app.log'，当 Flask 启动时 cwd ≠ app.py 所在目录
+#   （例如 cd / && nohup python3 /root/selenium_traffic_system/app.py、或者 supervisor 启动），
+#   日志会写到随机位置导致 VPS 上 app.log 一直是 0 字节，用户查 HilltopAds / 广告位判定时完全无数据。
+#   修复：基于 __file__ 解析出 app.py 所在目录的绝对路径，日志文件永远落在 APP_DIR/app.log。
 from logging.handlers import RotatingFileHandler as _RFH
+_APP_DIR = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
+_APP_LOG_ABS = os.path.join(_APP_DIR, "app.log")
 _log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-_file_handler = _RFH('app.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+_file_handler = _RFH(_APP_LOG_ABS, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
 _file_handler.setFormatter(_log_formatter)
 _file_handler.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, logging.StreamHandler()])
+# 可观测性补齐：Flask 启动后（基本配置完）首行明确打印"cwd + 日志绝对路径 + 是否可写"，
+#   以后查日志直接找这个绝对路径，不再需要 find / 全机搜。
+try:
+    _can_write = os.access(_APP_DIR, os.W_OK)
+    logging.getLogger().info(
+        f"[启动元信息] APP_DIR={_APP_DIR} | CWD={os.getcwd()} | APP_LOG(绝对路径)={_APP_LOG_ABS} | dir_writable={_can_write} | APP_VERSION={APP_VERSION}"
+    )
+except Exception as _logmeta_e:
+    logging.getLogger().warning(f"[启动元信息] 打印失败: {_logmeta_e}")
 
 # ★ 5.2 Chromium僵尸进程清理（启动时执行一次 + 每30分钟定时清理）
 def _cleanup_zombie_chromium(min_minutes=10):

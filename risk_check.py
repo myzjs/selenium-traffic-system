@@ -706,7 +706,13 @@ def run_risk_detect(page, proxy_ip, ad_selector=None, expected_timezone=None, ex
                 hit_risk_words.append(f"{kw}(in {k})")
     ua_risk["risk_keywords_hit"] = hit_risk_words
     ua_risk["ua_risk_flag"] = len(hit_risk_words) > 0
-    ua_risk["fixed_chrome_version"] = re.search(r"Chrome\/\d+\.0\.0\.0", ua) is not None
+    # ★ 26.8.13.3 修复误报：真实 Chrome 的 UA 形态就是 Chrome/X.0.0.0（次版本恒为 0），
+    #   旧正则 r"Chrome/\d+\.0\.0\.0" 把正常浏览器也判成"固定版本"。
+    #   仅当 UA 含自动化特征，或 Chrome 版本为占位值(0.0.0.0)时才视为"固定伪造版本"。
+    _m_ver = re.search(r"Chrome/(\d+)\.0\.0\.0", ua)
+    ua_risk["fixed_chrome_version"] = bool(_m_ver) and (
+        bool(ua_risk.get("ua_risk_flag")) or _m_ver.group(1) == "0"
+    )
 
     report["http_header_deep"] = header_deep
     report["http_header"] = {
@@ -1568,7 +1574,20 @@ def run_drill(target_url, headless=True, log_fn=None, progress_fn=None, with_ste
             log_fn("✅ 浏览器已启动")
 
             progress_fn(30, "创建上下文")
-            custom_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            # ★ 26.8.13.3：不再写死 Chrome 版本（旧代码固定 149，与浏览器实际版本 151 不一致，
+            #   触发"UA与Sec-CH-UA不一致"；且真实 Chrome 的 UA 本就带 .0.0.0，不构成异常）。
+            #   改为从浏览器实际版本（caps.browserVersion）动态构建 UA 与 Sec-CH-UA，
+            #   保证 UA / Client Hints 与真实浏览器完全一致。
+            _ua_version = "149"
+            try:
+                _caps = getattr(browser.driver, "caps", {}) or {}
+                _bv = _caps.get("browserVersion") or ""
+                _mv = re.search(r"(\d+)", _bv)
+                if _mv:
+                    _ua_version = _mv.group(1)
+            except Exception:
+                pass
+            custom_ua = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_ua_version}.0.0.0 Safari/537.36"
             context = browser.new_context(
                 locale=LOCALE,
                 timezone_id=TIMEZONE,
@@ -1581,10 +1600,12 @@ def run_drill(target_url, headless=True, log_fn=None, progress_fn=None, with_ste
                     "Sec-Fetch-Dest": "document",
                     "Sec-Fetch-Site": "none",
                     "Sec-Fetch-User": "?1",
-                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="149", "Google Chrome";v="149"',
+                    # ★ 26.8.13.3：Sec-Ch-Ua 版本与 UA 同步动态化（旧代码写死 149 与实际 UA 冲突）
+                    "Sec-Ch-Ua": f'"Not_A Brand";v="8", "Chromium";v="{_ua_version}", "Google Chrome";v="{_ua_version}"',
                     "Sec-Ch-Ua-Mobile": "?0",
                     "Sec-Ch-Ua-Platform": '"Linux"',
-                    "Referer": "https://www.google.com/",
+                    # ★ 26.8.13.3：删除无效 Referer 头 —— CDP setExtraHTTPHeaders 不会产生
+                    #   document.referrer（浏览器忽略导航 Referer 覆盖），Referer 改由下方两步导航产生
                     "Upgrade-Insecure-Requests": "1",
                 },
             )
@@ -1598,7 +1619,15 @@ def run_drill(target_url, headless=True, log_fn=None, progress_fn=None, with_ste
             progress_fn(55, "打开目标页面")
             log_fn(f"🌐 正在打开目标页面: {target_url}")
             try:
-                page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+                # ★ 26.8.13.3：两步导航产生真实 document.referrer ——
+                #   Selenium driver.get() 直接导航不产生 referrer（检测项"空Referer来路"）。
+                #   先访问来源页(google)，再用 JS 跳转目标站，此时 document.referrer = 来源页。
+                try:
+                    page.goto("https://www.google.com/", timeout=30000, wait_until="domcontentloaded")
+                    page.evaluate("location.href = " + json.dumps(target_url))
+                except Exception as e2:
+                    log_fn(f"⚠️ 两步导航异常(降级直接打开): {type(e2).__name__}: {str(e2)[:80]}")
+                    page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
             except Exception as e:
                 log_fn(f"⚠️ 页面加载异常(继续探测): {type(e).__name__}: {str(e)[:80]}")
             time.sleep(3)

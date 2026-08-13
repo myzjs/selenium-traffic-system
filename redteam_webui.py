@@ -537,32 +537,55 @@ def _inject_panels_into_response(app):
         return response
 
 
+import re as _re
+
+
+def _robust_replace_first(html: str, exact: str, regex: str, replacement: str) -> str:
+    """先精确 replace，命中失败再用正则 fallback 匹配，返回 (新html, 是否命中)。
+    用于防止 app.py 模板里的细微空格/引号样式变化导致注入全失效。
+    """
+    if exact and exact in html:
+        return html.replace(exact, replacement, 1), True
+    try:
+        m = _re.search(regex, html)
+    except _re.error:
+        m = None
+    if m:
+        return html[: m.start()] + replacement + html[m.end() :], True
+    return html, False
+
+
 def _do_inject(html: str) -> str:
     """在 HTML 攻防演练面板中插入双 Tab UI 和红队 JS。
-    策略：
+    策略（26.8.13.2 修复：替换按钮默认行为 + 默认展示红队 Tab + 锚点正则容错）：
       1. 找到 <h4 ...>攻防演练（风控漏洞检测）</h4> 面板，在其外层加双 Tab；
-      2. 在 renderDrillReport 之后注入红队 JS。
+      2. 找到 <button id="btnSecurityDrill" onclick="startSecurityDrill()">，
+         把 onclick 换成 startRedTeamDrill()，确保用户点按钮直接进红队 19 场景；
+      3. 默认激活红队 Tab（drillModeRed visible + drillTabRed active）；
+      4. 在 </body> 前注入红队 JS。
     """
-    # ---- 1) 给面板 HTML 加双 Tab UI ----
-    panel_header = "<h4 style=\"margin-top: 0; color: #4a9eff;\">攻防演练（风控漏洞检测）</h4>"
+    # ---- 1) 给面板 HTML 加双 Tab UI（默认红队 active） ----
+    panel_header_exact = "<h4 style=\"margin-top: 0; color: #4a9eff;\">攻防演练（风控漏洞检测）</h4>"
+    panel_header_re = r"<h4\s[^>]*?>\s*攻防演练[（(]风控漏洞检测[)）]\s*</h4>"
+    # 双 Tab 条默认红队 active，drillModeRisk 默认隐藏，drillModeRed 默认可见
     panel_replace = f"""
 <!-- REDTEAM_INJECTED_START_HTML -->
-<!-- 双 Tab 切换条 -->
+<!-- 双 Tab 切换条（默认展示红队） -->
 <div id="drillModeTabs" style="display:flex;gap:6px;margin-bottom:10px;">
-  <button class="tab-btn active" id="drillTabRisk" onclick="switchDrillMode('risk')">🛡️ 风控漏洞检测</button>
-  <button class="tab-btn" id="drillTabRed" onclick="switchDrillMode('red')">🎯 红队反欺诈评估</button>
+  <button class="tab-btn" id="drillTabRisk" onclick="switchDrillMode('risk')">🛡️ 风控漏洞检测</button>
+  <button class="tab-btn active" id="drillTabRed" onclick="switchDrillMode('red')">🎯 红队反欺诈评估（19场景）</button>
 </div>
 
-<!-- 风控检测 Tab 内容（原有内容 + 原有标题） -->
-<div id="drillModeRisk">
-{panel_header}
+<!-- 风控检测 Tab 内容（保留为可选，但默认隐藏） -->
+<div id="drillModeRisk" style="display:none;">
+{panel_header_exact}
 <p style="color:#94a3b8;font-size:13px;margin-top:0;">基于 risk_check.py，对带反检测注入的浏览器访问已勾选目标站进行风控漏洞探测，生成演练报告（保存于 report/ 目录）。</p>
 <!-- 原有进度条/结果容器由外层 HTML 负责（不移动位置，保证原有 startSecurityDrill 工作） -->
 </div>
 
-<!-- 红队评估 Tab 内容（新增） -->
-<div id="drillModeRed" style="display:none;">
-  <h4 style="margin-top:0;color:#dc2626;">🎯 红队反欺诈评估（平台方自检）</h4>
+<!-- 红队评估 Tab 内容（默认显示） -->
+<div id="drillModeRed">
+  <h4 style="margin-top:0;color:#dc2626;">🎯 红队反欺诈评估（19 类攻击场景 · 平台方自检）</h4>
   <p style="color:#94a3b8;font-size:13px;margin-top:0;">
     构造 19 类欺诈流量攻击，每个任务写入 golden label。将反欺诈系统的判定回填 JSONL 后，
     计算 <b>TPR（召回率）/ FPR（误报率）/ F1 / 各维度召回率</b>，精准识别反欺诈系统盲区。
@@ -594,7 +617,7 @@ def _do_inject(html: str) -> str:
     </div>
   </div>
   <div style="display:flex;gap:8px;margin-bottom:10px;">
-    <button class="btn" id="btnRedStart" onclick="startRedTeam()" style="background:#dc2626;color:#fff;">▶️ 开始红队演练</button>
+    <button class="btn" id="btnRedStart" onclick="startRedTeam()" style="background:#dc2626;color:#fff;">▶️ 开始红队演练(19场景)</button>
     <button class="btn" id="btnRedStop" onclick="stopRedTeam()" style="background:#7f1d1d;color:#fff;display:none;">🛑 停止</button>
     <button class="btn" onclick="evaluateRedTeam()" style="background:#3b82f6;color:#fff;">📊 重新评估(回填后)</button>
     <button class="btn" onclick="document.getElementById('redLogBox').innerHTML=''" style="background:#64748b;color:#fff;font-size:12px;">🧹 清空日志</button>
@@ -614,26 +637,30 @@ def _do_inject(html: str) -> str:
 <!-- REDTEAM_INJECTION_MARKER -->
 {_REDTEAM_INJECTION_MARKER}
 """
-    html = html.replace(panel_header, panel_replace, 1)
+    html, panel_hit = _robust_replace_first(html, panel_header_exact, panel_header_re, panel_replace)
 
-    # ---- 2) 移除原"攻防演练"面板中重复的旧标题和旧描述(不影响原面板) ----
-    # 其实旧标题/旧描述已经被替换成新双 Tab，所以原攻防演练描述被移走了。
-    # 把原攻防演练描述也从源中去掉，避免与风控 Tab 重复
+    # ---- 1.5) 替换按钮 onclick（攻防演练按钮 -> 默认进入红队） ----
+    drill_btn_exact = '<button class="btn" style="background:#dc2626;color:#fff;" id="btnSecurityDrill" onclick="startSecurityDrill()">🛡️ 攻防演练</button>'
+    drill_btn_re = r"<button\s[^>]*?id=[\"']btnSecurityDrill[\"'][^>]*?onclick=[\"']startSecurityDrill\(\)[\"'][^>]*>.*?</button>"
+    drill_btn_new = '<button class="btn" style="background:linear-gradient(135deg,#dc2626 0%,#991b1b 100%);color:#fff;" id="btnSecurityDrill" onclick="startRedTeamDrill()">🎯 红队演练(19场景)</button>'
+    html, btn_hit = _robust_replace_first(html, drill_btn_exact, drill_btn_re, drill_btn_new)
+    # 记录命中状态，便于注入 marker
+    _inject_status = f"panel={panel_hit},btn={btn_hit}"
+
+    # ---- 2) 移除原"攻防演练"面板中重复的旧描述 ----
     old_desc = '<p style="color:#94a3b8;font-size:13px;margin-top:0;">基于 risk_check.py，对带反检测注入的浏览器访问已勾选目标站进行风控漏洞探测，生成演练报告（保存于 report/ 目录）。</p>'
-    # 注意：原描述在替换后只出现了一次（在 drillModeRisk 内），其它出现应是旧的
     count = html.count(old_desc)
     if count > 1:
-        # 去掉第一次之后的（保留 drillModeRisk 里的）
         idx = html.find(old_desc)
         if idx >= 0:
             idx2 = html.find(old_desc, idx + len(old_desc))
             if idx2 >= 0:
                 html = html[:idx2] + html[idx2 + len(old_desc):]
 
-    # ---- 3) 注入 JS ----
+    # ---- 3) 注入 JS（在 marker 位置追加命中状态，便于本地测试校验） ----
     js_block = f"""
 <script>
-/* ============ REDTEAM INJECTED JS ============ */
+/* ============ REDTEAM INJECTED JS [status: {_inject_status}] ============ */
 {_REDTEAM_JS}
 /* ============================================== */
 </script>
@@ -648,6 +675,38 @@ def _do_inject(html: str) -> str:
 
 # 注入的 JS（前端逻辑：双Tab切换 + 红队状态轮询 + 评估渲染）
 _REDTEAM_JS = r"""
+// ===== 26.8.13.2 新增：按钮默认行为（攻防演练按钮 → 直接进入红队） =====
+function startRedTeamDrill() {
+  // 1) 先确保顶层大Tab切到「任务验证」（按钮本身在 #tab-taskvalidation 里，不需要再切）
+  if (typeof switchTab === 'function') { try { switchTab('taskvalidation'); } catch(e){} }
+  // 2) 切到红队小Tab
+  try { switchDrillMode('red'); } catch(e){}
+  // 3) 立即预加载 19 场景列表
+  try { loadRedScenariosOnce(); } catch(e){}
+  // 4) 滚动聚焦到红队面板
+  const panel = document.getElementById('drillModeTabs');
+  if (panel) panel.scrollIntoView({behavior:'smooth', block:'center'});
+  // 5) 按钮文案高亮提示
+  const btn = document.getElementById('btnSecurityDrill');
+  if (btn) {
+    const _orig = btn.style.boxShadow;
+    btn.style.boxShadow = '0 0 0 3px rgba(220,38,38,0.35)';
+    setTimeout(()=>{ btn.style.boxShadow = _orig || ''; }, 900);
+  }
+}
+// 页面加载完成后：默认激活红队Tab + 预加载19场景列表（无需等用户点）
+document.addEventListener('DOMContentLoaded', function() {
+  try { switchDrillMode('red'); } catch(e){}
+  setTimeout(() => { try { loadRedScenariosOnce(); } catch(e){} }, 400);
+});
+// 兜底：如果 DOMContentLoaded 已经过了（脚本异步注入），立刻再触发一次
+(function _rt_init_guard(){
+  if (document.readyState === 'interactive' || document.readyState === 'complete') {
+    try { switchDrillMode('red'); } catch(e){}
+    setTimeout(() => { try { loadRedScenariosOnce(); } catch(e){} }, 300);
+  }
+})();
+
 // 双 Tab 切换
 function switchDrillMode(mode) {
   const riskBtn = document.getElementById('drillTabRisk');

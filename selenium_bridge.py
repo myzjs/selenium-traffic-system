@@ -108,7 +108,16 @@ def _launch_chrome_with_timeout(chrome_options):
     """
     from selenium.webdriver.chromium.remote_connection import ChromiumRemoteConnection
     from selenium.webdriver.remote.client_config import ClientConfig
-    from selenium.webdriver.remote.webdriver import WebDriver as _RemoteWebDriver
+    # ★ 26.8.13.3 根因修复：必须用 ChromiumDriver 构造 driver！
+    #   execute_cdp_cmd 是 ChromiumDriver/Chrome 子类专属方法，WebDriver 基类没有。
+    #   之前用基类导致 _apply_context_config 中 UA/时区/屏幕/请求头/cdc 清理
+    #   等全部 CDP 调用抛 AttributeError 被 logger.debug 静默吞掉，
+    #   → 演练 7 项风控特征全部暴露（Headless UA/伦敦时区/800x600 屏幕/空 Referer/cdc 残留）。
+    try:
+        from selenium.webdriver.chromium.webdriver import ChromiumDriver as _RemoteWebDriver
+    except ImportError:
+        # 极老环境无 chromium.webdriver，退回基类（下方 _ensure_cdp_capable 会动态补齐）
+        from selenium.webdriver.remote.webdriver import WebDriver as _RemoteWebDriver
     from selenium.webdriver.common.driver_finder import DriverFinder
 
     service = Service()
@@ -134,6 +143,33 @@ def _launch_chrome_with_timeout(chrome_options):
     )
     driver = _RemoteWebDriver(command_executor=executor, options=chrome_options)
     driver.service = service  # _kill_driver_processes / force_quit_all 依赖此属性
+    # ★ 26.8.13.3 兜底：若最终拿到的 driver 没有 execute_cdp_cmd（基类/特殊环境），
+    #   动态绑定基于 _CDPSession.send 三级兼容实现的同名方法，确保 CDP 链路永不缺席
+    _ensure_cdp_capable(driver)
+    return driver
+
+
+def _ensure_cdp_capable(driver):
+    """★ 26.8.13.3 根因修复：确保 driver 具备 execute_cdp_cmd 能力。
+
+    背景：_launch_chrome_with_timeout 之前用 WebDriver 基类构造 driver，
+    基类没有 execute_cdp_cmd 方法 → 所有 CDP 调用（UA/时区/屏幕/请求头/
+    cdc 清理）抛 AttributeError 被 logger.debug 静默吞掉 → 演练 7 项风控
+    特征全部暴露。此处若 driver 原生缺 execute_cdp_cmd，动态绑定一个基于
+    _CDPSession.send 三级兼容实现（官方 API → driver.execute → 手工注入
+    sessionId）的同名方法。
+    """
+    _native = getattr(driver, "execute_cdp_cmd", None)
+    if _native is not None and callable(_native) and not getattr(_native, "_dynamic_cdp", False):
+        return driver  # 原生能力就绪
+
+    def _execute_cdp_cmd(cmd, cmd_args=None):
+        sess = _CDPSession(driver)
+        return sess.send(cmd, cmd_args or {})
+
+    _execute_cdp_cmd._dynamic_cdp = True  # 标记动态补齐，防 _CDPSession.send 方法1 递归
+    driver.execute_cdp_cmd = _execute_cdp_cmd
+    logger.debug("已为 driver(%s) 动态补齐 execute_cdp_cmd", type(driver).__name__)
     return driver
 
 
@@ -1813,7 +1849,8 @@ class _CDPSession:
         driver = self.driver
 
         # 方法 1：Selenium 4.0+ 原生 execute_cdp_cmd（最稳，优先）
-        if hasattr(driver, "execute_cdp_cmd") and callable(getattr(driver, "execute_cdp_cmd", None)):
+        _native = getattr(driver, "execute_cdp_cmd", None)
+        if _native is not None and callable(_native) and not getattr(_native, "_dynamic_cdp", False):
             try:
                 return driver.execute_cdp_cmd(method, _params)
             except (TypeError, KeyError):
@@ -2004,8 +2041,12 @@ class BrowserContext:
             h = viewport.get("height", 1080)
             try:
                 self.driver.set_window_size(w, h)
+                # ★ 26.8.13.3 修复：setDeviceMetricsOverride 必须带 screenWidth/screenHeight，
+                #   否则 screen.width/height 仍是真实屏幕(如 800x600)，视口 1920x1080 会被
+                #   判定为"视口大于屏幕分辨率"（vw > sw + 20）。
                 self.driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
                     "width": w, "height": h,
+                    "screenWidth": w, "screenHeight": h,
                     "deviceScaleFactor": opts.get("device_scale_factor", 1),
                     "mobile": opts.get("is_mobile", False)
                 })
@@ -2443,10 +2484,15 @@ class Chromium:
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
                 });
-                // 删除cdc_特征
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                // 删除cdc_特征（★ 26.8.13.3：改为动态遍历全部 cdc_/$cdc_ 前缀键，
+                //   旧代码只删 3 个固定键，新 chromedriver 的 _Object/_Proxy/_JSON/_Window 等键会残留）
+                (function() {
+                    for (const k of Object.getOwnPropertyNames(window)) {
+                        if (k.indexOf('cdc_') === 0 || k.indexOf('$cdc_') === 0) {
+                            try { delete window[k]; } catch(e) {}
+                        }
+                    }
+                })();
                 // WebRTC IP泄露保护（保留API但阻止内网IP泄露）
                 (function() {
                     const _origRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
