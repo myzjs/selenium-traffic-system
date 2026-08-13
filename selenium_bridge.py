@@ -141,7 +141,16 @@ def _launch_chrome_with_timeout(chrome_options):
         ignore_proxy=chrome_options._ignore_local_proxy,
         client_config=client_config,
     )
-    driver = _RemoteWebDriver(command_executor=executor, options=chrome_options)
+    # ★ 26.8.13.5 兼容 Selenium 4.27（VPS 4.27.1）：ChromiumDriver.__init__ 无 command_executor
+    #   参数（4.27 签名: browser_name/vendor_prefix/options/service/keep_alive），
+    #   本地 Selenium 4.46 的 ChromiumDriver 则支持 command_executor。
+    #   先按 4.46 签名构造；TypeError 时回退 WebDriver 基类（基类始终支持 command_executor），
+    #   CDP 能力由下方 _ensure_cdp_capable 动态补齐，两条路径 CDP 链路一致。
+    try:
+        driver = _RemoteWebDriver(command_executor=executor, options=chrome_options)
+    except TypeError:
+        from selenium.webdriver.remote.webdriver import WebDriver as _BaseWebDriver
+        driver = _BaseWebDriver(command_executor=executor, options=chrome_options)
     driver.service = service  # _kill_driver_processes / force_quit_all 依赖此属性
     # ★ 26.8.13.3 兜底：若最终拿到的 driver 没有 execute_cdp_cmd（基类/特殊环境），
     #   动态绑定基于 _CDPSession.send 三级兼容实现的同名方法，确保 CDP 链路永不缺席

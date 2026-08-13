@@ -74,7 +74,7 @@ import selenium_bridge as _selenium_bridge
 # 26.8.13.3 = 2026-08-13 第三次改动（攻防演练按钮默认改红队19场景）
 # 26.8.13.4 = 2026-08-13 第四次改动（根因修复VPS日志写飞Bug：RotatingFileHandler 相对路径→绝对路径；
 #              启动时打印日志绝对路径定位信息，防止以后cwd不同日志找不到）
-APP_VERSION = "26.8.13.4"
+APP_VERSION = "26.8.13.6"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -4175,6 +4175,41 @@ def create_ad_monitor():
         # ★ 分段计时法：key -> 当前连续"≥50%可见"分段的起始时间戳（未在曝光态则无记录）
         "exposed50_since": {},
     }
+
+
+def _finalize_ad_monitor(ad_monitor):
+    """★ 26.8.13.6 任务收尾：结算任务结束瞬间仍在曝光态的广告位最后一段曝光时长。
+
+    背景（NameError 修复）：worker 任务结束汇总前调用 _finalize_ad_monitor(ad_monitor)，
+    但函数从未定义 → 每次任务结束抛 NameError，广告监控数据不完整。
+    配合 scan_ads_during_task 的分段计时法：仍在 prev_exposed50 中的广告位，
+    其分段起点记录在 exposed50_since，任务结束时把 [起点, now] 补进累计时长，
+    并判定是否达到有效曝光阈值（config.ad_effective_exposure_ms，默认 1000ms）。
+    收尾逻辑绝不抛异常（不得影响任务结果）。
+    """
+    if not ad_monitor:
+        return ad_monitor
+    try:
+        _now = time.time()
+        _since = ad_monitor.get("exposed50_since") or {}
+        _dur = ad_monitor["exposure_duration_ms"]
+        _eff = ad_monitor["effective_exposed"]
+        _threshold = int(config.get("ad_effective_exposure_ms", 1000) or 1000)
+        for _key, _st in list(_since.items()):
+            _seg_ms = int(max(0.0, _now - _st) * 1000)
+            if _seg_ms <= 0:
+                continue
+            _acc = _dur.get(_key, 0) + _seg_ms
+            _dur[_key] = _acc
+            if _acc >= _threshold:
+                _eff.add(_key)
+        # 清理分段状态，避免重复收尾/重复结算
+        ad_monitor["exposed50_since"] = {}
+        ad_monitor["prev_exposed50"] = set()
+        ad_monitor["last_scan_ts"] = None
+    except Exception as _e:
+        log.warning(f"广告监控收尾结算异常（不影响任务结果）: {_e}")
+    return ad_monitor
 
 
 def scan_ads_during_task(page, ad_monitor, stage="页面"):

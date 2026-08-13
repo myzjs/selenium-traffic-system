@@ -1,9 +1,11 @@
 """
-26.8.13.4 回归测试：
+26.8.13.5 回归测试：
 1. 红队 19 场景模块可导入、场景注册完整（redteam_scenarios / reporter / integration / webui）
 2. selenium_bridge._ensure_cdp_capable 动态补齐 execute_cdp_cmd（无原生方法 / 原生方法存在 / 防递归标记）
 3. _CDPSession.send 方法 1 排除动态绑定方法（防止递归）
 4. risk_check.fixed_chrome_version 误报修复（真实 Chrome UA 不误判，Headless/占位版本才置位）
+5. Selenium 4.27（VPS）ChromiumDriver 无 command_executor 参数 → _launch_chrome_with_timeout
+   必须回退 WebDriver 基类构造（26.8.13.5 修复，防止"所有浏览器启动方式均失败"）
 全部使用 Mock，不依赖真实浏览器 / 网络。
 """
 import os
@@ -273,3 +275,58 @@ class TestFixedChromeVersion:
             f"Headless UA 应判定 fixed_chrome_version: {check}"
         )
         assert check["ua_risk_flag"] is True
+
+
+# ============ 5. Selenium 4.27（VPS）driver 构造兼容 ============
+
+class TestDriverConstructionSelenium427Compat:
+    """VPS Selenium 4.27.1 的 ChromiumDriver 无 command_executor 参数。
+
+    26.8.13.5 修复：_launch_chrome_with_timeout 对 command_executor 构造抛 TypeError
+    时回退 WebDriver 基类（基类始终支持 command_executor），CDP 由 _ensure_cdp_capable 补齐。
+    否则 VPS 上"所有浏览器启动方式均失败"，112 任务计划全部失败。
+    """
+
+    def test_launcher_source_has_typeerror_fallback(self):
+        """源码级护栏：构造 driver 必须存在 TypeError 回退逻辑（防未来被删）"""
+        import inspect
+        import selenium_bridge
+        src = inspect.getsource(selenium_bridge._launch_chrome_with_timeout)
+        assert "except TypeError" in src, "缺少 TypeError 回退分支（Selenium 4.27 兼容）"
+        assert "_BaseWebDriver" in src, "回退分支必须使用 WebDriver 基类构造"
+        assert "_ensure_cdp_capable(driver)" in src, "回退后仍须补齐 CDP 能力"
+
+    def test_some_driver_ctor_supports_command_executor_in_env(self):
+        """当前环境至少有一条构造路径可用：ChromiumDriver(4.46+) 或 WebDriver 基类"""
+        import inspect
+        from selenium.webdriver.chromium.webdriver import ChromiumDriver
+        from selenium.webdriver.remote.webdriver import WebDriver
+        sig_c = inspect.signature(ChromiumDriver.__init__)
+        sig_b = inspect.signature(WebDriver.__init__)
+        assert (
+            "command_executor" in sig_c.parameters
+            or "command_executor" in sig_b.parameters
+        ), "当前环境没有任何支持 command_executor 的 driver 构造路径"
+
+    def test_fallback_uses_webdriver_base_with_cdp_backfill(self):
+        """模拟 4.27 场景：ChromiumDriver 抛 TypeError → 走基类并补齐 CDP。
+
+        直接验证 _ensure_cdp_capable 对"无 execute_cdp_cmd 的对象"能补齐能力
+        （回退到基类后 CDP 链路依赖此函数）。
+        """
+        from selenium_bridge import _ensure_cdp_capable
+
+        class FakeBaseDriver:
+            """模拟 WebDriver 基类：有 command_executor 支持、无 execute_cdp_cmd"""
+            session_id = "s-4-27"
+            def __init__(self):
+                self.execute = MagicMock(return_value={"value": {"ok": 1}})
+                self.command_executor = MagicMock()
+
+        driver = FakeBaseDriver()
+        _ensure_cdp_capable(driver)
+        assert callable(getattr(driver, "execute_cdp_cmd", None))
+        assert getattr(driver.execute_cdp_cmd, "_dynamic_cdp", False) is True
+        # 动态方法能真正发出 CDP 命令（走 driver.execute 兜底）
+        out = driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {"width": 1920})
+        assert out == {"ok": 1}
