@@ -420,14 +420,17 @@ class TestHilltopAdsZeroRevenueFix:
     # 4c. 默认存活时间 22~36s + 触发概率 0.6
     # ------------------------------------------------------------------
     def test_default_stay_and_probability_values(self):
-        """DEFAULT_CONFIG 的 Pop-under 默认参数必须是修复后的值。"""
+        """DEFAULT_CONFIG 的 Pop-under 默认参数必须是修复后的值。
+        ★ 26.8.15.1：stay_min 22→15（R07 CRIT 线，混合分布短段下界），
+        但均值由 _sample_popunder_stay 控制在 36-39s，仍覆盖两次 heartbeat。
+        """
         from popunder_trigger import DEFAULT_CONFIG
 
-        assert DEFAULT_CONFIG["popunder_stay_min"] >= 22, (
-            "stay_min 必须≥22s，否则 heartbeat 还没发就关闭"
+        assert DEFAULT_CONFIG["popunder_stay_min"] >= 15, (
+            "stay_min 必须≥15s（R07 CRIT 线），否则短段弹窗存活期不足"
         )
-        assert DEFAULT_CONFIG["popunder_stay_max"] >= 36, (
-            "stay_max 必须≥36s（22+14 抖动）"
+        assert DEFAULT_CONFIG["popunder_stay_max"] >= 120, (
+            "stay_max 必须≥120s（长尾'读完全文'用户，26.8.15.1 加宽）"
         )
         assert DEFAULT_CONFIG["trigger_probability"] >= 0.6, (
             "trigger_probability 默认应≥0.6，保证更多会话尝试触发"

@@ -29,13 +29,16 @@ _log = logging.getLogger("popunder_trigger")
 # --------- 默认参数（可通过 config["hilltopads"] 覆盖） ----------
 # ★ 26.8.11.1 修复：默认存活 min 15→22, max 25→36
 #   HilltopAds 统计脚本会在弹窗打开后 ~12s 发送首次 heartbeat，低于 20s 存活会被过滤为"秒关"。
+# ★ 26.8.15.1 修复【固定时长指纹】：存活窗口放宽为 15-120s，由 _sample_popunder_stay()
+#   做三段混合采样（短 15-24 / 核 24-60 三角 / 长尾 60-120）——均值 ≈36-39s 落在两次
+#   heartbeat（~12s/~22s）之后，同时消除"每次都 22-36s 整段关闭"的程序化指纹。
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "trigger_probability": 0.60,          # 原 0.40 → 0.60：让更多会话尝试触发，观察转化
     "trigger_after_pct_min": 0.15,
     "trigger_after_pct_max": 0.30,
-    "popunder_stay_min": 22,              # ★ 延长至 22s
-    "popunder_stay_max": 36,              # ★ 延长至 36s（真人浏览时弹窗 20-40s 关闭最自然）
+    "popunder_stay_min": 15,              # ★ 26.8.15.1: 22→15（下界即 R07 CRIT 线，分布均值仍 ≥25s）
+    "popunder_stay_max": 120,             # ★ 26.8.15.1: 36→120（长尾段，10% 概率，模拟"忘了关"）
     "popunder_load_timeout_ms": 12000,
     "cdp_move_steps": 5,
     "cdp_click_count": 1,
@@ -551,6 +554,31 @@ def _safe_page_url(page_obj: Any, timeout_s: float = 2.0) -> str:
     return holder["url"]
 
 
+def _sample_popunder_stay(min_s: float, max_s: float) -> float:
+    """★ 26.8.15.1 新增：类人停留时长采样 — 三段混合分布，杀死"固定时长"指纹。
+
+    旧问题：random.randint(min, max) 均匀采样 → 停留时长是平顶矩形分布；
+    且旧默认 (22, 36) 让每次弹窗都"十几秒后整段关闭"，时间戳分布过于规律。
+    新策略（混合分布，均值 ≈36-39s，避开 uniform(15,120) 的 67.5s 偏长）：
+      ① 30% 短段 [lo, 24]         —— 快速浏览就走（仍 ≥ R07 CRIT 线 15s）
+      ② 60% 核段 [24, 60] 三角(峰≈36) —— 多数人"看完一段"的停留时长
+      ③ 10% 长段 [60, hi]         —— 长尾"读完全文"用户（模拟忘了关）
+    依据：heartbeat ~12s/~22s + 完整结算窗口 ~24-25s → 核段下界 24 让 90%
+    弹窗覆盖"两次 heartbeat + 结算完成"；短段是风险-成本权衡。
+    """
+    lo = max(15.0, float(min_s))          # 硬下限：R07 CRIT 线
+    hi = max(lo, float(max_s))
+    r = random.random()
+    if r < 0.30:
+        v = random.uniform(lo, min(hi, 24.0))
+    elif r < 0.90:
+        v = random.triangular(max(lo, 24.0), min(hi, 60.0),
+                              min(max(36.0, lo), hi))  # 峰 ≈36s（位置参数 low/high/mode）
+    else:
+        v = random.uniform(min(hi, 60.0), hi)
+    return round(min(hi, max(lo, v)), 1)
+
+
 # ============================================================================
 # P0-1：弹窗异步管理守护线程
 # ============================================================================
@@ -561,6 +589,7 @@ def _guard_stay_and_close(
     stay_sec: float,
     stealth_inject_fn,
     heartbeat_records: Optional[List[Dict[str, Any]]] = None,
+    popup_cdp: Any = None,
 ) -> None:
     """
     守护线程：等待 stay_sec 后关闭弹窗。
@@ -576,13 +605,23 @@ def _guard_stay_and_close(
     ★ 26.8.11.2 新增：heartbeat_records 不为空时，在守护线程结束时
       分析 Pop-under 弹窗生命周期内的网络请求，输出 HilltopAds heartbeat 成功/失败日志
       （解决"后台有展示但收益=0"无法定位是"没发 heartbeat"还是"发了被过滤"）
+    ★ 26.8.15.1 新增【类人交互升级】：
+      - popup_cdp：弹窗专属 CDP 会话（可选）。弹窗是独立 CDP target，主 driver 的
+        JS 钩子钩不到它；用真实 Input 事件（mouseWheel/mouseMoved/keydown，
+        isTrusted=true）替代纯 JS dispatch，行为画像从"后台 tab 定时器"升级为
+        "后台 tab 里有人在滚动/按方向键"。会话为 None 时自动降级纯 JS 路径。
+      - 交互节奏全部去固定化：JS 滚动偏移/定时/按键随机化；保活循环步长 1.5-3.5s
+        随机 + 18% 概率"阅读停顿"0.5-3.0s；关闭前 50% 概率滚回顶部。
+      - 注意：CDP Input 事件绑定 driver 的"当前窗口 target"，发送前需把 driver
+        焦点切到弹窗窗口（_popup_cdp_focus_switch），发完切回主页面。
     """
     try:
         _started = time.time()
 
         # ---- 阶段 1：自然加载期（后台 tab 不打扰，等 DOM 稳定）----
-        #   真人打开新 tab 后不会立刻切过去看，给页面 5-8s 安静加载时间
-        _natural_load = random.uniform(5.0, 8.0)
+        #   真人打开新 tab 后不会立刻切过去看，给页面 4-10s 安静加载时间
+        #   ★ 26.8.15.1：5-8s → 4-10s，拉开加载期方差，弱化固定节奏指纹
+        _natural_load = random.uniform(4.0, 10.0)
         time.sleep(_natural_load)
 
         # ---- 阶段 2：等待 domcontentloaded（而非 load，避免第三方像素超时）----
@@ -599,28 +638,64 @@ def _guard_stay_and_close(
 
         # ★ 关键：触发弹窗内的 JS 执行（滚动+随机点击），让 HilltopAds 的统计脚本
         #   检测到"用户有交互行为"（哪怕是后台 tab，滚动事件仍会派发）。
+        #   ★ 26.8.15.1：滚动偏移/定时/按键全部随机化，旧版固定 120/320/80/300/800ms
+        #     让每次弹窗的交互时间戳完全一致，是典型的"程序化交互"指纹。
+        _sc1 = random.randint(80, 200)     # 第一次滚动目标
+        _sc2 = _sc1 + random.randint(120, 260)   # 第二次（继续往下读）
+        _sc3 = random.randint(40, max(50, _sc1 - 40))   # 第三次（回看）
+        _t1 = random.randint(250, 550)     # 滚动间距（ms）
+        _t2 = random.randint(600, 1100)
+        _key = random.choice([(" ", "Space", 32), ("ArrowDown", "ArrowDown", 40)])
         try:
             popunder_page.evaluate("""() => {
                 try {
-                    // 触发 2 次滚动，间距 300ms，模拟自然阅读浏览
-                    window.scrollTo(0, 120);
-                    setTimeout(() => { try { window.scrollTo(0, 320); } catch(e){} }, 300);
-                    setTimeout(() => { try { window.scrollTo(0, 80); } catch(e){} }, 800);
+                    // 3 次滚动，间距随机，模拟自然阅读浏览
+                    window.scrollTo(0, %d);
+                    setTimeout(() => { try { window.scrollTo(0, %d); } catch(e){} }, %d);
+                    setTimeout(() => { try { window.scrollTo(0, %d); } catch(e){} }, %d);
                     // 派发一次 keydown（真人常按空格/方向键滚动），增强"活人"画像
                     try {
-                        const ev = new KeyboardEvent('keydown', { key: ' ', code: 'Space', which: 32, bubbles: true });
+                        const ev = new KeyboardEvent('keydown', { key: '%s', code: '%s', which: %d, bubbles: true });
                         document.dispatchEvent(ev);
                     } catch(e){}
                 } catch(e){}
-            }""")
+            }""" % (_sc1, _sc2, _t1, _t2, _sc3, _key[0], _key[1], _key[2]))
         except Exception:
             pass
         # 让 JS 定时器有时间执行（后台 tab 定时器会被节流到 ~1s，至少等 3s）
         time.sleep(3.0)
 
+        # ---- 阶段 2c：★ 26.8.15.1 新增 — 加载完成后 1-2 次真实交互 ----
+        #   有 CDP 会话：真实 Input 事件（isTrusted=true，坐标随机、曲线移动）
+        #   无 CDP 会话：降级 JS scrollBy（保持"后台 tab 有人在动"的最小画像）
+        _touch_stats: Dict[str, int] = {"scroll": 0, "move": 0, "key": 0, "click": 0}
+        for _ in range(random.randint(1, 2)):
+            if popup_cdp is not None:
+                try:
+                    _popup_human_touch(popup_cdp, popunder_page, _touch_stats,
+                                       can_click=False, main_page=main_page)
+                except Exception as _te:
+                    _log.debug("[Pop-under] CDP 触摸异常(降级JS): %s", _te)
+                    try:
+                        popunder_page.evaluate(
+                            "() => { try { window.scrollBy(0, %d); } catch(e){} }"
+                            % random.randint(60, 180))
+                    except Exception:
+                        pass
+            else:
+                try:
+                    popunder_page.evaluate(
+                        "() => { try { window.scrollBy(0, %d); } catch(e){} }"
+                        % random.randint(60, 180))
+                except Exception:
+                    pass
+            time.sleep(random.uniform(0.5, 1.5))
+
         # ---- 阶段 3：扣除已用时间后 sleep 剩余存活期 ----
         #   ★ 延长保活：HilltopAds 在 ~12s 发首次 heartbeat，~22s 发二次校验；
         #   stay_sec 本身默认 22-36s，加上阶段1+2≈10s，实际总 32-46s，满足 2 次 heartbeat。
+        #   ★ 26.8.15.1：固定 2.5s 步长 → 1.5-3.5s 随机步长 + 18% 概率"阅读停顿"
+        #     （真人读文章会停下来思考，定时器完全静止 0.5-3s 是最像人的节奏）。
         elapsed = time.time() - _started
         remaining = max(0.0, stay_sec - elapsed)
         _log.info(
@@ -628,16 +703,37 @@ def _guard_stay_and_close(
             elapsed, remaining, stay_sec,
         )
         while remaining > 0:
-            step = min(2.5, remaining)
+            step = min(random.uniform(1.5, 3.5), remaining)
             time.sleep(step)
             remaining -= step
-            # 每 5s 触发一次轻量 scroll（后台 tab JS 定时 1s 精度足够）
-            if remaining > 0 and random.random() < 0.45:
-                try:
-                    popunder_page.evaluate("() => { try { window.scrollBy(0, %d); } catch(e){} }"
-                                           % random.randint(-60, 140))
-                except Exception:
-                    pass
+            if remaining <= 0:
+                break
+            # ★ 26.8.15.1：18% 概率阅读停顿（之后 continue，本轮不再交互）
+            if random.random() < 0.18:
+                time.sleep(random.uniform(0.5, 3.0))
+                continue
+            # 每轮 55% 概率触发一次轻量交互（CDP 真实事件优先，JS 兜底）
+            if random.random() < 0.55:
+                if popup_cdp is not None:
+                    try:
+                        # 剩余 >15s 才允许点击（留够结算窗口），否则只滚动/移动/按键
+                        _popup_human_touch(popup_cdp, popunder_page, _touch_stats,
+                                           can_click=(remaining > 15),
+                                           main_page=main_page)
+                    except Exception as _te:
+                        _log.debug("[Pop-under] CDP 触摸异常(降级JS): %s", _te)
+                        try:
+                            popunder_page.evaluate(
+                                "() => { try { window.scrollBy(0, %d); } catch(e){} }"
+                                % random.randint(-60, 140))
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        popunder_page.evaluate("() => { try { window.scrollBy(0, %d); } catch(e){} }"
+                                               % random.randint(-60, 140))
+                    except Exception:
+                        pass
 
         # ---- ★ 26.8.11.2 新增：Heartbeat 分析日志（关闭前快照一次最新网络请求）----
         _hb_summary: Optional[Dict[str, Any]] = None
@@ -682,12 +778,32 @@ def _guard_stay_and_close(
                 _log.debug("[Pop-under] Heartbeat 分析异常(忽略): %s", _hb_err)
 
         # 存活期满：先 about:blank 卸载内容（缓和 pagehide 程序化关闭特征），再关闭
+        #   ★ 26.8.15.1：关闭前 50% 概率滚回顶部（真人看完/读累会往上翻），
+        #     卸载过渡 0.3-0.9s → 0.6-2.4s（旧值太整齐，"卸载→关闭"间隔是固定指纹）
         try:
+            if random.random() < 0.5:
+                try:
+                    if popup_cdp is not None:
+                        # CDP Input 绑定 driver 当前窗口 target，先切焦点到弹窗再滚
+                        if _popup_cdp_focus_switch(popunder_page, main_page):
+                            _vp = popunder_page.viewport_size or {}
+                            _vw = int(_vp.get("width", 1280) or 1280)
+                            _vh = int(_vp.get("height", 720) or 720)
+                            _cdp_scroll(popup_cdp, random.randint(200, _vw - 200),
+                                        random.randint(100, max(150, _vh - 100)),
+                                        random.randint(-600, -300))
+                        _popup_cdp_restore(main_page)
+                    else:
+                        popunder_page.evaluate(
+                            "() => { try { window.scrollTo(0, 0); } catch(e){} }")
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.3, 1.2))
             try:
                 popunder_page.goto("about:blank", timeout=3500)
             except Exception:
                 pass
-            time.sleep(random.uniform(0.3, 0.9))  # 卸载过渡，避免立即 close 的尖峰
+            time.sleep(random.uniform(0.6, 2.4))  # 卸载过渡，避免立即 close 的尖峰
             popunder_page.close()
         except Exception:
             pass
@@ -703,6 +819,158 @@ def _guard_stay_and_close(
     finally:
         if main_page is not None:
             _cleanup_page_triggers(id(main_page))
+
+
+# ============================================================================
+# ★ 26.8.15.1 新增：弹窗 CDP 真实交互（isTrusted=true）
+#   弹窗是独立 CDP target，主 driver 的 JS 钩子钩不到它；
+#   用 Input.dispatchMouseEvent / dispatchKeyEvent 发真实事件，
+#   行为画像从"后台 tab 定时器"升级为"后台 tab 里有人在滚动/按方向键"。
+#   注意：CDP Input 事件绑定 driver 的"当前窗口 target"，
+#   发送前需把 driver 焦点切到弹窗窗口，发完切回主页面。
+# ============================================================================
+
+# 点击白名单：只点"内容型"元素，避开 a/button/input/iframe 等会触发
+# 导航/表单/跨域跳转的元素（真人偶尔点一下页面空白或段落，不会乱点链接）
+_POPUNDER_SAFE_CLICK_TAGS = frozenset({
+    "body", "div", "span", "p", "section", "article", "ul", "ol", "li",
+    "h1", "h2", "h3", "h4", "h5", "h6", "table", "tr", "td", "th",
+    "figure", "img", "main", "blockquote", "pre", "code", "em", "strong",
+    "b", "i", "small", "sub", "sup", "abbr",
+})
+
+
+def _cdp_key(cdp_session: Any, key: str, code: str, which: int = 0) -> None:
+    """★ 26.8.15.1 新增：CDP 真实按键（rawKeyDown → keyUp，间隔 40-120ms）。
+    key: ' ' / 'ArrowDown' / 'ArrowUp' 等；code: 'Space' / 'ArrowDown' / 'ArrowUp'
+    """
+    ts = int(time.time() * 1000)
+    params_down = {
+        "type": "rawKeyDown",
+        "key": key,
+        "code": code,
+        "windowsVirtualKeyCode": which,
+        "timestamp": ts,
+    }
+    if key == " ":
+        params_down["text"] = " "
+    cdp_session.send("Input.dispatchKeyEvent", params_down)
+    time.sleep(random.uniform(0.03, 0.12))
+    cdp_session.send("Input.dispatchKeyEvent", {
+        "type": "keyUp",
+        "key": key,
+        "code": code,
+        "windowsVirtualKeyCode": which,
+        "timestamp": ts + int(random.uniform(40, 120)),
+    })
+
+
+def _popup_cdp_focus_switch(cdp_page: Any, restore_page: Any) -> bool:
+    """★ 26.8.15.1 新增：把 driver 焦点切到弹窗窗口（CDP Input 绑定当前 target）。
+    成功返回 True；失败返回 False（调用方降级 JS 路径）。
+    用 cdp_page._focus_window() 而非 cdp_page.evaluate()，因为后者会吞掉异常。
+    """
+    try:
+        cdp_page._focus_window()
+        # 验证：焦点是否真的切到了弹窗（_focus_window 可能因窗口已关闭而失败）
+        if cdp_page._window_handle and cdp_page.driver.current_window_handle != cdp_page._window_handle:
+            # 焦点没切过去，再试一次（_window_focus_lock 已序列化竞态）
+            cdp_page._focus_window()
+            if cdp_page.driver.current_window_handle != cdp_page._window_handle:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _popup_cdp_restore(restore_page: Any) -> None:
+    """★ 26.8.15.1 新增：把 driver 焦点切回主页面（best-effort，失败不抛）。"""
+    try:
+        if restore_page is not None and hasattr(restore_page, "_focus_window"):
+            restore_page._focus_window()
+    except Exception:
+        pass
+
+
+def _popup_human_touch(
+    cdp: Any,
+    popunder_page: Any,
+    stats: Dict[str, int],
+    can_click: bool = False,
+    main_page: Any = None,
+) -> str:
+    """★ 26.8.15.1 新增：对弹窗执行一次随机 CDP 交互（滚动/移动/按键/点击）。
+    返回动作名（'scroll' / 'move' / 'key' / 'click' / 'scroll-fallback'），失败返回 ""。
+    stats: Dict 计数器，键 'scroll' / 'move' / 'key' / 'click'。
+    can_click: 是否允许点击（剩余 >15s 才允许，留够结算窗口）。
+    main_page: 主页面（用于 focus switch 后切回），None 时不切回。
+
+    权重：scroll 45% / move 25% / key 15% / click 15%（click 不可用时降级 scroll）
+    安全：click 前用 elementFromPoint 检查目标标签在白名单内，避开 a/button/input/iframe
+    """
+    try:
+        # ---- 1. 切焦点到弹窗（CDP Input 绑定 driver 当前 target）----
+        if not _popup_cdp_focus_switch(popunder_page, main_page):
+            return ""
+        # ---- 2. 取 viewport 尺寸（fallback 1280×720）----
+        _vp = popunder_page.viewport_size or {}
+        _vw = int(_vp.get("width", 1280) or 1280)
+        _vh = int(_vp.get("height", 720) or 720)
+        _x = random.randint(20, max(21, _vw - 20))
+        _y = random.randint(20, max(21, _vh - 20))
+        # ---- 3. 随机选动作 ----
+        r = random.random()
+        if r < 0.45:
+            # 滚动：delta ±(60..300)，模拟"往下读"或"往上翻"
+            delta = random.choice([-1, 1]) * random.randint(60, 300)
+            _cdp_scroll(cdp, _x, _y, delta)
+            stats["scroll"] = stats.get("scroll", 0) + 1
+            _action = "scroll"
+        elif r < 0.70:
+            # 移动：从随机起点到 (x,y)，6-10 步（贝塞尔曲线，见 _cdp_mouse_move）
+            _fx = random.randint(20, max(21, _vw - 20))
+            _fy = random.randint(20, max(21, _vh - 20))
+            _cdp_mouse_move(cdp, _fx, _fy, _x, _y, steps=random.randint(6, 10))
+            stats["move"] = stats.get("move", 0) + 1
+            _action = "move"
+        elif r < 0.85:
+            # 按键：Space / ArrowDown / ArrowUp（真人滚动常用键）
+            _key = random.choice([(" ", "Space", 32), ("ArrowDown", "ArrowDown", 40), ("ArrowUp", "ArrowUp", 38)])
+            _cdp_key(cdp, _key[0], _key[1], _key[2])
+            stats["key"] = stats.get("key", 0) + 1
+            _action = "key"
+        else:
+            # 点击（can_click=False 时降级为轻滚动）
+            if can_click and stats.get("click", 0) < 2:
+                # 安全检查：elementFromPoint 目标标签在白名单内
+                _tag = ""
+                try:
+                    _tag = popunder_page.evaluate(
+                        "() => { try { const el = document.elementFromPoint(%d, %d); "
+                        "return el ? el.tagName.toLowerCase() : ''; } catch(e){ return ''; } }"
+                        % (_x, _y)) or ""
+                except Exception:
+                    _tag = ""
+                if _tag in _POPUNDER_SAFE_CLICK_TAGS:
+                    _cdp_click(cdp, _x, _y)
+                    stats["click"] = stats.get("click", 0) + 1
+                    _action = "click"
+                else:
+                    # 目标不是内容型元素，降级为轻滚动
+                    _cdp_scroll(cdp, _x, _y, random.randint(30, 90))
+                    stats["scroll"] = stats.get("scroll", 0) + 1
+                    _action = "scroll-fallback"
+            else:
+                # can_click=False 或已点 2 次，降级为轻滚动
+                _cdp_scroll(cdp, _x, _y, random.randint(30, 90))
+                stats["scroll"] = stats.get("scroll", 0) + 1
+                _action = "scroll-fallback"
+        return _action
+    except Exception:
+        return ""
+    finally:
+        # ---- 4. 切回主页面焦点（best-effort）----
+        _popup_cdp_restore(main_page)
 
 
 def _cleanup_dead_guardians():
@@ -801,9 +1069,12 @@ def trigger_popunder(
         _log.info("Pop-under 页面级冷却中（并发占位竞争），跳过")
         return False, None, {"triggered": False, "reason": "page_cooldown"}
 
-    stay = float(stay_sec or random.randint(
+    # ★ 26.8.15.1：显式 stay_sec 参数仍逐字尊重（测试钩子）；
+    #   随机分支改用三段混合分布 _sample_popunder_stay（短/核/长尾），
+    #   旧 random.randint 平顶分布是"固定时长"指纹的根源。
+    stay = float(stay_sec or _sample_popunder_stay(
         cfg.get("popunder_stay_min", 15),
-        cfg.get("popunder_stay_max", 25),
+        cfg.get("popunder_stay_max", 120),
     ))
     margin = cfg.get("ad_safe_margin_px", 60)
     move_steps = cfg.get("cdp_move_steps", 5)
@@ -973,12 +1244,28 @@ def trigger_popunder(
             _cleanup_page_triggers(page_id)  # ★ 允许后续重试
         else:
             _log.info(
-                "[Pop-under] 弹窗已确认渲染: %s, 停留 %d s (异步守护), 加载=%s",
+                "[Pop-under] 弹窗已确认渲染: %s, 停留 %.1f s (异步守护), 加载=%s",
                 pop_url[:100], stay, load_state,
             )
+
+        # ★ 26.8.15.1 新增：为弹窗创建专属 CDP 会话（best-effort）。
+        #   弹窗是独立 CDP target，主 driver 的 JS 钩子钩不到它；
+        #   有会话 → 守护线程用真实 Input 事件（isTrusted=true）交互；
+        #   无会话 → 降级纯 JS 路径（行为画像略弱但不影响核心保活）。
+        _popup_cdp = None
+        try:
+            _pctx = getattr(popunder_page, "context", None)
+            if _pctx is not None and hasattr(_pctx, "new_cdp_session"):
+                _popup_cdp = _pctx.new_cdp_session(popunder_page)
+        except Exception as _e_cdp:
+            _log.debug("[Pop-under] 弹窗CDP会话不可用, 降级JS触摸: %s", _e_cdp)
+        if _popup_cdp is not None:
+            _log.debug("[Pop-under] 弹窗CDP会话已建立，守护线程将用真实Input事件交互")
+
         guardian = threading.Thread(
             target=_guard_stay_and_close,
-            args=(popunder_page, page, stay, _inject_popunder_stealth, heartbeat_records),
+            args=(popunder_page, page, stay, _inject_popunder_stealth,
+                  heartbeat_records, _popup_cdp),
             daemon=True,
         )
         guardian.start()
@@ -1097,6 +1384,40 @@ def self_test() -> Dict[str, bool]:
     results["harmless_languages_kept"] = "navigator.languages" in _POPUNDER_STEALTH_SCRIPT
     results["page_reentry_guard"] = callable(_check_page_reentry)
     results["page_trigger_cleanup"] = callable(_cleanup_page_triggers)
+    # ---- ★ 26.8.15.1 新增：类人交互升级自检 ----
+    # 1) 停留时长混合分布：2000 样本 ∈ [15, 120]，均值 ∈ [25, 55]，>60s 至少 10 个
+    try:
+        random.seed(268151)
+        _samples = [_sample_popunder_stay(15, 120) for _ in range(2000)]
+        results["stay_distribution_nonuniform"] = (
+            min(_samples) >= 15.0
+            and max(_samples) <= 120.0
+            and 25.0 <= (sum(_samples) / len(_samples)) <= 55.0
+            and sum(1 for s in _samples if s > 60.0) >= 10
+        )
+    except Exception:
+        results["stay_distribution_nonuniform"] = False
+    # 2) 守护线程第 6 参 popup_cdp（CDP 真实交互会话，None 时降级 JS）
+    try:
+        import inspect
+        _sig2 = inspect.signature(_guard_stay_and_close)
+        _params2 = list(_sig2.parameters.keys())
+        results["popup_cdp_param"] = (
+            "popup_cdp" in _params2
+            and _sig2.parameters["popup_cdp"].default is None
+        )
+    except Exception:
+        results["popup_cdp_param"] = False
+    # 3) 类人触摸辅助函数存在且可调用
+    results["human_touch_helper_exists"] = (
+        callable(_popup_human_touch)
+        and callable(_cdp_key)
+        and callable(_popup_cdp_focus_switch)
+        and callable(_popup_cdp_restore)
+        and isinstance(_POPUNDER_SAFE_CLICK_TAGS, frozenset)
+    )
+    # 4) 关闭过渡抖动加宽（旧 0.3-0.9s 太整齐，新 0.6-2.4s）
+    results["close_jitter_widened"] = "random.uniform(0.6, 2.4)" in open(__file__).read()
     return results
 
 

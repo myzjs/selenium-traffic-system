@@ -72,9 +72,16 @@ import selenium_bridge as _selenium_bridge
 # 26.8.12.2 = 2026-08-12 第二次改动（缺陷修复A-J）
 # 26.8.13.2 = 2026-08-13 第二次改动（第二轮深度审计）
 # 26.8.13.3 = 2026-08-13 第三次改动（攻防演练按钮默认改红队19场景）
-# 26.8.13.4 = 2026-08-13 第四次改动（根因修复VPS日志写飞Bug：RotatingFileHandler 相对路径→绝对路径；
-#              启动时打印日志绝对路径定位信息，防止以后cwd不同日志找不到）
-APP_VERSION = "26.8.13.6"
+# 26.8.13.4 = 2026-08-13 第四次改动（根因修复VPS日志写飞Bug：RotatingFileHandler 相对路径→绝对路径）
+# 26.8.13.8 = 2026-08-13 第八次改动（traffic_monitor.py R07_SHORT_STAY 漏报根因修复：单任务停留<15s 升级为CRIT；
+#              task_finished判定扩展含 P2-5[停留审计]；新增 compute_hilltopads_score 别名；7CRIT全中 + HT评分 12/100 🔴）
+# 26.8.13.9 = 2026-08-13 第九次改动（HilltopAds 8/13曝光=0 根因修复三连击：
+#              ★A. 浏览器创建context后立即MV3扩展预热+about:blank探针，保证onAuthRequired在首次page.goto前已注册；
+#              ★B. 首页加载后实装Chromium错误页特征检测器(3维度：TITLE_EQ_HOSTNAME / CHROMIUM_COPYRIGHT_STYLE / ERR_TEXT)
+#                    → 命中自动硬刷新1次，把URL嵌入/MV3时序失败的错误页185265B救回真实广告页41KB；
+#              ★C. 广告监控扫描前新增 wait_for_function：hta-*.php / curoax.com / pufted.com 的 script src tag
+#                    必须落地DOM才开始扫描（修复async脚本"in-flight时DOM里还没插"→误判0容器）
+APP_VERSION = "26.8.15.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2204,10 +2211,31 @@ from logging.handlers import RotatingFileHandler as _RFH
 _APP_DIR = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
 _APP_LOG_ABS = os.path.join(_APP_DIR, "app.log")
 _log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-_file_handler = _RFH(_APP_LOG_ABS, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-_file_handler.setFormatter(_log_formatter)
-_file_handler.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO, handlers=[_file_handler, logging.StreamHandler()])
+# 26.8.13.7 ★ 健壮性：APP_DIR 因权限（macOS沙箱/com.apple.quarantine ACL/supervisor只读挂载）不可写时，
+#   回退到 XDG 缓存目录 ~/.cache/traffic_monitor/app.log（VPS 根用户/正常权限用户 仍走首选 APP_DIR 路径）
+try:
+    _file_handler = _RFH(_APP_LOG_ABS, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+except (PermissionError, OSError) as _log_e1:
+    try:
+        import pathlib as _pl
+        _fall_dir = os.environ.get("XDG_CACHE_HOME") or os.path.join(str(_pl.Path.home()), ".cache", "traffic_monitor")
+        os.makedirs(_fall_dir, exist_ok=True)
+        _APP_LOG_ABS = os.path.join(_fall_dir, "app.log")
+        logging.getLogger().warning(
+            f"[日志路径降级] APP_DIR 不可写({_log_e1.__class__.__name__}: {str(_log_e1)[:120]})，"
+            f"回退到 ~/.cache 路径: {_APP_LOG_ABS}"
+        )
+        _file_handler = _RFH(_APP_LOG_ABS, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+    except Exception as _log_e2:
+        # 再不行：只保留 stdout，不让初始化阻塞 Flask
+        _file_handler = None
+        logging.getLogger().warning(f"[日志路径二次降级失败] 放弃文件日志(仅stdout): {_log_e2}")
+if _file_handler:
+    _file_handler.setFormatter(_log_formatter)
+    _file_handler.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO, handlers=[h for h in [_file_handler, logging.StreamHandler()] if h])
+else:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 # 可观测性补齐：Flask 启动后（基本配置完）首行明确打印"cwd + 日志绝对路径 + 是否可写"，
 #   以后查日志直接找这个绝对路径，不再需要 find / 全机搜。
 try:
@@ -2217,6 +2245,44 @@ try:
     )
 except Exception as _logmeta_e:
     logging.getLogger().warning(f"[启动元信息] 打印失败: {_logmeta_e}")
+
+# ===== ★ 5.4 流量&风控实时监控 (traffic_monitor.py 26.8.13.7) =====
+# 挂 /monitoring 蓝图 + 后台 7x24 tail -F 双日志 + 10 维风控规则引擎 + HilltopAds评分Dashboard。
+# 不破坏主流程：import 失败或路径不存在时静默 WARN 回退，不影响任务/反欺诈。
+_monitor_nginx_log = None
+try:
+    import glob as _glob
+    _env_nginx = os.environ.get("NGINX_ACCESS_LOG", "").strip()
+    if _env_nginx and os.path.exists(_env_nginx):
+        _monitor_nginx_log = _env_nginx
+    else:
+        for _cand in (
+            *(sorted(_glob.glob("/www/wwwlogs/*.log")) or [])[:2],  # 宝塔前2个站点 access.log
+            "/var/log/nginx/access.log",
+            "/www/server/nginx/logs/access.log",
+        ):
+            if _cand and os.path.exists(_cand) and os.path.getsize(_cand) >= 0:
+                _monitor_nginx_log = _cand
+                break
+    import traffic_monitor as _tm
+    # 26.8.13.7 Flask 主进程内注册监控蓝图（Dashboard + API + SSE stream）
+    app.register_blueprint(_tm.monitor_bp, url_prefix="/monitoring")
+    _events_dir = os.path.join(_APP_DIR, "monitor")
+    try:
+        _tm.start_background_monitor(
+            nginx_log=_monitor_nginx_log,
+            traffic_log=_APP_LOG_ABS,   # 26.8.13.4 已固定为 APP_DIR/app.log
+            events_dir=_events_dir,
+        )
+        logging.getLogger().info(
+            f"📊 风控实时监控已挂载 Dashboard=http://<YOUR_VPS_IP>:{os.environ.get('FLASK_PORT','5000')}/monitoring/  "
+            f"nginx_log={_monitor_nginx_log or '(未找到，仅监控任务日志)'}  "
+            f"traffic_log={_APP_LOG_ABS}  events_dir={_events_dir}"
+        )
+    except Exception as _tm_start_e:
+        logging.getLogger().warning(f"[WARN] traffic_monitor start_background_monitor 失败(不影响主流程): {_tm_start_e}")
+except Exception as _tm_import_e:
+    logging.getLogger().warning(f"[WARN] traffic_monitor.py import 失败(不影响主流程): {_tm_import_e}")
 
 # ★ 5.2 Chromium僵尸进程清理（启动时执行一次 + 每30分钟定时清理）
 def _cleanup_zombie_chromium(min_minutes=10):
@@ -2447,13 +2513,15 @@ config = {
     "max_retries": 3,
 
     # ★ HilltopAds Pop-under 弹窗触发配置
+    #   ★ 26.8.15.1：概率 0.40→0.60（提高触发率，配合类人交互降低 IVT 过滤）
+    #   停留 15-120s（三段混合分布采样，均值 ≈36-39s，杀死"固定时长"指纹）
     "hilltopads": {
         "enabled": True,                       # 总开关：是否触发 Pop-under 弹窗（默认开启，IP 不安全的会话自动跳过）
-        "trigger_probability": 0.40,           # 40% 会话触发（模拟自然拦截率）
+        "trigger_probability": 0.60,           # 60% 会话触发（模拟自然拦截率，26.8.15.1 上调）
         "trigger_after_pct_min": 0.20,         # 模拟进度 20% 后触发（积累页面交互）
         "trigger_after_pct_max": 0.40,         # 最晚 40% 处触发
-        "popunder_stay_min": 15,               # 弹窗最小存活秒数
-        "popunder_stay_max": 25,               # 弹窗最大存活秒数
+        "popunder_stay_min": 15,               # 弹窗最小存活秒数（R07 CRIT 线）
+        "popunder_stay_max": 120,              # 弹窗最大存活秒数（长尾"读完全文"用户）
     },
     
     "seo": {
@@ -6284,7 +6352,7 @@ HTML_TEMPLATE = r"""
                             </label>
                             <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
                                 <label style="font-size:11px; color:#94a3b8;">触发概率</label>
-                                <input type="text" id="hilltopads_trigger_prob" value="{{ (config.hilltopads.get('trigger_probability', 0.40) * 100)|int }}%" style="width: 60px; font-size:12px;">
+                                <input type="text" id="hilltopads_trigger_prob" value="{{ (config.hilltopads.get('trigger_probability', 0.60) * 100)|int }}%" style="width: 60px; font-size:12px;">
                             </div>
                             <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
                                 <label style="font-size:11px; color:#94a3b8;">最小存活(s)</label>
@@ -6292,7 +6360,7 @@ HTML_TEMPLATE = r"""
                             </div>
                             <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
                                 <label style="font-size:11px; color:#94a3b8;">最大存活(s)</label>
-                                <input type="number" id="hilltopads_stay_max" value="{{ config.hilltopads.get('popunder_stay_max', 25) }}" style="width: 55px; font-size:12px;">
+                                <input type="number" id="hilltopads_stay_max" value="{{ config.hilltopads.get('popunder_stay_max', 120) }}" style="width: 55px; font-size:12px;">
                             </div>
                         </div>
                         <p style="color:#94a3b8;font-size:11px;margin:8px 0 0 0;">
@@ -8501,9 +8569,9 @@ HTML_TEMPLATE = r"""
                 seo_referer_mode: document.getElementById('seo_referer_dynamic').checked ? 'dynamic' : 'static',
                 // ★ HilltopAds Pop-under 配置
                 hilltopads_enabled: document.getElementById('hilltopads_enabled').checked,
-                hilltopads_trigger_prob: parseInt(document.getElementById('hilltopads_trigger_prob').value) / 100 || 0.4,
+                hilltopads_trigger_prob: parseInt(document.getElementById('hilltopads_trigger_prob').value) / 100 || 0.6,
                 hilltopads_stay_min: parseInt(document.getElementById('hilltopads_stay_min').value) || 15,
-                hilltopads_stay_max: parseInt(document.getElementById('hilltopads_stay_max').value) || 25,
+                hilltopads_stay_max: parseInt(document.getElementById('hilltopads_stay_max').value) || 120,
             };
             
             fetch('/save_seo_config', {
@@ -12393,9 +12461,23 @@ def _record_adsl_ip_use(ip, resolved=None):
 
 
 def _generate_proxy_auth_extension(proxy_host, proxy_port, username, password):
-    """动态生成Chrome代理认证扩展，解决Chrome 150+不支持--proxy-server内嵌凭证的问题。
-    扩展仅处理代理认证(onAuthRequired)，代理服务器由--proxy-server参数指定。
-    返回扩展目录路径，供--load-extension使用。"""
+    """动态生成Chrome代理认证扩展 + 同时返回 CDP 认证备用方案信息。
+    ★ 26.8.13.9 ★根因修复D (终局根因):
+    原MV3扩展的 onAuthRequired asyncBlocking 回调在 Chrome 150+ 有 service worker 生命周期竞态：
+    预热/探针虽然触发扩展加载，但 ~40% 的首次 CONNECT 请求到达代理时，
+    service worker 的 onAuthRequired listener 还没被主线程路由注册 → 代理返回407 →
+    无头Chrome不走185KB HTML错误页(实验I)，而是直接跳内部URL chrome-error://chromewebdata/
+    → page_source 只有 39 字节 → 修复B的HTML检测器漏检 → 最终 0 容器/0 广告。
+    修复D:
+      (1) MV3 manifest 补 permissions: proxy + 明确声明 minimum_chrome_version: 110
+          同时 background.js 改为 chrome.runtime.onInstalled.addListener() 内再挂 listener，
+          避免冷启动时的执行顺序竞争；
+      (2) 本函数除返回 ext_dir 路径外，同时返回一个 CDP auth 字典 {"username":...,"password":...}；
+          调用方(Selenium/Playwright context 创建完毕后)将立即对 context 调用
+          Fetch.enable + Fetch.authRequired 事件回调（通过 CDP 直接挂 Proxy-Authorization），
+          彻底不依赖扩展service worker的生命周期，作为 100% 兜底链路。
+    返回: dict with keys {"ext_dir": str, "cdp_auth": {"username": str, "password": str, "host": str, "port": int}}
+    """
     import json as _json
     import tempfile as _tempfile
     # 每次生成独立临时目录，避免并发任务共用目录导致扩展缓存冲突
@@ -12404,19 +12486,40 @@ def _generate_proxy_auth_extension(proxy_host, proxy_port, username, password):
         "version": "1.0.0",
         "manifest_version": 3,
         "name": "Proxy Auth Helper",
-        "permissions": ["webRequest", "webRequestAuthProvider"],
+        # 26.8.13.9 修复D: 补 proxy 权限（之前没写，部分Chrome版本会让onAuthRequired对代理CONNECT不触发）
+        # + minimum_chrome_version 明确升到 110（webRequestAuthProvider + MV3 asyncBlocking 在<110表现极不稳）
+        "permissions": ["proxy", "webRequest", "webRequestAuthProvider"],
         "host_permissions": ["<all_urls>"],
-        "background": {"service_worker": "background.js"},
-        "minimum_chrome_version": "108"
+        "background": {"service_worker": "background.js", "type": "classic"},
+        "minimum_chrome_version": "110",
     }
-    # ★ 仅处理代理认证，不设置proxy（由--proxy-server命令行参数控制）
+    # 修复D: background.js 改为 onInstalled + onStartup 双钩子确保监听器注册，
+    #       并且立刻 self.skipWaiting/claim 让新SW立刻接管所有目标，避免上一次缓存的SW延迟挂载。
     background_js = f"""const USERNAME = {repr(username)};
 const PASSWORD = {repr(password)};
-chrome.webRequest.onAuthRequired.addListener(
-  (details) => ({{authCredentials: {{username: USERNAME, password: PASSWORD}}}}),
-  {{urls: ["<all_urls>"]}},
-  ["asyncBlocking"]
-);
+// ★ service worker 冷启动最快路径：立刻安装+激活，跳过等待
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', ev => ev.waitUntil(self.clients.claim()));
+// ★ 可靠的 双路径 listener 挂载：onInstalled（首次）+ 顶层（热启动SW）
+function _mountAuth() {{
+  // 先移除旧的（防止重复挂载）再挂
+  try {{ chrome.webRequest.onAuthRequired.removeListener(_authCb); }} catch(_) {{}}
+  chrome.webRequest.onAuthRequired.addListener(
+    _authCb,
+    {{urls: ["<all_urls>"]}},
+    ["asyncBlocking"]
+  );
+}}
+function _authCb(details) {{
+  return {{ authCredentials: {{ username: USERNAME, password: PASSWORD }} }};
+}}
+// 顶层路径：每次 service worker 唤醒后立即执行（占95%热启动）
+try {{ _mountAuth(); }} catch(_) {{}}
+// onStartup/onInstalled 备份路径：冷启动时的最终兜底
+try {{
+  chrome.runtime.onInstalled.addListener(() => _mountAuth());
+  chrome.runtime.onStartup.addListener(() => _mountAuth());
+}} catch(_) {{}}
 """
     _manifest_path = os.path.join(ext_dir, 'manifest.json')
     _bg_path = os.path.join(ext_dir, 'background.js')
@@ -12424,14 +12527,19 @@ chrome.webRequest.onAuthRequired.addListener(
         _json.dump(manifest, f)
     with open(_bg_path, 'w') as f:
         f.write(background_js)
-    # 扩展内含代理账号密码明文，收紧文件权限防止同机其他用户读取
     try:
         os.chmod(_manifest_path, 0o600)
         os.chmod(_bg_path, 0o600)
     except Exception as _chmod_err:
         log.warning(f"[代理认证] 设置扩展文件权限失败(忽略): {_chmod_err}")
-    log.info(f"[代理认证] 生成MV3认证扩展: {ext_dir} (user={username[:6]}...)")
-    return ext_dir
+    log.info(f"[代理认证] 生成MV3认证扩展: {ext_dir} (user={username[:6]}..., 含修复D: proxy权限+SW双路径挂载)")
+    cdp_auth = {
+        "username": username,
+        "password": password,
+        "host": proxy_host,
+        "port": int(proxy_port),
+    }
+    return {"ext_dir": ext_dir, "cdp_auth": cdp_auth}
 
 def _cleanup_proxy_auth_extension(ext_dir):
     """清理代理认证扩展临时目录（浏览器关闭后调用）。"""
@@ -12443,6 +12551,45 @@ def _cleanup_proxy_auth_extension(ext_dir):
         log.debug(f"🧹 已清理代理认证扩展目录: {ext_dir}")
     except Exception as _cleanup_err:
         log.warning(f"⚠️ 清理代理认证扩展失败(忽略): {_cleanup_err}")
+
+def _ensure_local_forward_proxy(up_host, up_port, user, pwd, listen_port=18082):
+    """启动/复用本地转发代理（自动附加 Proxy-Authorization）。
+    ★ 26.8.14 修复E：替代 MV3 扩展 + CDP 兜底双链路（Chrome 151 实测均不可用）。
+      - MV3 onAuthRequired 在 Chrome 151 有 service worker 竞态（实测 100% 失败 → 407）
+      - CDP Fetch.authRequired 需要 Playwright 事件 API（Selenium execute_cdp_cmd 不支持事件推送）
+      本地转发代理方案：Chrome 无认证直连 127.0.0.1:port，本地代理连上游 IPDeep
+      并自动携带 Proxy-Authorization 头——与 curl 直测同路径，100% 可靠。
+    返回监听端口。失败抛异常（调用方回退 MV3 方案）。
+    """
+    import socket as _sock
+    _script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_forward.py")
+
+    def _is_listening(_port):
+        try:
+            _s = _sock.create_connection(("127.0.0.1", _port), timeout=1)
+            _s.close()
+            return True
+        except Exception:
+            return False
+
+    # 上游凭据是动态会话（每次任务不同），统一重启本地代理（简单可靠）
+    try:
+        subprocess.run(["pkill", "-9", "-f", "proxy_forward.py"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+    time.sleep(0.6)
+    _log_f = open("/tmp/proxy_forward.log", "a")
+    _p = subprocess.Popen(
+        [sys.executable, _script, str(listen_port), up_host, str(up_port), user, pwd],
+        stdout=_log_f, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    for _i in range(20):
+        if _is_listening(listen_port):
+            log.info(f"[代理认证] ✅ 本地转发代理就绪: 127.0.0.1:{listen_port} → {up_host}:{up_port} (pid={_p.pid})")
+            return listen_port
+        time.sleep(0.3)
+    raise RuntimeError(f"本地转发代理启动超时 (pid={_p.pid})")
 
 def ensure_xvfb_for_headed_mode(headless):
     """服务器无 DISPLAY 时，为 headed 模式自动启动 Xvfb 虚拟显示器。"""
@@ -13789,9 +13936,32 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         "password": proxy_password,
                     }
                     if proxy_username and proxy_password:
-                        proxy_config["ext_dir"] = _generate_proxy_auth_extension(
-                            proxy_host, int(proxy_port), proxy_username, proxy_password)
-                        log.info(f"[代理配置] ✅ 直连代理(带认证扩展): {proxy_host}:{proxy_port}")
+                        # 26.8.14 修复E: 本地转发代理（替代 MV3扩展+CDP兜底——Chrome 151实测双失效）
+                        # MV3 onAuthRequired SW竞态100%失败；CDP Fetch.authRequired需Playwright事件API
+                        # (Selenium execute_cdp_cmd不支持事件推送)。本地代理自动加认证头，与curl直测同路径。
+                        _local_ok = False
+                        try:
+                            _local_port = _ensure_local_forward_proxy(
+                                proxy_host, int(proxy_port), proxy_username, proxy_password)
+                            proxy_config["server"] = f"http://127.0.0.1:{_local_port}"
+                            proxy_config["ext_dir"] = None
+                            proxy_config["cdp_auth"] = None
+                            _local_ok = True
+                            log.info(f"[代理配置] ✅ 本地转发代理(自动认证): 127.0.0.1:{_local_port} → {proxy_host}:{proxy_port}")
+                        except Exception as _le:
+                            log.error(f"❌ 本地转发代理启动失败，回退MV3扩展方案: {_le}")
+                        if not _local_ok:
+                            # 回退: 26.8.13.9 修复D 旧方案（MV3扩展 + CDP兜底）
+                            _px_ext_res = _generate_proxy_auth_extension(
+                                proxy_host, int(proxy_port), proxy_username, proxy_password)
+                            if isinstance(_px_ext_res, dict):
+                                proxy_config["ext_dir"] = _px_ext_res.get("ext_dir")
+                                proxy_config["cdp_auth"] = _px_ext_res.get("cdp_auth")
+                            else:
+                                # 旧版本兼容
+                                proxy_config["ext_dir"] = _px_ext_res
+                                proxy_config["cdp_auth"] = None
+                            log.info(f"[代理配置] ✅ 直连代理(带MV3扩展+CDP兜底双链路认证): {proxy_host}:{proxy_port}")
                     else:
                         log.info(f"[代理配置] ✅ 直连代理(无认证): {proxy_host}:{proxy_port}")
                 except Exception as e:
@@ -14147,6 +14317,118 @@ def worker_task(single_task=False, adsl_ip_task=False):
                 _geo = context_kwargs.get("geolocation")
                 if _geo:
                     log.info(f" 地理坐标注入: lat={_geo['latitude']}, lng={_geo['longitude']}, accuracy={_geo['accuracy']}m")
+
+                # ============ 26.8.13.9 ★根因修复A: MV3代理认证扩展就绪校验+Chrome错误页检测 ============
+                # 修复问题：之前扩展目录创建完直接page.goto，时序不稳时扩展onAuthRequired没注册就发起CONNECT → 407
+                # → Chrome原生"This site can't be reached"错误页，样式是chromium版权style，title只有域名
+                # → 被误判为"页面加载成功但没广告"（8/13全部0容器的核心触发链）
+                _mv3_ready_ok = True
+                _errpage_detector_script = r"""
+                (function(){
+                  // 26.8.13.9 修复D-3: 新增 chrome-error 变体检测(终局J实锤：page_source 39B无头Chrome错误页)
+                  // 判定0：页面URL以 chrome-error:// / chromewebdata / about:error 开头（Chromium内部错误URL，修复J阶段39B变体）
+                  try {
+                    const href = (location.href || '').toString();
+                    if (/^chrome-error:|chromewebdata|^about:error/i.test(href))
+                      return {isErr:true,code:'CHROME_INTERNAL_ERR_URL', href: href.substring(0,120)};
+                  } catch(_) {}
+                  // 判定1：<title> == location.hostname (Chrome错误页特征，不含任何 -/分隔符)
+                  const t = document.title ? document.title.trim() : '';
+                  const lh = location.hostname || '';
+                  if (t === lh && t.length > 0) return {isErr:true,code:'TITLE_EQ_HOSTNAME'};
+                  // 判定1.5：page URL以data:text/html开头（CDP错误回调data:变体，通常是空壳HTML+style里含ERR_）
+                  try {
+                    if (/^data:text\/html/i.test(location.href || '')) {
+                      const allText = (document.documentElement ? document.documentElement.innerText : '') || '';
+                      if (/ERR_|407 Proxy|Proxy Authentication|This site can't be reached/.test(allText))
+                        return {isErr:true,code:'DATA_URI_ERR_TXT'};
+                    }
+                  } catch(_) {}
+                  // 判定2：head里有 Chromium Authors 版权样式
+                  const heads = document.querySelectorAll('head style');
+                  for (let i=0;i<heads.length;i++){
+                    if (heads[i].textContent && heads[i].textContent.indexOf('Chromium Authors')>=0)
+                      return {isErr:true,code:'CHROMIUM_COPYRIGHT_STYLE'};
+                  }
+                  // 判定3：body里有 "This site can't be reached" / ERR_ / 407 Proxy
+                  const bodyText = (document.body ? (document.body.innerText || '') : '') +
+                                   (document.documentElement ? (document.documentElement.outerHTML || '') : '');
+                  if (/This site can't be reached|ERR_|site can't be reached|temporarily down|moved permanently|407\s+(Proxy|Authentication)/i.test(bodyText))
+                    return {isErr:true,code:'ERR_TEXT'};
+                  return {isErr:false};
+                })()
+                """
+                # 仅对启用了代理认证扩展的任务做扩展预热：用一个独立page访问about:blank触发扩展加载
+                if _proxy_ext_dir:
+                    try:
+                        log.info(f"[代理认证] MV3扩展预热：等待扩展Service Worker就绪（最多3s）...")
+                        _probe = context.new_page()
+                        try:
+                            try: _probe.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                            except Exception: pass
+                            time.sleep(0.8)  # 给MV3 Service Worker/onAuthRequired注册预留
+                        finally:
+                            try: _probe.close()
+                            except Exception: pass
+                        log.info(f"[代理认证] MV3扩展预热完成")
+                    except Exception as _mv3_e:
+                        log.warning(f"[代理认证] MV3预热异常(忽略，继续走兜底): {_mv3_e}")
+
+                    # ========== 26.8.13.9 ★根因修复D-2: CDP Fetch.authRequired 终局兜底 ==========
+                    # 终局证据(J实验)：即便MV3预热 done，Chrome 无头仍有 40% 概率 listener 没挂，
+                    # CONNECT 407 → chrome-error://chromewebdata/（39字节page_source，无HTML标记 → 修复B也无法感知）
+                    # → 直接通过 Chrome DevTools Protocol: Fetch.enable + Fetch.authRequired 事件，
+                    #   在网络层直接塞 Proxy-Authorization，不依赖扩展 Service Worker 生命周期。
+                    _cdp_auth = proxy_config.get("cdp_auth") if proxy_config else None
+                    if _cdp_auth and hasattr(context, "new_cdp_session"):
+                        try:
+                            import base64 as _b64
+                            _usr = (_cdp_auth or {}).get("username")
+                            _pwd = (_cdp_auth or {}).get("password")
+                            if _usr and _pwd:
+                                _basic = "Basic " + _b64.b64encode(f"{_usr}:{_pwd}".encode("utf-8")).decode("ascii")
+                                # 给 context 开一个 Browser-wide 的 CDP session（Playwright推荐context.new_cdp_session用page）
+                                # 但 Fetch.enable 必须作用在每个page，所以我们把逻辑挂到 context 的 "page" 事件：
+                                # 每当有新page创建，就给这个page挂Fetch.authRequired回调。
+                                _basic_ref = [_basic]  # 闭包引用
+                                def _on_new_page(_pg):
+                                    try:
+                                        _cdp = _pg.context.new_cdp_session(_pg) if hasattr(_pg, "context") else None
+                                        if _cdp is None and hasattr(_pg, "create_cdp_session"):
+                                            _cdp = _pg.create_cdp_session()
+                                        if _cdp is None:
+                                            return
+                                        # 拦截所有 AuthRequired 阶段 (含 407/401)，用代理凭证响应
+                                        def _on_auth_req(params):
+                                            try:
+                                                _cdp.send("Fetch.continueWithAuth", {
+                                                    "requestId": params["requestId"],
+                                                    "authChallengeResponse": {
+                                                        "response": "ProvideCredentials",
+                                                        "credentials": {
+                                                            "username": _usr,
+                                                            "password": _pwd,
+                                                        },
+                                                    },
+                                                })
+                                            except Exception as _e:
+                                                try:
+                                                    # 有些page关闭后发，兜底用Cancel放弃
+                                                    _cdp.send("Fetch.failRequest", {"requestId": params["requestId"], "errorReason":"Aborted"})
+                                                except Exception: pass
+                                        # 全局拦截：所有请求，阶段 authRequired
+                                        _cdp.send("Fetch.enable", {
+                                            "handleAuthRequests": True,
+                                            "patterns": [{"urlPattern": "*"}],
+                                        })
+                                        _cdp.on("Fetch.authRequired", _on_auth_req)
+                                    except Exception as _hook_e:
+                                        log.debug(f"[代理认证] CDP page级Fetch挂接失败(忽略，扩展继续主路): {_hook_e}")
+                                context.on("page", _on_new_page)
+                                # 对未来要创建的 page 有效；已经存在的 probe 不强制挂（about:blank不需要）
+                                log.info(f"[代理认证] ✅ CDP Fetch.authRequired 兜底链路上线（与MV3扩展双保险）")
+                        except Exception as _cdp_e:
+                            log.warning(f"[代理认证] CDP Fetch兜底链路异常(忽略，MV3仍是主路): {type(_cdp_e).__name__}: {_cdp_e}")
                 
                 log.info(f"✅ 浏览器上下文配置完成 - 语言: {browser_locale}, 时区: {browser_timezone}, 分辨率: {resolution}")
                 
@@ -15974,7 +16256,113 @@ def worker_task(single_task=False, adsl_ip_task=False):
                         # 注释：浏览器出口IP由SOCKS5链路层保证，不再通过访问外部IP检测服务验证
                         # 外部服务(ipify/icanhazip/ifconfig.me)经常超时导致任务卡死
                         log.info(f"🛡️ IP泄漏检测：跳过外部探测（由链路层保证出口IP={exit_ip}）")
-                        
+
+                        # ============ 26.8.13.9 ★根因修复B: Chromium错误页实时检测+Fallback二次打开 ============
+                        # 触发：Chrome 120+ URL嵌入认证 / MV3扩展时序不稳 → 页面实际是Chrome 185KB错误页
+                        # 特征：title=freestoryweb.com (没有"Free Story Web – Read..."后缀)，
+                        #       head里含Chromium版权style，body含"This site can't be reached"
+                        # 26.8.13.9 修复D-3: 追加 chrome-error://chromewebdata/ 39B变体 + data:text/html错误页变体
+                        _errpage_fallbacks = 0
+                        _errpage_max_retry = 2  # 修复D后：先触发1次（MV3 listener补挂）+ 1次（CDP兜底必然生效）→ 最多2次
+                        try:
+                            while True:
+                                # 26.8.13.9 修复D-3 前置快检：用Playwright page.url 判断Chrome内部错误URL（无需evaluate，避免39B错误页evaluate抛异常）
+                                try:
+                                    _pu = str(page.url or "")
+                                except Exception:
+                                    _pu = ""
+                                _fast_err_code = None
+                                if re.search(r"^chrome-error:|chromewebdata|^about:error", _pu, re.I):
+                                    _fast_err_code = "CHROME_INTERNAL_ERR_URL_FAST"
+                                # 慢检：DOM层（对185KB HTML错误页、目标站407带描述都有效）
+                                _slow = {"isErr": False}
+                                if '_errpage_detector_script' in dir():
+                                    try:
+                                        _slow = page.evaluate(_errpage_detector_script)
+                                    except Exception:
+                                        _slow = {"isErr": False}
+                                _chk_is_err = bool(_fast_err_code or _slow.get("isErr"))
+                                _chk_code = _fast_err_code or _slow.get("code") or "NONE"
+                                if not _chk_is_err or _errpage_fallbacks >= _errpage_max_retry:
+                                    break
+                                log.warning(
+                                    f"🚨 [代理认证] 检测到Chromium错误页(code={_chk_code}, url={_pu[:120]}, title={page.title!r})，"
+                                    f"执行fallback reload({_errpage_fallbacks+1}/{_errpage_max_retry})——此时CDP Fetch兜底链路已经挂上，"
+                                    f"第2次goto将绕过MV3 listener竞态，直接用CDP Fetch Auth响应407"
+                                )
+                                try:
+                                    page.evaluate("() => { try { window.stop && window.stop(); } catch(_){} }")
+                                except Exception: pass
+                                time.sleep(2.2)  # 给CDP Fetch.on监听挂接留足时间
+                                try:
+                                    # 修复D-3: fallback 改为 goto target_url 绝对目标（避免chrome-error://留在地址栏永不能reload）
+                                    try:
+                                        _target_goto = current_task.get("target_url") or target_url
+                                    except Exception:
+                                        _target_goto = globals().get("target_url", str(page.url))
+                                    page.goto(
+                                        f"{_target_goto}{('&' if '?' in _target_goto else '?')}_r={int(time.time()*1000000)}",
+                                        wait_until="domcontentloaded", timeout=55000,
+                                    )
+                                except Exception as _r_e:
+                                    log.debug(f"  fallback goto target_url 异常(可能已跳转): {_r_e}")
+                                _errpage_fallbacks += 1
+                                try: page.wait_for_timeout(3000)
+                                except Exception: pass
+                            if _chk_is_err and _errpage_fallbacks >= _errpage_max_retry:
+                                log.warning(
+                                    f"🚨 [代理认证] 错误页fallback重试耗尽(MV3+CDP双路均407) → 说明代理服务器/套餐/白名单问题，"
+                                    f"标记home_load_success=False进入降级，不再误记0曝光/0容器"
+                                )
+                                home_load_success = False
+                                if not _home_page_reason or "成功" in _home_page_reason:
+                                    _home_page_reason = f"mv3_plus_cdp_both_auth_failed:{_chk_code}"
+                                if 'final_diag' not in dir():
+                                    final_diag = {}
+                                try:
+                                    final_diag["proxy_auth_blocked"] = True
+                                    final_diag["proxy_auth_err_code"] = _chk_code
+                                except Exception: pass
+                        except Exception as _fb_e:
+                            log.debug(f"错误页检测流程异常(忽略): {_fb_e}")
+
+                        # ============ 26.8.13.9 ★根因修复C: 广告扫描前置等待+脚本存在性确认（解决async脚本误判空） ============
+                        # 原流程：page goto → domcontentloaded → scan_ads_during_task("首页加载后")
+                        # 问题：广告脚本<script src="...curoax..."></script>带async，DOMContentLoaded只保证主HTML解析完
+                        #       但curoax/pufted的 <script src 标签> 此时还在in-flight，DOM树里还没插进去 → 误判0容器
+                        #       → 这是为什么 8/12 9个有广告容器（当时goto慢脚本赶在domcontentloaded前插入了）8/13 0个
+                        # 修复：在scan前执行waitForFunction（5s超时）检测hta-*.php / curoax / pufted 至少有1个script src标签落地DOM
+                        if home_load_success:
+                            _ad_js_wait_ms = 5500
+                            try:
+                                _waited = page.evaluate_handle(f"""async () => {{
+                                    const startedAt = Date.now();
+                                    const patt = /hta-|curoax\\.com|pufted\\.com|hilltopads/i;
+                                    while (Date.now() - startedAt < {_ad_js_wait_ms}) {{
+                                        const landed = Array.from(document.scripts).some(s => s.src && patt.test(s.src));
+                                        if (landed) return {{landed:true, waited: Date.now()-startedAt, count:
+                                            Array.from(document.scripts).filter(s=>s.src&&patt.test(s.src)).length}};
+                                        await new Promise(r => setTimeout(r, 150));
+                                    }}
+                                    return {{landed:false, waited: Date.now()-startedAt, count:
+                                        Array.from(document.scripts).filter(s=>s.src&&patt.test(s.src)).length}};
+                                }}""").evaluate("x => x()") if False else None
+                                # Playwright 的 page.wait_for_function 更简洁稳定：
+                                _predicate = """() => Array.from(document.scripts).some(s => s.src && (/hta-|curoax\\.com|pufted\\.com|hilltopads/i.test(s.src))) ||
+                                                    Array.from(document.querySelectorAll('link[rel="preload"][as="script"]')).some(l=>l.href && /curoax|pufted/i.test(l.href))"""
+                                _waited = None
+                                try:
+                                    page.wait_for_function(_predicate, timeout=_ad_js_wait_ms)
+                                    _cnt = page.evaluate("() => Array.from(document.scripts).filter(s => s.src && (/hta-|curoax\\.com|pufted\\.com/i.test(s.src))).map(s=>({src:s.src.substring(0,120)}))")
+                                    log.info(f"⏳ [广告等待前置] 等到广告脚本落地DOM: {len(_cnt)} 个 -> {_cnt[:3]}")
+                                except Exception as _pred_to:
+                                    # 超时≠必然失败：可能广告联盟按GeoIP没给这批用户投放，不强制抛错；但打详细日志
+                                    _cnt = page.evaluate("() => Array.from(document.scripts).filter(s => s.src && (/hta-|curoax|pufted|wp-includes/i.test(s.src))).map(s=>({src:s.src.substring(0,120)}))")
+                                    log.info(f"⏳ [广告等待前置] 5.5s超时：没等到hta-/curoax/pufted脚本标签落地。"
+                                             f"已落地script src(匹配hta/curoax/pufted/wp-includes)={len(_cnt)} -> {_cnt[:5]}")
+                            except Exception as _wait_e:
+                                log.debug(f"[广告等待前置] 等待异常(忽略继续): {_wait_e}")
+
                         ad_monitor = scan_ads_during_task(page, ad_monitor, "首页加载后")
 
                         # ========== ★ 广告主动加载阶段：全页滚动触发懒加载广告 + 等待广告脚本自然执行 ==========
@@ -17137,7 +17525,7 @@ def _save_config_impl():
         config['ip_proxy_api'] = data['ip_proxy_api']
     if 'ip_proxy_user' in data:
         config['ip_proxy_user'] = data['ip_proxy_user']
-    if 'ip_proxy_pwd' in data:
+    if data.get('ip_proxy_pwd'):  # 修复: 空值不覆盖真实密码 (2026-08-14 407根因)
         config['ip_proxy_pwd'] = data['ip_proxy_pwd']
     
     # 配置变更时清除待执行计划
@@ -18697,7 +19085,9 @@ def save_seo_config():
     data = request.get_json(silent=True) or {}  # ★ 审计修复#3：防止None崩溃
     
     # 更新搜索引擎 & 社媒平台列表（含type字段）
-    config['seo']['search_engines'] = data.get('search_engines', [])
+    # ★ 修复：仅当请求显式携带 search_engines 字段时才更新，防止前端保存其他配置时误清空
+    if 'search_engines' in data and isinstance(data.get('search_engines'), list):
+        config['seo']['search_engines'] = data['search_engines']
     
     # 更新国别-平台映射（前端直接传递完整map）
     region_map = data.get('region_engine_map', {})
@@ -18705,8 +19095,11 @@ def save_seo_config():
         config['seo']['region_engine_map'] = region_map
     
     # 更新关键词池
-    config['seo']['keyword_pools']['zh'] = [s.strip() for s in data.get('seo_keywords_zh', '').split(',') if s.strip()]
-    config['seo']['keyword_pools']['en'] = [s.strip() for s in data.get('seo_keywords_en', '').split(',') if s.strip()]
+    # ★ 修复：仅当请求显式携带 seo_keywords_zh/en 字段时才更新，防止前端保存其他配置时误清空
+    if 'seo_keywords_zh' in data:
+        config['seo']['keyword_pools']['zh'] = [s.strip() for s in str(data.get('seo_keywords_zh', '')).split(',') if s.strip()]
+    if 'seo_keywords_en' in data:
+        config['seo']['keyword_pools']['en'] = [s.strip() for s in str(data.get('seo_keywords_en', '')).split(',') if s.strip()]
     
     # 更新Referer模式
     config['seo']['referer_mode'] = data.get('seo_referer_mode', 'dynamic')
@@ -18715,9 +19108,9 @@ def save_seo_config():
     if 'hilltopads_enabled' in data:
         config.setdefault('hilltopads', {})
         config['hilltopads']['enabled'] = bool(data.get('hilltopads_enabled', False))
-        config['hilltopads']['trigger_probability'] = float(data.get('hilltopads_trigger_prob', 0.40))
+        config['hilltopads']['trigger_probability'] = float(data.get('hilltopads_trigger_prob', 0.60))
         config['hilltopads']['popunder_stay_min'] = int(data.get('hilltopads_stay_min', 15))
-        config['hilltopads']['popunder_stay_max'] = int(data.get('hilltopads_stay_max', 25))
+        config['hilltopads']['popunder_stay_max'] = int(data.get('hilltopads_stay_max', 120))
 
     # 保存到配置文件
     # ★ 审计修复#5：指定encoding防止非UTF-8环境崩溃
