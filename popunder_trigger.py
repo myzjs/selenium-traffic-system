@@ -34,7 +34,8 @@ _log = logging.getLogger("popunder_trigger")
 #   heartbeat（~12s/~22s）之后，同时消除"每次都 22-36s 整段关闭"的程序化指纹。
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
-    "trigger_probability": 0.60,          # 原 0.40 → 0.60：让更多会话尝试触发，观察转化
+    "trigger_probability": 0.85,          # ★ 26.8.17.1: 0.40→0.60→0.85（P0-2：冷却 75s 已兜底频控，
+                                          #   概率门是 5.7% 触发成功率的放大器，上调后靠 cooldown 控量）
     "trigger_after_pct_min": 0.15,
     "trigger_after_pct_max": 0.30,
     "popunder_stay_min": 15,              # ★ 26.8.15.1: 22→15（下界即 R07 CRIT 线，分布均值仍 ≥25s）
@@ -65,6 +66,8 @@ _HEARTBEAT_LANDING_DOMAINS: Tuple[str, ...] = (
     "evadav", "propellerads", "curoax", "pufted",
     "bony-teaching", "untimely-hello", "googlesyndication", "doubleclick",
     "mgid", "taboola", "outbrain", "ad-maven",
+    # ★ 26.8.17.1：8/15 排查确认的实际落地域名（此前缺失导致结算验证假阴性）
+    "eatcells", "nesber",
 )
 # 统计 / 像素 / 上报路径关键词（落地广告域名命中后按此判定）
 _HEARTBEAT_URL_KEYWORDS: Tuple[str, ...] = (
@@ -460,12 +463,49 @@ def _pick_safe_coordinates(
 # CDP 鼠标事件
 # ============================================================================
 
+# ★ 26.8.17.1 新增：CDP 通道韧性 — 超时/连接类异常识别与单次重试。
+#   根因（HILLTOPADS_ZERO_REVENUE_FINDINGS 🔴1）：localhost CDP HTTP 通道
+#   （/goog/cdp/execute）偶发 ReadTimeoutError×14 / MaxRetryError×11 /
+#   NewConnectionError×11，旧实现直接落入 trigger_popunder 的 except 分支
+#   整次触发失败（触发成功率仅 ~5.7%）。此类异常多为瞬时（通道忙/代理抖动），
+#   原地重试 1 次（前加 0.6-1.5s 随机退避）即可恢复，无需重建会话。
+_CDP_TRANSIENT_EXC_NAMES: frozenset = frozenset((
+    "ReadTimeoutError", "ReadTimeout", "ConnectTimeoutError", "ConnectTimeout",
+    "MaxRetryError", "NewConnectionError", "ConnectionError", "TimeoutError",
+    "HTTPError", "RemoteDisconnected", "ProtocolError",
+))
+
+
+def _is_cdp_transient_error(exc: BaseException) -> bool:
+    """判断 CDP 调用异常是否为瞬时通道错误（值得原地重试 1 次）。"""
+    return type(exc).__name__ in _CDP_TRANSIENT_EXC_NAMES
+
+
+def _cdp_send_retry(cdp_session, method: str, params: Dict[str, Any],
+                    _retry: int = 1):
+    """带单次瞬时重试的 CDP 命令发送。
+
+    非瞬时异常（协议错误/参数错误）立即抛出，交给上层 except 记录；
+    瞬时异常（超时/连接断开）退避 0.6-1.5s 后原样重试 1 次，仍失败则抛出。
+    """
+    try:
+        return cdp_session.send(method, params)
+    except Exception as _e:
+        if _retry <= 0 or not _is_cdp_transient_error(_e):
+            raise
+        _backoff = random.uniform(0.6, 1.5)
+        _log.info("[Pop-under] CDP 瞬时错误(%s: %s)，%.2fs 后重试 1 次",
+                  type(_e).__name__, _e, _backoff)
+        time.sleep(_backoff)
+        return cdp_session.send(method, params)  # 第二次失败直接抛给上层
+
+
 def _cdp_scroll(cdp_session, x, y, delta_y):
     """★ 谷歌广告合规修复：真实滚动手势。
     通过 CDP mouseWheel 派发自然滚动，让光标路径自然经过/越过广告区域，
     替代"瞬间点到广告中心"的直接合成点击，降低被判定为机读点击的风险。
     """
-    cdp_session.send("Input.dispatchMouseEvent", {
+    _cdp_send_retry(cdp_session, "Input.dispatchMouseEvent", {
         "type": "mouseWheel", "x": x, "y": y, "deltaX": 0,
         "deltaY": int(delta_y), "modifiers": 0,
         "timestamp": int(time.time() * 1000),
@@ -495,7 +535,7 @@ def _cdp_mouse_move(cdp_session, from_x, from_y, to_x, to_y, steps=5):
         mt = 1 - t
         cur_x = int(mt**3 * from_x + 3 * mt**2 * t * cx1 + 3 * mt * t**2 * cx2 + t**3 * to_x)
         cur_y = int(mt**3 * from_y + 3 * mt**2 * t * cy1 + 3 * mt * t**2 * cy2 + t**3 * to_y)
-        cdp_session.send("Input.dispatchMouseEvent", {
+        _cdp_send_retry(cdp_session, "Input.dispatchMouseEvent", {
             "type": "mouseMoved", "x": cur_x, "y": cur_y,
             "modifiers": 0, "button": "none",
             "timestamp": int(time.time() * 1000),
@@ -515,19 +555,19 @@ def _cdp_click(cdp_session, x, y):
     # 点击前的微小瞄准移动（真人会微调指针位置再按下）
     jx = x + int(random.uniform(-3, 3))
     jy = y + int(random.uniform(-3, 3))
-    cdp_session.send("Input.dispatchMouseEvent", {
+    _cdp_send_retry(cdp_session, "Input.dispatchMouseEvent", {
         "type": "mouseMoved", "x": jx, "y": jy,
         "button": "none", "modifiers": 0,
         "timestamp": int(time.time() * 1000),
     })
     time.sleep(random.uniform(0.03, 0.15))
     ts = int(time.time() * 1000)
-    cdp_session.send("Input.dispatchMouseEvent", {
+    _cdp_send_retry(cdp_session, "Input.dispatchMouseEvent", {
         "type": "mousePressed", "x": jx, "y": jy,
         "button": "left", "clickCount": 1, "timestamp": ts,
     })
     time.sleep(random.uniform(0.06, 0.20))
-    cdp_session.send("Input.dispatchMouseEvent", {
+    _cdp_send_retry(cdp_session, "Input.dispatchMouseEvent", {
         "type": "mouseReleased", "x": jx, "y": jy,
         "button": "left", "clickCount": 1,
         "timestamp": ts + int(random.uniform(80, 200)),
@@ -854,9 +894,9 @@ def _cdp_key(cdp_session: Any, key: str, code: str, which: int = 0) -> None:
     }
     if key == " ":
         params_down["text"] = " "
-    cdp_session.send("Input.dispatchKeyEvent", params_down)
+    _cdp_send_retry(cdp_session, "Input.dispatchKeyEvent", params_down)
     time.sleep(random.uniform(0.03, 0.12))
-    cdp_session.send("Input.dispatchKeyEvent", {
+    _cdp_send_retry(cdp_session, "Input.dispatchKeyEvent", {
         "type": "keyUp",
         "key": key,
         "code": code,
@@ -1058,7 +1098,7 @@ def trigger_popunder(
         return False, None, {"triggered": False, "reason": "page_cooldown"}
 
     # ---- 随机概率 ----
-    prob = cfg.get("trigger_probability", 0.40)
+    prob = cfg.get("trigger_probability", 0.85)  # ★ 26.8.17.1: 兜底默认 0.40→0.85，与 DEFAULT_CONFIG 对齐
     if random.random() > prob:
         # ★ 可观测修复：概率跳过不再静默（INFO 可见，便于区分 CDP 触发 vs 自然弹窗）
         _log.info("[Pop-under] 概率跳过 (random > %.2f)，本次不触发 CDP 点击", prob)
@@ -1108,7 +1148,19 @@ def trigger_popunder(
         # 4. CDP 通道 — ★ 审计修复【根因】：旧实现绑定 context.pages[0]，
         #    多 tab 场景（SEO 结果页/其它任务页先开）时鼠标事件派发到错误页面，
         #    弹窗触发失败（间歇性：时好时坏）。改为绑定当前发布商页。
-        cdp = context.new_cdp_session(page)
+        # ★ 26.8.17.1：会话建立也纳入瞬时重试（建会话本身可能撞上通道超时）
+        try:
+            cdp = context.new_cdp_session(page)
+        except Exception as _se:
+            if _is_cdp_transient_error(_se):
+                # 瞬时通道错误：退避 0.6-1.5s 后原地重试 1 次（与 _cdp_send_retry 一致）
+                _backoff = random.uniform(0.6, 1.5)
+                _log.info("[Pop-under] CDP 会话建立瞬时错误(%s: %s)，%.2fs 后重试 1 次",
+                          type(_se).__name__, _se, _backoff)
+                time.sleep(_backoff)
+                cdp = context.new_cdp_session(page)  # 第二次失败抛给外层 except
+            else:
+                raise
 
         # ★ 焦点保险：CDP Input 事件派发到当前焦点窗口，点击前确保焦点在发布商页
         #   （selenium_bridge 共享 driver，焦点可能已被其它标签篡夺）
@@ -1418,6 +1470,42 @@ def self_test() -> Dict[str, bool]:
     )
     # 4) 关闭过渡抖动加宽（旧 0.3-0.9s 太整齐，新 0.6-2.4s）
     results["close_jitter_widened"] = "random.uniform(0.6, 2.4)" in open(__file__).read()
+    # ---- ★ 26.8.17.1 新增：CDP 瞬时重试 + 概率上调 + 落地白名单 自检 ----
+    src = open(__file__).read()
+    # 5) CDP 瞬时重试：helper 存在、3 个手势函数 + 按键 + 会话建立全部走它
+    results["cdp_retry_helper_exists"] = (
+        "_CDP_TRANSIENT_EXC_NAMES" in src
+        and "def _cdp_send_retry" in src
+        and "def _is_cdp_transient_error" in src
+    )
+    results["cdp_retry_wired"] = (
+        "_cdp_send_retry(cdp" in src
+        and src.count("_cdp_send_retry(cdp") >= 6  # scroll/move/click×2/key×2/...
+        and "cdp = context.new_cdp_session(page)" in src  # 会话建立重试分支仍在
+    )
+    # 瞬时错误分类：典型三类（ReadTimeout/MaxRetry/NewConnection）+ 非瞬时不误判
+    def _exc_named(name):
+        _cls = type(name, (Exception,), {})  # 动态造异常类，type().__name__ 即 name
+        return _cls("x")
+    results["cdp_transient_classify"] = (
+        _is_cdp_transient_error(_exc_named("ReadTimeoutError"))
+        and _is_cdp_transient_error(_exc_named("MaxRetryError"))
+        and _is_cdp_transient_error(_exc_named("NewConnectionError"))
+        and not _is_cdp_transient_error(_exc_named("ValueError"))
+        and not _is_cdp_transient_error(_exc_named("AttributeError"))
+    )
+    # 6) 概率门 0.85（DEFAULT_CONFIG + 兜底默认两处对齐）
+    results["prob_default_085"] = (
+        DEFAULT_CONFIG["trigger_probability"] == 0.85
+        and 'cfg.get("trigger_probability", 0.85)' in src
+    )
+    # 7) 落地白名单含 eatcells / nesber（结算验证假阴性修复）
+    results["heartbeat_landing_whitelist"] = (
+        any("eatcells" in d for d in _HEARTBEAT_LANDING_DOMAINS)
+        and any("nesber" in d for d in _HEARTBEAT_LANDING_DOMAINS)
+        and _is_heartbeat_url("https://eatcells.com/hb?x=1")
+        and _is_heartbeat_url("https://nesber.com/pixel?id=9")
+    )
     return results
 
 

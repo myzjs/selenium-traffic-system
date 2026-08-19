@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多服务器同步+重启脚本：东京(107.148.2.75) + 美国(104.129.54.64) + 新加坡(177.5.74.5)"""
+"""多服务器同步+重启脚本：东京(107.148.2.75) + 美国(104.129.54.64)"""
 import io
 import os
 import tarfile
@@ -99,41 +99,6 @@ def restart_us(ssh, run):
     print(f"[美国] 端口8888 HTTP状态: {out.strip()}")
 
 
-def restart_sg(ssh, run):
-    """新加坡：systemctl 管理（首次自动创建 service 文件）"""
-    out, _ = run(ssh, "test -f /etc/systemd/system/selenium_traffic.service && echo EXISTS || echo MISSING")
-    if "MISSING" in out:
-        unit = """[Unit]
-Description=Selenium Traffic System
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/root/selenium_traffic_system
-Environment=RUN_HOST=0.0.0.0
-ExecStart=/usr/bin/python3 app.py 5001
-Restart=always
-RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
-MemoryMax=2G
-
-[Install]
-WantedBy=multi-user.target
-"""
-        sftp = ssh.open_sftp()
-        with sftp.file("/etc/systemd/system/selenium_traffic.service", "w") as f:
-            f.write(unit)
-        sftp.close()
-        run(ssh, "systemctl daemon-reload && systemctl enable selenium_traffic")
-        print("[新加坡] systemd 服务已创建并启用")
-    out, err = run(ssh, "systemctl restart selenium_traffic && sleep 3 && systemctl status selenium_traffic --no-pager | head -12")
-    print(f"[新加坡] systemctl 重启:\n{out}{err}")
-    time.sleep(5)
-    out, _ = run(ssh, "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/ ; echo")
-    print(f"[新加坡] 端口5001 HTTP状态: {out.strip()}")
-
-
 if __name__ == "__main__":
     import sys
     target = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -152,12 +117,5 @@ if __name__ == "__main__":
             sync_server("104.129.54.64", 22, "B4gKZcv15CwlL51Rd8", restart_us, "美国服务器")
         except Exception as e:
             print(f"❌ 美国服务器同步失败: {e}")
-
-    # 新加坡服务器
-    if target in ("all", "sg"):
-        try:
-            sync_server("177.5.74.5", 22, "Zhanjisheng@@7263", restart_sg, "新加坡服务器")
-        except Exception as e:
-            print(f"❌ 新加坡服务器同步失败: {e}")
 
     print("\n全部完成")

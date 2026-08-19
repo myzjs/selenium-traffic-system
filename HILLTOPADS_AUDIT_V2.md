@@ -169,7 +169,7 @@ popunder_page.add_init_script("""
 
 ### 风险总评：🔴 高 —— 改造未触及
 
-东京+新加坡两台 VPS 仍在共用相同的 `popunder_trigger.py` 参数和行为模式。HilltopAds 可通过弹窗的触发时机一致性、存活时长分布等数据关联两台 VPS。
+多台 VPS 仍在共用相同的 `popunder_trigger.py` 参数和行为模式。HilltopAds 可通过弹窗的触发时机一致性、存活时长分布等数据关联各台 VPS。
 
 ---
 

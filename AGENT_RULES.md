@@ -62,7 +62,7 @@ traffic_distribution.py
 ## 4. 硬约束速查（详见知识库「数据契约」）
 
 - 流量有效性：仅 `ad_loaded == true 且 ad_impressions > 0` 算有效；**禁止**用 `_has_ad_code` 判成功。
-- Pop-under：触发概率 0.6，生存 22-36s；窗口禁止 `bring_to_front()`（防 IVT 分类）。
+- Pop-under：触发概率 0.85（★26.8.17.1 由 0.6 上调，冷却 75s 已兜底频控），生存 15-120s 三段混合分布（均值≈36-39s，下界 15s=R07 CRIT 硬门槛）；窗口禁止 `bring_to_front()`（防 IVT 分类）。
 - 频控：单站任务 40 次/24h，多站任务 30 次/24h。
 - 工作时间：强制 8:00-23:00 当地（country_segments / enforce_working_hours / 任务生成终检三层一致）。
 - 看门狗宽限期：90s（防代理抖动误杀）。

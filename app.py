@@ -81,7 +81,14 @@ import selenium_bridge as _selenium_bridge
 #                    → 命中自动硬刷新1次，把URL嵌入/MV3时序失败的错误页185265B救回真实广告页41KB；
 #              ★C. 广告监控扫描前新增 wait_for_function：hta-*.php / curoax.com / pufted.com 的 script src tag
 #                    必须落地DOM才开始扫描（修复async脚本"in-flight时DOM里还没插"→误判0容器）
-APP_VERSION = "26.8.15.1"
+# 26.8.15.1 = 2026-08-15 弹窗"类人交互"升级（混合分布停留 + 弹窗内真实 CDP 交互 + prob 0.60）
+# 26.8.17.1 = 2026-08-17 零收益根因修复（HILLTOPADS_ZERO_REVENUE_ROOTCAUSE_FINDINGS 8/15 审计）：
+#              ★A. CDP 通道韧性：_cdp_send_retry 单次瞬时重试（ReadTimeout/MaxRetry/NewConnection 等 11 类）
+#                   覆盖 scroll/mouseMove/click/key 4 个 CDP 辅助 + new_cdp_session 会话建立（去重后 1 次重试）
+#              ★B. 触发概率 0.60→0.85（DEFAULT_CONFIG / app 配置 / 表单默认 / POST 兜底 4 处；冷却 75s 已兜底频控）
+#              ★C. 心跳结算验证白名单补 eatcells / nesber（8/15 实测落地域名，此前缺失→结算验证假阴性）
+#              ★D. 部署拓扑：sync_two_servers.py 移除新加坡 177.5.74.5（仅保留东京 + 美西）
+APP_VERSION = "26.8.17.1"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2517,7 +2524,7 @@ config = {
     #   停留 15-120s（三段混合分布采样，均值 ≈36-39s，杀死"固定时长"指纹）
     "hilltopads": {
         "enabled": True,                       # 总开关：是否触发 Pop-under 弹窗（默认开启，IP 不安全的会话自动跳过）
-        "trigger_probability": 0.60,           # 60% 会话触发（模拟自然拦截率，26.8.15.1 上调）
+        "trigger_probability": 0.85,           # ★ 26.8.17.1: 0.60→0.85（P0-2：冷却 75s 已兜底频控）
         "trigger_after_pct_min": 0.20,         # 模拟进度 20% 后触发（积累页面交互）
         "trigger_after_pct_max": 0.40,         # 最晚 40% 处触发
         "popunder_stay_min": 15,               # 弹窗最小存活秒数（R07 CRIT 线）
@@ -6352,7 +6359,7 @@ HTML_TEMPLATE = r"""
                             </label>
                             <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
                                 <label style="font-size:11px; color:#94a3b8;">触发概率</label>
-                                <input type="text" id="hilltopads_trigger_prob" value="{{ (config.hilltopads.get('trigger_probability', 0.60) * 100)|int }}%" style="width: 60px; font-size:12px;">
+                                <input type="text" id="hilltopads_trigger_prob" value="{{ (config.hilltopads.get('trigger_probability', 0.85) * 100)|int }}%" style="width: 60px; font-size:12px;">
                             </div>
                             <div class="form-group" style="flex: 0 0 auto; min-width: 0;">
                                 <label style="font-size:11px; color:#94a3b8;">最小存活(s)</label>
@@ -19108,7 +19115,7 @@ def save_seo_config():
     if 'hilltopads_enabled' in data:
         config.setdefault('hilltopads', {})
         config['hilltopads']['enabled'] = bool(data.get('hilltopads_enabled', False))
-        config['hilltopads']['trigger_probability'] = float(data.get('hilltopads_trigger_prob', 0.60))
+        config['hilltopads']['trigger_probability'] = float(data.get('hilltopads_trigger_prob', 0.85))
         config['hilltopads']['popunder_stay_min'] = int(data.get('hilltopads_stay_min', 15))
         config['hilltopads']['popunder_stay_max'] = int(data.get('hilltopads_stay_max', 120))
 
