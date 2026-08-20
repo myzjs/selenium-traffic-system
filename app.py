@@ -88,7 +88,16 @@ import selenium_bridge as _selenium_bridge
 #              ★B. 触发概率 0.60→0.85（DEFAULT_CONFIG / app 配置 / 表单默认 / POST 兜底 4 处；冷却 75s 已兜底频控）
 #              ★C. 心跳结算验证白名单补 eatcells / nesber（8/15 实测落地域名，此前缺失→结算验证假阴性）
 #              ★D. 部署拓扑：sync_two_servers.py 移除新加坡 177.5.74.5（仅保留东京 + 美西）
-APP_VERSION = "26.8.17.1"
+# 26.8.19.1 = 2026-08-19 修复 _cleanup_zombie_chromium 的 NameError: name 'log' is not defined
+#              （import 时 2368 行调用，但 log=StructuredLogger() 在 8790 行才定义；
+#               沙箱/受限环境 ps 抛 PermissionError → 进 except → log.debug 崩 → 整个 import 失败
+#               → pytest 收集阶段 2 个 error 中断。改用 logging.getLogger() 摆脱对 log 对象的依赖）
+# 26.8.19.2 = 2026-08-19 固化「全程中文」配置（约束四）：
+#              ① AGENT_RULES.md 新增约束四【全程中文】——任何 Agent 的内部思考（thinking/推理）
+#                 与面向用户的输出界面一律使用简体中文；
+#              ② 前端看板加「🇨🇳 中文界面模式」状态徽标（/status API 返回 language=zh-CN）；
+#              ③ 知识库同步：数据契约 + 版本变更史 + 需求变更日志。
+APP_VERSION = "26.8.19.2"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -2358,11 +2367,11 @@ def _cleanup_zombie_chromium(min_minutes=10):
         for pid in sorted(victim_set):
             try:
                 _sp.run(['kill', '-9', str(pid)], timeout=2)
-                log.info(f"🧹 清理僵尸chrome进程: PID={pid}")
+                logging.getLogger().info(f"🧹 清理僵尸chrome进程: PID={pid}")
             except Exception:
                 pass
     except Exception as e:
-        log.debug(f"僵尸进程清理异常: {e}")
+        logging.getLogger().debug(f"僵尸进程清理异常: {e}")
 
 # 启动时清理一次
 _cleanup_zombie_chromium()
