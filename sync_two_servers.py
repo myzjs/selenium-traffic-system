@@ -12,10 +12,14 @@ REMOTE_DIR = "/root/selenium_traffic_system"
 
 # 排除的文件/目录（缓存、日志、运行时数据、服务器自有配置）
 EXCLUDE_DIRS = {"__pycache__", ".git", "qa_sessions", "report", "test_reports",
-                "feedback", ".uploads", "node_modules"}
+                "feedback", ".uploads", "node_modules", "bundle", "venv",
+                ".uv_python", ".uv_cache", ".demo_monitor", ".pytest_cache",
+                ".risk_state"}
 EXCLUDE_FILES = {"app.log", "config.json", ".env", "historical_tasks.json",
                  "ua_usage_history.json", "fingerprint_stats.json",
-                 "sync_two_servers.py"}
+                 "sync_two_servers.py", ".app.pid", ".app_foreground.out",
+                 "nohup_monitor.out", "app_8888.log",
+                 "selenium_traffic_system_py314_bundle.tar.gz"}
 EXCLUDE_EXTS = {".log", ".pyc"}
 
 
