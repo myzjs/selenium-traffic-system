@@ -97,7 +97,8 @@ import selenium_bridge as _selenium_bridge
 #                 与面向用户的输出界面一律使用简体中文；
 #              ② 前端看板加「🇨🇳 中文界面模式」状态徽标（/status API 返回 language=zh-CN）；
 #              ③ 知识库同步：数据契约 + 版本变更史 + 需求变更日志。
-APP_VERSION = "26.8.19.2"
+# 26.8.19.3 = 2026-08-20 站点访问记录剪裁上限修复：record_site_visit() 保存剪裁从 30 改为 50，覆盖单站点 40 次 + 多站点 30 次需求
+APP_VERSION = "26.8.19.3"
 
 # 向 selenium_bridge 注册停止检查回调：任一任务停止时，让 bridge 内部的
 # goto/wait 等阻塞循环能及时中断（解决"点停止后仍卡在页面加载等待里"的问题）。
@@ -212,7 +213,9 @@ def record_site_visit(host: str):
         try:
             os.makedirs(os.path.dirname(_SITE_FREQ_STATE), exist_ok=True)
             with open(_SITE_FREQ_STATE, "w", encoding="utf-8") as _f:
-                json.dump({k: v[-_SITE_MAX_PER_WINDOW:] for k, v in _SITE_VISITS.items()}, _f, ensure_ascii=False)
+                # ★ Bug修复：剪裁上限需覆盖单站点 40 次 + 余量（30+10=40），取 50 保安全
+                # 之前使用 _SITE_MAX_PER_WINDOW (30)导致单站点访问记录在重启后被截断
+                json.dump({k: v[-50:] for k, v in _SITE_VISITS.items()}, _f, ensure_ascii=False)
         except Exception:
             pass
 
